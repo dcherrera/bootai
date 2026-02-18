@@ -1,0 +1,6 @@
+[submodule "foundry"]
+	path = foundry
+	url = https://github.com/dcherrera/foundry.git
+[submodule "JACLibc"]
+	path = JACLibc
+	url = https://github.com/dcherrera/JACLibc.git
