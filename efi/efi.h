@@ -18,6 +18,7 @@ typedef uint64_t EFI_STATUS;
 typedef void*    EFI_HANDLE;
 typedef uint16_t CHAR16;
 typedef uint8_t  BOOLEAN;
+typedef void*    EFI_EVENT;
 
 /* EFI_GUID */
 typedef struct {
@@ -31,6 +32,7 @@ typedef struct {
 #define EFI_SUCCESS              0
 #define EFI_ERROR_MASK           0x8000000000000000ULL
 #define EFI_ERROR(x)             ((x) | EFI_ERROR_MASK)
+#define EFI_NOT_READY            EFI_ERROR(6)
 #define EFI_NOT_FOUND            EFI_ERROR(14)
 #define EFI_BUFFER_TOO_SMALL     EFI_ERROR(5)
 
@@ -77,7 +79,7 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
 struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
     EFI_STATUS (*Reset)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
     EFI_STATUS (*ReadKeyStroke)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
-    void *WaitForKey;
+    EFI_EVENT WaitForKey;
 };
 
 /* Boot Services (partial — expand as needed) */
@@ -98,7 +100,7 @@ struct EFI_BOOT_SERVICES {
     /* Events */
     void *CreateEvent;
     void *SetTimer;
-    void *WaitForEvent;
+    EFI_STATUS (*WaitForEvent)(UINTN NumberOfEvents, EFI_EVENT *Event, UINTN *Index);
     void *SignalEvent;
     void *CloseEvent;
     void *CheckEvent;
@@ -170,10 +172,12 @@ extern EFI_BOOT_SERVICES *gBS;
 /* Console */
 void efi_print(const CHAR16 *str);
 void efi_print_ascii(const char *str);
+void efi_print_line(const char *str);
 void efi_clear_screen(void);
 
 /* Input */
 EFI_STATUS efi_read_key(EFI_INPUT_KEY *key);
+void efi_wait_key(void);
 int efi_read_line(char *buf, int max_len);
 
 /* Filesystem */

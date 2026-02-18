@@ -1,22 +1,96 @@
 /*
- * console.c - Framebuffer text output via UEFI Graphics Output Protocol (GOP)
+ * console.c — Text output via UEFI Simple Text Output Protocol
  *
- * Provides text output using gST->ConOut for console display.
- * Functions: efi_print(), efi_print_ascii(), efi_clear_screen()
+ * Uses gST->ConOut->OutputString() for all text display.
+ * Also mirrors output to COM1 serial port (0x3F8) for headless debugging.
+ * Functions: efi_print(), efi_print_ascii(), efi_print_line(), efi_clear_screen()
  */
 
 #include "efi.h"
 
+/* x86 port I/O for serial debug output */
+static inline void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t val;
+    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+#define COM1 0x3F8
+
+static void serial_init(void) {
+    outb(COM1 + 1, 0x00);  /* Disable interrupts */
+    outb(COM1 + 3, 0x80);  /* Enable DLAB */
+    outb(COM1 + 0, 0x01);  /* Baud rate 115200 (divisor 1) */
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);  /* 8N1 */
+    outb(COM1 + 2, 0xC7);  /* Enable FIFO */
+    outb(COM1 + 4, 0x0B);  /* IRQs enabled, RTS/DSR set */
+}
+
+static void serial_putc(char c) {
+    while (!(inb(COM1 + 5) & 0x20))
+        ;
+    outb(COM1, (uint8_t)c);
+}
+
+static void serial_puts(const char *s) {
+    while (*s) {
+        serial_putc(*s);
+        s++;
+    }
+}
+
+static int serial_inited = 0;
+
 void efi_print(const CHAR16 *str) {
-    /* TODO: Call gST->ConOut->OutputString() to display UCS-2 string */
-    (void)str;
+    if (gST && gST->ConOut && str) {
+        gST->ConOut->OutputString(gST->ConOut, (CHAR16 *)str);
+    }
 }
 
 void efi_print_ascii(const char *str) {
-    /* TODO: Convert ASCII to CHAR16 on stack, then call efi_print() */
-    (void)str;
+    if (!str) return;
+
+    /* Init serial on first use */
+    if (!serial_inited) {
+        serial_init();
+        serial_inited = 1;
+    }
+
+    /* Mirror to serial */
+    serial_puts(str);
+
+    /* Convert ASCII to UCS-2 in a stack buffer, flush in chunks */
+    CHAR16 buf[128];
+    int i = 0;
+
+    while (*str) {
+        buf[i++] = (CHAR16)(unsigned char)*str++;
+
+        if (i >= 127) {
+            buf[i] = 0;
+            efi_print(buf);
+            i = 0;
+        }
+    }
+
+    if (i > 0) {
+        buf[i] = 0;
+        efi_print(buf);
+    }
+}
+
+void efi_print_line(const char *str) {
+    efi_print_ascii(str);
+    efi_print_ascii("\r\n");
 }
 
 void efi_clear_screen(void) {
-    /* TODO: Call gST->ConOut->ClearScreen() */
+    if (gST && gST->ConOut) {
+        gST->ConOut->ClearScreen(gST->ConOut);
+    }
 }
