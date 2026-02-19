@@ -3,6 +3,9 @@
  *
  * Defines just enough of the UEFI spec to build a boot services application.
  * No dependency on gnu-efi or EDK2.
+ *
+ * All UEFI function pointers use __attribute__((ms_abi)) because UEFI
+ * uses the Microsoft x64 calling convention (args in RCX, RDX, R8, R9).
  */
 
 #ifndef BOOTAI_EFI_H
@@ -10,6 +13,9 @@
 
 #include <stdint.h>
 #include <stddef.h>
+
+/* UEFI calling convention — Microsoft x64 ABI */
+#define EFIAPI __attribute__((ms_abi))
 
 /* Basic UEFI types */
 typedef uint64_t UINTN;
@@ -32,9 +38,16 @@ typedef struct {
 #define EFI_SUCCESS              0
 #define EFI_ERROR_MASK           0x8000000000000000ULL
 #define EFI_ERROR(x)             ((x) | EFI_ERROR_MASK)
-#define EFI_NOT_READY            EFI_ERROR(6)
-#define EFI_NOT_FOUND            EFI_ERROR(14)
+#define EFI_UNSUPPORTED          EFI_ERROR(3)
 #define EFI_BUFFER_TOO_SMALL     EFI_ERROR(5)
+#define EFI_NOT_READY            EFI_ERROR(6)
+#define EFI_DEVICE_ERROR         EFI_ERROR(7)
+#define EFI_NOT_FOUND            EFI_ERROR(14)
+#define EFI_NO_MAPPING           EFI_ERROR(17)
+#define EFI_TIMEOUT              EFI_ERROR(18)
+#define EFI_CONNECTION_FIN       EFI_ERROR(104)
+#define EFI_CONNECTION_RESET     EFI_ERROR(105)
+#define EFI_CONNECTION_REFUSED   EFI_ERROR(106)
 
 /* Memory types */
 typedef enum {
@@ -48,6 +61,133 @@ typedef enum {
     EfiConventionalMemory,
     EfiMaxMemoryType
 } EFI_MEMORY_TYPE;
+
+/* IPv4 address */
+typedef struct { uint8_t Addr[4]; } EFI_IPv4_ADDRESS;
+
+/* Service Binding Protocol (used by TCP4, UDP4, DNS4, HTTP) */
+typedef struct EFI_SERVICE_BINDING_PROTOCOL {
+    EFI_STATUS (EFIAPI *CreateChild)(struct EFI_SERVICE_BINDING_PROTOCOL *This, EFI_HANDLE *ChildHandle);
+    EFI_STATUS (EFIAPI *DestroyChild)(struct EFI_SERVICE_BINDING_PROTOCOL *This, EFI_HANDLE ChildHandle);
+} EFI_SERVICE_BINDING_PROTOCOL;
+
+/* ---- TCP4 Protocol types ---- */
+
+typedef struct {
+    BOOLEAN          UseDefaultAddress;
+    EFI_IPv4_ADDRESS StationAddress;
+    EFI_IPv4_ADDRESS SubnetMask;
+    uint16_t         StationPort;
+    EFI_IPv4_ADDRESS RemoteAddress;
+    uint16_t         RemotePort;
+    BOOLEAN          ActiveFlag;
+} EFI_TCP4_ACCESS_POINT;
+
+typedef struct {
+    uint8_t               TypeOfService;
+    uint8_t               TimeToLive;
+    EFI_TCP4_ACCESS_POINT AccessPoint;
+    void                 *ControlOption;
+} EFI_TCP4_CONFIG_DATA;
+
+typedef struct {
+    EFI_EVENT  Event;
+    EFI_STATUS Status;
+} EFI_TCP4_COMPLETION_TOKEN;
+
+typedef struct {
+    EFI_TCP4_COMPLETION_TOKEN CompletionToken;
+} EFI_TCP4_CONNECTION_TOKEN;
+
+typedef struct {
+    uint32_t FragmentLength;
+    void    *FragmentBuffer;
+} EFI_TCP4_FRAGMENT_DATA;
+
+typedef struct {
+    BOOLEAN              Push;
+    BOOLEAN              Urgent;
+    uint32_t             DataLength;
+    uint32_t             FragmentCount;
+    EFI_TCP4_FRAGMENT_DATA FragmentTable[1];
+} EFI_TCP4_TRANSMIT_DATA;
+
+typedef struct {
+    BOOLEAN              UrgentFlag;
+    uint32_t             DataLength;
+    uint32_t             FragmentCount;
+    EFI_TCP4_FRAGMENT_DATA FragmentTable[1];
+} EFI_TCP4_RECEIVE_DATA;
+
+typedef struct {
+    EFI_TCP4_COMPLETION_TOKEN CompletionToken;
+    union {
+        EFI_TCP4_RECEIVE_DATA  *RxData;
+        EFI_TCP4_TRANSMIT_DATA *TxData;
+    } Packet;
+} EFI_TCP4_IO_TOKEN;
+
+typedef struct {
+    EFI_TCP4_COMPLETION_TOKEN CompletionToken;
+} EFI_TCP4_CLOSE_TOKEN;
+
+typedef struct EFI_TCP4_PROTOCOL {
+    void *GetModeData;
+    EFI_STATUS (EFIAPI *Configure)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_CONFIG_DATA *TcpConfigData);
+    void *Routes;
+    EFI_STATUS (EFIAPI *Connect)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_CONNECTION_TOKEN *ConnectionToken);
+    void *Accept;
+    EFI_STATUS (EFIAPI *Transmit)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_IO_TOKEN *Token);
+    EFI_STATUS (EFIAPI *Receive)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_IO_TOKEN *Token);
+    EFI_STATUS (EFIAPI *Close)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_CLOSE_TOKEN *CloseToken);
+    void *Cancel;
+    EFI_STATUS (EFIAPI *Poll)(struct EFI_TCP4_PROTOCOL *This);
+} EFI_TCP4_PROTOCOL;
+
+/* ---- IP4 Config2 Protocol (for DHCP) ---- */
+
+typedef struct EFI_IP4_CONFIG2_PROTOCOL {
+    EFI_STATUS (EFIAPI *SetData)(struct EFI_IP4_CONFIG2_PROTOCOL *This, uint32_t DataType, UINTN DataSize, void *Data);
+    EFI_STATUS (EFIAPI *GetData)(struct EFI_IP4_CONFIG2_PROTOCOL *This, uint32_t DataType, UINTN *DataSize, void *Data);
+    void *RegisterDataNotify;
+    void *UnregisterDataNotify;
+} EFI_IP4_CONFIG2_PROTOCOL;
+
+/* IP4Config2 data types */
+#define IP4_CONFIG2_DATA_TYPE_INTERFACEINFO 0
+#define IP4_CONFIG2_DATA_TYPE_POLICY        1
+#define IP4_CONFIG2_DATA_TYPE_DNSSERVER     4
+
+/* IP4Config2 policy */
+#define IP4_CONFIG2_POLICY_STATIC 0
+#define IP4_CONFIG2_POLICY_DHCP   1
+
+/* ---- DNS4 Protocol (minimal) ---- */
+
+typedef struct {
+    EFI_STATUS       Status;
+    uint32_t         IpCount;
+    EFI_IPv4_ADDRESS *IpList;
+} EFI_DNS4_HOST_NAME_TO_IP;
+
+typedef struct {
+    EFI_EVENT  Event;
+    EFI_STATUS Status;
+    uint32_t   RetryCount;
+    uint32_t   RetryInterval;
+    EFI_DNS4_HOST_NAME_TO_IP *H2AData;
+} EFI_DNS4_COMPLETION_TOKEN;
+
+typedef struct EFI_DNS4_PROTOCOL {
+    void *GetModeData;
+    EFI_STATUS (EFIAPI *Configure)(struct EFI_DNS4_PROTOCOL *This, void *DnsConfigData);
+    EFI_STATUS (EFIAPI *HostNameToIp)(struct EFI_DNS4_PROTOCOL *This, CHAR16 *HostName, EFI_DNS4_COMPLETION_TOKEN *Token);
+    void *IpToHostName;
+    void *GeneralLookUp;
+    void *UpdateDnsCache;
+    EFI_STATUS (EFIAPI *Poll)(struct EFI_DNS4_PROTOCOL *This);
+    void *Cancel;
+} EFI_DNS4_PROTOCOL;
 
 /* Forward declarations */
 typedef struct EFI_SYSTEM_TABLE    EFI_SYSTEM_TABLE;
@@ -63,13 +203,13 @@ typedef struct {
 
 /* Simple Text Output Protocol */
 struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
-    EFI_STATUS (*Reset)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
-    EFI_STATUS (*OutputString)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String);
+    EFI_STATUS (EFIAPI *Reset)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
+    EFI_STATUS (EFIAPI *OutputString)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String);
     void *TestString;
     void *QueryMode;
     void *SetMode;
     void *SetAttribute;
-    EFI_STATUS (*ClearScreen)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *ClearScreen)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This);
     void *SetCursorPosition;
     void *EnableCursor;
     void *Mode;
@@ -77,8 +217,8 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
 
 /* Simple Text Input Protocol */
 struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
-    EFI_STATUS (*Reset)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
-    EFI_STATUS (*ReadKeyStroke)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
+    EFI_STATUS (EFIAPI *Reset)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
+    EFI_STATUS (EFIAPI *ReadKeyStroke)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
     EFI_EVENT WaitForKey;
 };
 
@@ -91,25 +231,25 @@ struct EFI_BOOT_SERVICES {
     void *RestoreTPL;
 
     /* Memory */
-    EFI_STATUS (*AllocatePages)(int Type, EFI_MEMORY_TYPE MemoryType, UINTN Pages, uint64_t *Memory);
-    EFI_STATUS (*FreePages)(uint64_t Memory, UINTN Pages);
-    EFI_STATUS (*GetMemoryMap)(UINTN *MemoryMapSize, void *MemoryMap, UINTN *MapKey, UINTN *DescriptorSize, uint32_t *DescriptorVersion);
-    EFI_STATUS (*AllocatePool)(EFI_MEMORY_TYPE PoolType, UINTN Size, void **Buffer);
-    EFI_STATUS (*FreePool)(void *Buffer);
+    EFI_STATUS (EFIAPI *AllocatePages)(int Type, EFI_MEMORY_TYPE MemoryType, UINTN Pages, uint64_t *Memory);
+    EFI_STATUS (EFIAPI *FreePages)(uint64_t Memory, UINTN Pages);
+    EFI_STATUS (EFIAPI *GetMemoryMap)(UINTN *MemoryMapSize, void *MemoryMap, UINTN *MapKey, UINTN *DescriptorSize, uint32_t *DescriptorVersion);
+    EFI_STATUS (EFIAPI *AllocatePool)(EFI_MEMORY_TYPE PoolType, UINTN Size, void **Buffer);
+    EFI_STATUS (EFIAPI *FreePool)(void *Buffer);
 
     /* Events */
-    void *CreateEvent;
+    EFI_STATUS (EFIAPI *CreateEvent)(uint32_t Type, UINTN NotifyTpl, void (EFIAPI *NotifyFunction)(EFI_EVENT, void*), void *NotifyContext, EFI_EVENT *Event);
     void *SetTimer;
-    EFI_STATUS (*WaitForEvent)(UINTN NumberOfEvents, EFI_EVENT *Event, UINTN *Index);
+    EFI_STATUS (EFIAPI *WaitForEvent)(UINTN NumberOfEvents, EFI_EVENT *Event, UINTN *Index);
     void *SignalEvent;
-    void *CloseEvent;
+    EFI_STATUS (EFIAPI *CloseEvent)(EFI_EVENT Event);
     void *CheckEvent;
 
     /* Protocol Handlers */
     void *InstallProtocolInterface;
     void *ReinstallProtocolInterface;
     void *UninstallProtocolInterface;
-    void *HandleProtocol;
+    EFI_STATUS (EFIAPI *HandleProtocol)(EFI_HANDLE Handle, EFI_GUID *Protocol, void **Interface);
     void *Reserved;
     void *RegisterProtocolNotify;
     void *LocateHandle;
@@ -125,11 +265,11 @@ struct EFI_BOOT_SERVICES {
 
     /* Misc */
     void *GetNextMonotonicCount;
-    void *Stall;
+    EFI_STATUS (EFIAPI *Stall)(UINTN Microseconds);
     void *SetWatchdogTimer;
 
     /* Driver support */
-    void *ConnectController;
+    EFI_STATUS (EFIAPI *ConnectController)(EFI_HANDLE ControllerHandle, EFI_HANDLE *DriverImageHandle, void *RemainingDevicePath, BOOLEAN Recursive);
     void *DisconnectController;
 
     /* Open/Close Protocol */
@@ -139,8 +279,8 @@ struct EFI_BOOT_SERVICES {
 
     /* Library */
     void *ProtocolsPerHandle;
-    EFI_STATUS (*LocateHandleBuffer)(int SearchType, EFI_GUID *Protocol, void *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
-    EFI_STATUS (*LocateProtocol)(EFI_GUID *Protocol, void *Registration, void **Interface);
+    EFI_STATUS (EFIAPI *LocateHandleBuffer)(int SearchType, EFI_GUID *Protocol, void *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
+    EFI_STATUS (EFIAPI *LocateProtocol)(EFI_GUID *Protocol, void *Registration, void **Interface);
 };
 
 /* System Table */
@@ -158,12 +298,14 @@ struct EFI_SYSTEM_TABLE {
     EFI_BOOT_SERVICES              *BootServices;
 };
 
-/* Protocol GUIDs — defined in efi/main.c */
+/* Protocol GUIDs */
 extern EFI_GUID gEfiSimpleFileSystemProtocolGuid;
-extern EFI_GUID gEfiTcp4ProtocolGuid;
-extern EFI_GUID gEfiHttpProtocolGuid;
-extern EFI_GUID gEfiDhcp4ProtocolGuid;
 extern EFI_GUID gEfiGraphicsOutputProtocolGuid;
+extern EFI_GUID gEfiTcp4ServiceBindingGuid;
+extern EFI_GUID gEfiTcp4ProtocolGuid;
+extern EFI_GUID gEfiIp4Config2ProtocolGuid;
+extern EFI_GUID gEfiDns4ServiceBindingGuid;
+extern EFI_GUID gEfiDns4ProtocolGuid;
 
 /* Global system table — set in efi_main */
 extern EFI_SYSTEM_TABLE *gST;
@@ -188,7 +330,9 @@ EFI_STATUS efi_list_dir(const char *path);
 
 /* Networking */
 EFI_STATUS efi_net_init(void);
-EFI_STATUS efi_http_get(const char *url, void **response, UINTN *size);
+int efi_net_available(void);
+EFI_STATUS efi_http_get(const char *url, char *response, UINTN max_size, UINTN *out_size);
+EFI_STATUS efi_dns_resolve(const char *hostname, EFI_IPv4_ADDRESS *out_ip);
 
 /* Memory — JACLibc malloc wired to UEFI AllocatePool */
 void efi_memory_init(void);

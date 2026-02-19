@@ -1,4 +1,4 @@
-# BootAI
+## BootAI
 
 Boot straight into AI. A UEFI application that turns any x86_64 machine into an AI coding assistant — no OS required.
 
@@ -7,18 +7,23 @@ Plug in a USB drive, power on, and you're talking to a language model that can r
 ## What It Does
 
 - **Chat / code generation** — full language model inference on bare metal
+
 - **File operations** — read, write, list files via UEFI Simple File System
+
 - **Web search** — search DuckDuckGo via UEFI TCP4 networking
+
 - **URL fetching** — pull web pages via UEFI HTTP protocol
+
 - **Persistent settings** — saved in UEFI NVRAM across reboots
+
 - **Conversation history** — saved to disk
 
 ## Models
 
-| Model | Size | Quantization | Memory |
-|-------|------|-------------|--------|
-| Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | ~4 GB |
-| RWKV-X 3.6B | 3.6B | Q8 (INT8) | ~3.6 GB |
+| Model                     | Size | Quantization | Memory  |
+| ------------------------- | ---- | ------------ | ------- |
+| Qwen2.5-Coder-7B-Instruct | 7B   | Q4_K_M       | ~4 GB   |
+| RWKV-X 3.6B               | 3.6B | Q8 (INT8)    | ~3.6 GB |
 
 Minimum 8GB RAM required.
 
@@ -27,10 +32,15 @@ Minimum 8GB RAM required.
 No kernel. No OS. The `.efi` binary stays in UEFI boot services mode, which gives us free access to:
 
 - **Filesystem** — Simple File System Protocol (FAT32)
+
 - **Networking** — TCP4, UDP4, HTTP, DHCP4
+
 - **Display** — Graphics Output Protocol
+
 - **Keyboard** — Simple Text Input Protocol
+
 - **Storage** — NVRAM variables
+
 - **Timers** — Event services
 
 ## Stack
@@ -53,7 +63,7 @@ x86_64 Hardware
 
 ## Build
 
-```bash
+```
 # Prerequisites (macOS)
 brew install x86_64-elf-gcc ovmf qemu
 
@@ -90,4 +100,4 @@ bootai/
 
 ## License
 
-MIT
+MIT-T
