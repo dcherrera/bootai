@@ -6,6 +6,7 @@
  */
 
 #include "efi.h"
+#include "foundry/tensor/tensor.h"
 
 /* Globals */
 EFI_SYSTEM_TABLE  *gST = 0;
@@ -53,6 +54,94 @@ static void show_boot_menu(void) {
     efi_print_ascii("  Select: ");
 }
 
+/* ----------------------------------------------------------------- */
+/* Tensor self-test — verifies foundry tensor ops on bare metal      */
+/* ----------------------------------------------------------------- */
+static void tensor_self_test(void) {
+    efi_print_ascii("  Running tensor self-test...\r\n");
+    int pass;
+
+    /* Disable autograd — we're doing inference, not training */
+    bool prev_grad = tm_no_grad_begin();
+
+    /* Test 1: matmul — [2,3] @ [3,2] = [2,2] with all 3.0 */
+    {
+        int64_t shape_a[] = {2, 3};
+        int64_t shape_b[] = {3, 2};
+        tm_tensor *a = tm_ones(shape_a, 2, TM_F32);
+        tm_tensor *b = tm_ones(shape_b, 2, TM_F32);
+        tm_tensor *c = tm_matmul(a, b);
+
+        float *data = tm_data_f32(c);
+        pass = (c && c->shape[0] == 2 && c->shape[1] == 2 &&
+                data[0] == 3.0f && data[1] == 3.0f &&
+                data[2] == 3.0f && data[3] == 3.0f);
+        efi_print_ascii(pass ? "  PASS: matmul\r\n" : "  FAIL: matmul\r\n");
+
+        tm_free(a);
+        tm_free(b);
+        tm_free(c);
+    }
+
+    /* Test 2: softmax — use tm_softmax now */
+    {
+        int64_t shape[] = {1, 4};
+        tm_tensor *t = tm_ones(shape, 2, TM_F32);
+        tm_tensor *s = tm_softmax(t, -1);
+
+        float *data = tm_data_f32(s);
+        /* softmax of [1,1,1,1] = [0.25, 0.25, 0.25, 0.25] */
+        float total = data[0] + data[1] + data[2] + data[3];
+        pass = (total > 0.999f && total < 1.001f &&
+                data[0] > 0.24f && data[0] < 0.26f);
+        efi_print_ascii(pass ? "  PASS: softmax\r\n" : "  FAIL: softmax\r\n");
+
+        tm_free(t);
+        tm_free(s);
+    }
+
+    /* Test 3: rms_norm — normalized output */
+    {
+        int64_t shape[] = {1, 4};
+        tm_tensor *t = tm_full(shape, 2, TM_F32, 2.0);
+        tm_tensor *w = tm_ones(shape, 2, TM_F32);
+        tm_tensor *n = tm_rms_norm(t, w, 1e-6f);
+
+        if (!n) { efi_print_ascii("  FAIL: rms_norm returned NULL\r\n"); tm_free(t); tm_free(w); goto done; }
+
+        float *data = tm_data_f32(n);
+        /* RMS of [2,2,2,2] = 2.0, so normalized = 2/2 * 1 = 1.0 */
+        pass = (data[0] > 0.99f && data[0] < 1.01f);
+        efi_print_ascii(pass ? "  PASS: rms_norm\r\n" : "  FAIL: rms_norm\r\n");
+
+        tm_free(t);
+        tm_free(w);
+        tm_free(n);
+    }
+
+    /* Test 4: silu — silu(x) = x * sigmoid(x) */
+    {
+        int64_t shape[] = {4};
+        tm_tensor *t = tm_ones(shape, 1, TM_F32);
+        if (!t) { efi_print_ascii("  FAIL: silu: tm_ones NULL\r\n"); goto done; }
+
+        tm_tensor *s = tm_silu(t);
+        if (!s) { efi_print_ascii("  FAIL: silu: tm_silu NULL\r\n"); tm_free(t); goto done; }
+
+        float *data = tm_data_f32(s);
+        /* silu(1.0) = 1.0 * sigmoid(1.0) = 1.0 * 0.7311 ≈ 0.7311 */
+        pass = (data[0] > 0.73f && data[0] < 0.74f);
+        efi_print_ascii(pass ? "  PASS: silu\r\n" : "  FAIL: silu\r\n");
+
+        tm_free(t);
+        tm_free(s);
+    }
+
+done:
+    tm_no_grad_end(prev_grad);
+    efi_print_ascii("  Tensor self-test complete.\r\n");
+}
+
 #define HTTP_RESPONSE_MAX 8192
 #define DISPLAY_MAX       2048
 
@@ -61,7 +150,7 @@ static void command_repl(void) {
     char response[HTTP_RESPONSE_MAX];
 
     efi_print_ascii("\r\n");
-    efi_print_ascii("  Command REPL — commands: fetch <url>, netinfo, exit\r\n");
+    efi_print_ascii("  Command REPL — commands: fetch <url>, netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -159,11 +248,38 @@ static void command_repl(void) {
             continue;
         }
 
+        /* tensor — run tensor self-test */
+        if (str_eq(line, "tensor")) {
+            tensor_self_test();
+            continue;
+        }
+
         /* Default: echo back */
         efi_print_ascii("  ");
         efi_print_line(line);
     }
 }
+
+/*
+ * Switch to a larger stack and call fn(). UEFI default stack is ~128KB
+ * which overflows during tensor operations. We allocate 1MB via AllocatePages.
+ */
+static void run_on_new_stack(void (*fn)(void), void *stack_top) {
+    register void *old_rsp __asm__("r15");
+    __asm__ volatile (
+        "mov %%rsp, %[old]\n\t"     /* save old stack pointer */
+        "mov %[top], %%rsp\n\t"     /* switch to new stack */
+        "call *%[func]\n\t"         /* call the function */
+        "mov %[old], %%rsp\n\t"     /* restore old stack */
+        : [old] "=&r"(old_rsp)
+        : [top] "r"(stack_top), [func] "r"(fn)
+        : "memory", "cc",
+          "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11"
+    );
+}
+
+static void __attribute__((used)) app_main(void);
 
 /* EFI application entry point — must use MS x64 calling convention */
 EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
@@ -178,6 +294,26 @@ EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_T
     /* Initialize memory */
     efi_memory_init();
 
+    /* Allocate 2MB stack for tensor operations */
+    #define APP_STACK_PAGES 512  /* 512 * 4KB = 2MB */
+    uint64_t stack_addr = 0;
+    EFI_STATUS st = gBS->AllocatePages(0, EfiLoaderData, APP_STACK_PAGES, &stack_addr);
+    if (st != EFI_SUCCESS) {
+        efi_print_ascii("  FATAL: cannot allocate stack\r\n");
+        return EFI_SUCCESS;
+    }
+
+    /* Stack grows down — top is base + size, 16-byte aligned.
+     * x86_64 ABI: RSP must be 16-byte aligned BEFORE call.
+     * The 'call' instruction pushes 8 bytes, so RSP inside the callee
+     * will be at 16n+8, which is correct per ABI. */
+    void *stack_top = (void *)((stack_addr + APP_STACK_PAGES * 4096ULL) & ~0xFULL);
+    run_on_new_stack(app_main, stack_top);
+
+    return EFI_SUCCESS;
+}
+
+static void __attribute__((used)) app_main(void) {
     /* Initialize networking */
     efi_print_ascii("  Initializing network...\r\n");
     EFI_STATUS net_status = efi_net_init();
@@ -186,6 +322,9 @@ EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_T
     } else {
         efi_print_ascii("  Network: unavailable\r\n");
     }
+
+    /* Run tensor self-test at boot */
+    tensor_self_test();
 
     /* Main loop: boot menu → action → back to menu */
     for (;;) {
@@ -227,6 +366,4 @@ EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_T
 
         efi_clear_screen();
     }
-
-    return EFI_SUCCESS;
 }

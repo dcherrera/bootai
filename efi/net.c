@@ -36,6 +36,19 @@ EFI_GUID gEfiDns4ProtocolGuid = {
     {0xA0, 0x11, 0x7E, 0xB5, 0x5A, 0x3F, 0x14, 0x01}
 };
 
+EFI_GUID gEfiUdp4ServiceBindingGuid = {
+    0x83f01464, 0x99bd, 0x45e5,
+    {0xb3, 0x83, 0xaf, 0x63, 0x05, 0xd8, 0xe9, 0xe6}
+};
+
+EFI_GUID gEfiUdp4ProtocolGuid = {
+    0x3ad9df29, 0x4501, 0x478d,
+    {0xb1, 0xf8, 0x7f, 0x7f, 0xe7, 0x0e, 0x50, 0xf3}
+};
+
+/* QEMU user-mode DNS forwarder */
+static EFI_IPv4_ADDRESS dns_server = { .Addr = {10, 0, 2, 3} };
+
 /* ---- Static globals ---- */
 
 static EFI_IP4_CONFIG2_PROTOCOL    *ip4_config2;
@@ -568,6 +581,337 @@ typedef struct {
     uint32_t         RetryInterval;
 } EFI_DNS4_CONFIG_DATA;
 
+/* ---- DNS wire format (RFC 1035) ---- */
+
+static uint16_t dns_query_id = 1;
+
+/*
+ * Build a DNS A-record query for hostname into buf.
+ * Returns query length, or 0 on error.
+ */
+static int dns_build_query(const char *hostname, uint8_t *buf, int buf_size) {
+    UINTN hlen = ba_strlen(hostname);
+    if (hlen == 0 || hlen > 253) return 0;
+
+    /* Estimate: 12 (header) + hlen + 2 (label overhead) + 1 (null) + 4 (qtype/qclass) */
+    int max_needed = 12 + (int)hlen + 2 + 1 + 4;
+    if (max_needed > buf_size) return 0;
+
+    ba_memset(buf, 0, (UINTN)buf_size);
+    int pos = 0;
+
+    /* Header: 12 bytes */
+    uint16_t id = dns_query_id++;
+    buf[pos++] = (uint8_t)(id >> 8);
+    buf[pos++] = (uint8_t)(id & 0xFF);
+    buf[pos++] = 0x01;  /* flags: RD=1 (recursion desired) */
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x00;  /* QDCOUNT = 1 */
+    buf[pos++] = 0x01;
+    buf[pos++] = 0x00;  /* ANCOUNT = 0 */
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x00;  /* NSCOUNT = 0 */
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x00;  /* ARCOUNT = 0 */
+    buf[pos++] = 0x00;
+
+    /* Question: label-encoded hostname */
+    const char *p = hostname;
+    while (*p) {
+        /* Find next dot or end */
+        const char *dot = p;
+        while (*dot && *dot != '.') dot++;
+
+        int label_len = (int)(dot - p);
+        if (label_len == 0 || label_len > 63) return 0;
+
+        buf[pos++] = (uint8_t)label_len;
+        for (int i = 0; i < label_len; i++) {
+            buf[pos++] = (uint8_t)p[i];
+        }
+        p = dot;
+        if (*p == '.') p++;
+    }
+    buf[pos++] = 0x00;  /* terminating null label */
+
+    /* QTYPE = A (1) */
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x01;
+
+    /* QCLASS = IN (1) */
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x01;
+
+    return pos;
+}
+
+/*
+ * Parse a DNS response and extract the first A record.
+ * Returns 1 on success, 0 on failure.
+ */
+static int dns_parse_response(const uint8_t *buf, int len, EFI_IPv4_ADDRESS *out_ip) {
+    if (len < 12) return 0;
+
+    /* Check QR=1 (response) */
+    if (!(buf[2] & 0x80)) return 0;
+
+    /* Check RCODE=0 (no error) */
+    if ((buf[3] & 0x0F) != 0) return 0;
+
+    /* ANCOUNT */
+    uint16_t ancount = ((uint16_t)buf[6] << 8) | buf[7];
+    if (ancount == 0) return 0;
+
+    /* Skip header (12 bytes) */
+    int pos = 12;
+
+    /* Skip question section: walk labels, then skip QTYPE + QCLASS (4 bytes) */
+    /* QDCOUNT */
+    uint16_t qdcount = ((uint16_t)buf[4] << 8) | buf[5];
+    for (uint16_t q = 0; q < qdcount; q++) {
+        /* Walk labels */
+        while (pos < len) {
+            uint8_t llen = buf[pos];
+            if (llen == 0) { pos++; break; }
+            if ((llen & 0xC0) == 0xC0) { pos += 2; break; } /* compression pointer */
+            pos += 1 + llen;
+        }
+        pos += 4; /* QTYPE + QCLASS */
+    }
+
+    /* Walk answer RRs */
+    for (uint16_t a = 0; a < ancount && pos < len; a++) {
+        /* Skip NAME (handle compression pointers) */
+        while (pos < len) {
+            uint8_t llen = buf[pos];
+            if (llen == 0) { pos++; break; }
+            if ((llen & 0xC0) == 0xC0) { pos += 2; break; }
+            pos += 1 + llen;
+        }
+
+        if (pos + 10 > len) return 0;
+
+        uint16_t rtype  = ((uint16_t)buf[pos] << 8) | buf[pos + 1];
+        uint16_t rclass = ((uint16_t)buf[pos + 2] << 8) | buf[pos + 3];
+        /* skip TTL (4 bytes) */
+        uint16_t rdlength = ((uint16_t)buf[pos + 8] << 8) | buf[pos + 9];
+        pos += 10;
+
+        if (rtype == 1 && rclass == 1 && rdlength == 4) {
+            /* A record — extract IPv4 */
+            if (pos + 4 > len) return 0;
+            out_ip->Addr[0] = buf[pos];
+            out_ip->Addr[1] = buf[pos + 1];
+            out_ip->Addr[2] = buf[pos + 2];
+            out_ip->Addr[3] = buf[pos + 3];
+            return 1;
+        }
+
+        pos += rdlength;
+    }
+
+    return 0;
+}
+
+/* ---- UDP4 DNS resolver ---- */
+
+static EFI_STATUS udp4_dns_resolve(const char *hostname, EFI_IPv4_ADDRESS *out_ip) {
+    EFI_STATUS status;
+
+    if (!gBS) return EFI_NOT_READY;
+
+    /* Locate UDP4 Service Binding */
+    UINTN handle_count = 0;
+    EFI_HANDLE *handles = 0;
+    EFI_SERVICE_BINDING_PROTOCOL *udp4_sb = 0;
+
+    status = gBS->LocateHandleBuffer(SEARCH_BY_PROTOCOL, &gEfiUdp4ServiceBindingGuid,
+                                     0, &handle_count, &handles);
+    if (status != EFI_SUCCESS || handle_count == 0) {
+        efi_print_ascii("  UDP4 ServiceBinding not found\r\n");
+        return EFI_NOT_FOUND;
+    }
+
+    gBS->HandleProtocol(handles[0], &gEfiUdp4ServiceBindingGuid, (void **)&udp4_sb);
+    gBS->FreePool(handles);
+
+    if (!udp4_sb) return EFI_NOT_FOUND;
+
+    /* Create child instance */
+    EFI_HANDLE child_handle = 0;
+    status = udp4_sb->CreateChild(udp4_sb, &child_handle);
+    if (status != EFI_SUCCESS) {
+        print_status("UDP4 CreateChild", status);
+        return status;
+    }
+
+    EFI_UDP4_PROTOCOL *udp4 = 0;
+    status = gBS->HandleProtocol(child_handle, &gEfiUdp4ProtocolGuid, (void **)&udp4);
+    if (status != EFI_SUCCESS) {
+        print_status("HandleProtocol UDP4", status);
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return status;
+    }
+
+    /* Configure UDP4 */
+    EFI_UDP4_CONFIG_DATA udp_config;
+    ba_memset(&udp_config, 0, sizeof(udp_config));
+    udp_config.AcceptBroadcast = 0;
+    udp_config.AcceptPromiscuous = 0;
+    udp_config.AcceptAnyPort = 0;
+    udp_config.AllowDuplicatePort = 0;
+    udp_config.TypeOfService = 0;
+    udp_config.TimeToLive = 64;
+    udp_config.DoNotFragment = 0;
+    udp_config.ReceiveTimeout = 0;
+    udp_config.TransmitTimeout = 0;
+    udp_config.UseDefaultAddress = 1;
+    ba_memset(&udp_config.StationAddress, 0, sizeof(EFI_IPv4_ADDRESS));
+    ba_memset(&udp_config.SubnetMask, 0, sizeof(EFI_IPv4_ADDRESS));
+    udp_config.StationPort = 0; /* ephemeral */
+    ba_memset(&udp_config.RemoteAddress, 0, sizeof(EFI_IPv4_ADDRESS));
+    udp_config.RemotePort = 0;
+
+    /* Retry on EFI_NO_MAPPING (DHCP not ready) */
+    for (int retry = 0; retry < 20; retry++) {
+        status = udp4->Configure(udp4, &udp_config);
+        if (status != EFI_NO_MAPPING) break;
+        gBS->Stall(250000); /* 250ms */
+    }
+
+    if (status != EFI_SUCCESS) {
+        print_status("UDP4 Configure", status);
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return status;
+    }
+
+    /* Build DNS query */
+    uint8_t query_buf[512];
+    int query_len = dns_build_query(hostname, query_buf, sizeof(query_buf));
+    if (query_len == 0) {
+        efi_print_ascii("  Failed to build DNS query\r\n");
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return EFI_DEVICE_ERROR;
+    }
+
+    /* --- Transmit DNS query --- */
+    EFI_UDP4_SESSION_DATA tx_session;
+    ba_memset(&tx_session, 0, sizeof(tx_session));
+    ba_memcpy(&tx_session.DestinationAddress, &dns_server, sizeof(EFI_IPv4_ADDRESS));
+    tx_session.DestinationPort = 53;
+
+    EFI_UDP4_TRANSMIT_DATA tx_data;
+    ba_memset(&tx_data, 0, sizeof(tx_data));
+    tx_data.UdpSessionData = &tx_session;
+    tx_data.GatewayAddress = 0;
+    tx_data.DataLength = (uint32_t)query_len;
+    tx_data.FragmentCount = 1;
+    tx_data.FragmentTable[0].FragmentLength = (uint32_t)query_len;
+    tx_data.FragmentTable[0].FragmentBuffer = query_buf;
+
+    EFI_UDP4_COMPLETION_TOKEN tx_token;
+    ba_memset(&tx_token, 0, sizeof(tx_token));
+
+    status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                              empty_notify, 0, &tx_token.Event);
+    if (status != EFI_SUCCESS) {
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return status;
+    }
+
+    tx_token.Status = EFI_NOT_READY;
+    tx_token.Packet.TxData = &tx_data;
+
+    status = udp4->Transmit(udp4, &tx_token);
+    if (status != EFI_SUCCESS) {
+        print_status("UDP4 Transmit", status);
+        gBS->CloseEvent(tx_token.Event);
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return status;
+    }
+
+    /* Poll for transmit completion */
+    for (int wait = 0; wait < 50; wait++) {
+        udp4->Poll(udp4);
+        if (tx_token.Status != EFI_NOT_READY) break;
+        gBS->Stall(100000); /* 100ms */
+    }
+    gBS->CloseEvent(tx_token.Event);
+
+    if (tx_token.Status != EFI_SUCCESS) {
+        print_status("UDP4 Transmit result", tx_token.Status);
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return tx_token.Status;
+    }
+
+    /* --- Receive DNS response --- */
+    EFI_UDP4_COMPLETION_TOKEN rx_token;
+    ba_memset(&rx_token, 0, sizeof(rx_token));
+
+    status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                              empty_notify, 0, &rx_token.Event);
+    if (status != EFI_SUCCESS) {
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return status;
+    }
+
+    rx_token.Status = EFI_NOT_READY;
+    rx_token.Packet.RxData = 0;
+
+    status = udp4->Receive(udp4, &rx_token);
+    if (status != EFI_SUCCESS) {
+        print_status("UDP4 Receive", status);
+        gBS->CloseEvent(rx_token.Event);
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return status;
+    }
+
+    /* Poll for receive completion (5-second timeout) */
+    for (int wait = 0; wait < 50; wait++) {
+        udp4->Poll(udp4);
+        if (rx_token.Status != EFI_NOT_READY) break;
+        gBS->Stall(100000); /* 100ms */
+    }
+    gBS->CloseEvent(rx_token.Event);
+
+    if (rx_token.Status != EFI_SUCCESS || !rx_token.Packet.RxData) {
+        if (rx_token.Status == EFI_NOT_READY) {
+            efi_print_ascii("  DNS query timed out\r\n");
+        } else {
+            print_status("UDP4 Receive result", rx_token.Status);
+        }
+        udp4_sb->DestroyChild(udp4_sb, child_handle);
+        return (rx_token.Status == EFI_NOT_READY) ? EFI_TIMEOUT : rx_token.Status;
+    }
+
+    /* Parse the DNS response from the received fragment */
+    EFI_UDP4_RECEIVE_DATA *rx_data = rx_token.Packet.RxData;
+    int parsed = 0;
+
+    if (rx_data->FragmentCount > 0 && rx_data->FragmentTable[0].FragmentBuffer) {
+        parsed = dns_parse_response(
+            (const uint8_t *)rx_data->FragmentTable[0].FragmentBuffer,
+            (int)rx_data->FragmentTable[0].FragmentLength,
+            out_ip);
+    }
+
+    /* Signal RecycleSignal to return buffer to firmware */
+    if (rx_data->RecycleSignal) {
+        gBS->SignalEvent(rx_data->RecycleSignal);
+    }
+
+    udp4_sb->DestroyChild(udp4_sb, child_handle);
+
+    if (!parsed) {
+        efi_print_ascii("  DNS: no A record in response\r\n");
+        return EFI_NOT_FOUND;
+    }
+
+    return EFI_SUCCESS;
+}
+
+/* ---- DNS resolution ---- */
+
 EFI_STATUS efi_dns_resolve(const char *hostname, EFI_IPv4_ADDRESS *out_ip) {
     /* First try: parse as raw IP address */
     if (parse_ipv4(hostname, out_ip)) {
@@ -576,12 +920,18 @@ EFI_STATUS efi_dns_resolve(const char *hostname, EFI_IPv4_ADDRESS *out_ip) {
 
     if (!gBS) return EFI_NOT_READY;
 
-    /* DNS4 protocol is available in OVMF with NETWORK_HTTP_ENABLE but has
-       stability issues (crashes with #GP in pool memory handling). For now,
-       hostnames are not supported — use IP addresses directly.
-       TODO: Implement lightweight DNS client over UDP4, or fix OVMF DNS4 interaction. */
-    efi_print_ascii("  Hostname resolution not yet supported. Use IP address.\r\n");
-    return EFI_NOT_FOUND;
+    /* Use our lightweight UDP4 DNS client (OVMF's DNS4 driver crashes with #GP) */
+    efi_print_ascii("  Resolving ");
+    efi_print_ascii(hostname);
+    efi_print_ascii("...\r\n");
+
+    EFI_STATUS status = udp4_dns_resolve(hostname, out_ip);
+    if (status == EFI_SUCCESS) {
+        efi_print_ascii("  Resolved to ");
+        print_ip(out_ip);
+        efi_print_ascii("\r\n");
+    }
+    return status;
 }
 
 /* ---- HTTP/1.0 GET ---- */

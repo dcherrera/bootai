@@ -2,7 +2,7 @@
 
 ## Status: WORKING
 
-DHCP, TCP4, and HTTP/1.0 GET all work end-to-end in QEMU. DNS hostname resolution is disabled due to an OVMF driver bug — use IP addresses directly.
+DHCP, TCP4, HTTP/1.0 GET, and DNS hostname resolution all work end-to-end in QEMU. DNS uses a custom UDP4 resolver (OVMF's DNS4 driver has a firmware bug).
 
 ## What's Done
 
@@ -75,7 +75,7 @@ Build command: `GCC5_BIN=/opt/homebrew/bin/x86_64-elf- build -a X64 -t GCC5 -p O
 
 ## Known Limitations
 
-- **No DNS**: OVMF's DNS4 driver crashes with #GP (accesses freed pool memory). Hostnames not supported — use IP addresses.
+- **DNS via UDP4 only**: OVMF's DNS4 driver crashes with #GP. Workaround: custom UDP4 DNS resolver (RFC 1035 wire format). Hardcoded to QEMU forwarder at 10.0.2.3.
 - **QEMU user-mode only**: External IPs don't route properly on macOS. Use `10.0.2.2` (QEMU gateway to host).
 - **Duplicate serial output**: Both ConOut and serial show output lines (cosmetic issue).
 - **HTTP only**: No HTTPS/TLS support.

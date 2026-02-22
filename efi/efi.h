@@ -144,6 +144,76 @@ typedef struct EFI_TCP4_PROTOCOL {
     EFI_STATUS (EFIAPI *Poll)(struct EFI_TCP4_PROTOCOL *This);
 } EFI_TCP4_PROTOCOL;
 
+/* ---- UDP4 Protocol types ---- */
+
+typedef struct {
+    BOOLEAN          AcceptBroadcast;
+    BOOLEAN          AcceptPromiscuous;
+    BOOLEAN          AcceptAnyPort;
+    BOOLEAN          AllowDuplicatePort;
+    uint8_t          TypeOfService;
+    uint8_t          TimeToLive;
+    BOOLEAN          DoNotFragment;
+    uint32_t         ReceiveTimeout;
+    uint32_t         TransmitTimeout;
+    BOOLEAN          UseDefaultAddress;
+    EFI_IPv4_ADDRESS StationAddress;
+    EFI_IPv4_ADDRESS SubnetMask;
+    uint16_t         StationPort;
+    EFI_IPv4_ADDRESS RemoteAddress;
+    uint16_t         RemotePort;
+} EFI_UDP4_CONFIG_DATA;
+
+typedef struct {
+    EFI_IPv4_ADDRESS SourceAddress;
+    uint16_t         SourcePort;
+    EFI_IPv4_ADDRESS DestinationAddress;
+    uint16_t         DestinationPort;
+} EFI_UDP4_SESSION_DATA;
+
+typedef struct {
+    uint32_t FragmentLength;
+    void    *FragmentBuffer;
+} EFI_UDP4_FRAGMENT_DATA;
+
+typedef struct {
+    EFI_UDP4_SESSION_DATA *UdpSessionData;
+    EFI_IPv4_ADDRESS      *GatewayAddress;
+    uint32_t               DataLength;
+    uint32_t               FragmentCount;
+    EFI_UDP4_FRAGMENT_DATA FragmentTable[1];
+} EFI_UDP4_TRANSMIT_DATA;
+
+typedef struct {
+    uint64_t               TimeStamp;     /* EFI_TIME pad — 8 bytes */
+    uint64_t               TimeStamp2;    /* Remaining 8 bytes of timestamp */
+    EFI_EVENT              RecycleSignal;
+    EFI_UDP4_SESSION_DATA  SessionData;
+    uint32_t               DataLength;
+    uint32_t               FragmentCount;
+    EFI_UDP4_FRAGMENT_DATA FragmentTable[1];
+} EFI_UDP4_RECEIVE_DATA;
+
+typedef struct {
+    EFI_EVENT  Event;
+    EFI_STATUS Status;
+    union {
+        EFI_UDP4_RECEIVE_DATA  *RxData;
+        EFI_UDP4_TRANSMIT_DATA *TxData;
+    } Packet;
+} EFI_UDP4_COMPLETION_TOKEN;
+
+typedef struct EFI_UDP4_PROTOCOL {
+    void *GetModeData;
+    EFI_STATUS (EFIAPI *Configure)(struct EFI_UDP4_PROTOCOL *This, EFI_UDP4_CONFIG_DATA *UdpConfigData);
+    void *Groups;
+    void *Routes;
+    EFI_STATUS (EFIAPI *Transmit)(struct EFI_UDP4_PROTOCOL *This, EFI_UDP4_COMPLETION_TOKEN *Token);
+    EFI_STATUS (EFIAPI *Receive)(struct EFI_UDP4_PROTOCOL *This, EFI_UDP4_COMPLETION_TOKEN *Token);
+    void *Cancel;
+    EFI_STATUS (EFIAPI *Poll)(struct EFI_UDP4_PROTOCOL *This);
+} EFI_UDP4_PROTOCOL;
+
 /* ---- IP4 Config2 Protocol (for DHCP) ---- */
 
 typedef struct EFI_IP4_CONFIG2_PROTOCOL {
@@ -241,7 +311,7 @@ struct EFI_BOOT_SERVICES {
     EFI_STATUS (EFIAPI *CreateEvent)(uint32_t Type, UINTN NotifyTpl, void (EFIAPI *NotifyFunction)(EFI_EVENT, void*), void *NotifyContext, EFI_EVENT *Event);
     void *SetTimer;
     EFI_STATUS (EFIAPI *WaitForEvent)(UINTN NumberOfEvents, EFI_EVENT *Event, UINTN *Index);
-    void *SignalEvent;
+    EFI_STATUS (EFIAPI *SignalEvent)(EFI_EVENT Event);
     EFI_STATUS (EFIAPI *CloseEvent)(EFI_EVENT Event);
     void *CheckEvent;
 
@@ -304,6 +374,8 @@ extern EFI_GUID gEfiGraphicsOutputProtocolGuid;
 extern EFI_GUID gEfiTcp4ServiceBindingGuid;
 extern EFI_GUID gEfiTcp4ProtocolGuid;
 extern EFI_GUID gEfiIp4Config2ProtocolGuid;
+extern EFI_GUID gEfiUdp4ServiceBindingGuid;
+extern EFI_GUID gEfiUdp4ProtocolGuid;
 extern EFI_GUID gEfiDns4ServiceBindingGuid;
 extern EFI_GUID gEfiDns4ProtocolGuid;
 

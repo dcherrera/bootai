@@ -1,0 +1,38 @@
+# BootAI Documentation
+
+UEFI application that boots directly into AI inference — no kernel, no OS.
+
+## Specs & Plans
+
+- [BootAI Roadmap](specs/bootai-roadmap.md) — 6-phase plan from boot to full AI assistant
+
+## Architecture
+
+- [UEFI Boot Architecture](architecture/uefi-boot-architecture.md) — Boot flow, memory model, build pipeline, driver binding
+- [Networking](architecture/networking.md) — DHCP, TCP4, UDP4 DNS, HTTP/1.0
+
+## Research
+
+- [Phase 2 Debug Log](research/phase2-debug-log.md) — Networking bring-up: bugs found, fixes applied
+
+## Adding Documentation
+
+1. Pick the right category:
+   - **specs/** — Plans, roadmaps, feature specifications
+   - **architecture/** — Internal system documentation
+   - **research/** — Investigation logs, debug sessions
+
+2. Use kebab-case filenames (`uefi-boot-architecture.md`, not `UEFIBootArchitecture.md`)
+
+3. Update this index with a link to your new document
+
+## Quick Links
+
+| Resource | Location |
+|----------|----------|
+| Main README | `../README.md` |
+| Build commands | `../Makefile` |
+| UEFI types | `../efi/efi.h` |
+| Network stack | `../efi/net.c` |
+| Entry point | `../efi/main.c` |
+| Project guidelines | `../CLAUDE.md` |
