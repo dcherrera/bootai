@@ -241,6 +241,7 @@ static void command_infer(void) {
     }
 
     char num[12];
+    /* Debug: show prompt token IDs
     int_to_str(num, n_prompt);
     efi_print_ascii("  Prompt: "); efi_print_ascii(num); efi_print_ascii(" tokens [");
     for (int t = 0; t < n_prompt && t < 10; t++) {
@@ -248,6 +249,7 @@ static void command_infer(void) {
         int_to_str(num, tokens[t]); efi_print_ascii(num);
     }
     efi_print_ascii("]\r\n");
+    */
     /* Reset model state */
     ba_model_reset(g_model);
 
@@ -273,14 +275,13 @@ static void command_infer(void) {
     char decode_buf[64];
 
     for (int i = 0; i < cfg.max_tokens; i++) {
-        /* Debug: show top-5 logits for first 5 tokens */
+        /* Debug: show top-5 logits for first 5 tokens
         if (i < 5) {
             int top_ids[5] = {0,0,0,0,0};
             float top_vals[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
             for (int v = 0; v < vocab; v++) {
                 if (logits[v] > top_vals[4]) {
                     top_vals[4] = logits[v]; top_ids[4] = v;
-                    /* bubble up */
                     for (int s = 4; s > 0 && top_vals[s] > top_vals[s-1]; s--) {
                         float tv = top_vals[s]; top_vals[s] = top_vals[s-1]; top_vals[s-1] = tv;
                         int ti = top_ids[s]; top_ids[s] = top_ids[s-1]; top_ids[s-1] = ti;
@@ -295,6 +296,7 @@ static void command_infer(void) {
             }
             uefi_printf("\r\n");
         }
+        */
 
         int next = ba_model_sample(logits, vocab, &cfg);
 
