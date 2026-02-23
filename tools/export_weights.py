@@ -44,18 +44,22 @@ def float32_to_float16(tensor: np.ndarray) -> np.ndarray:
 
 def detect_architecture(config) -> tuple:
     """Detect model architecture and return (arch_id, has_qk_norm, has_qkv_bias)."""
-    model_type = config.get("model_type", "")
+    model_type = config.get("model_type", "").lower()
+
+    # LLaMA-family (SmolLM2, LLaMA, Mistral): no qk_norm, no QKV bias
+    if "llama" in model_type:
+        return 2, False, False  # arch=llama, qk_norm=False, bias=False
 
     # Qwen3: has qk_norm, no QKV bias
-    if "qwen3" in model_type.lower() or config.get("head_dim", 0) == 64:
+    if "qwen3" in model_type:
         return 0, True, False  # arch=qwen3, qk_norm=True, bias=False
 
     # Qwen2.5: no qk_norm, has QKV bias
-    if "qwen2" in model_type.lower():
+    if "qwen2" in model_type:
         return 1, False, True  # arch=qwen2, qk_norm=False, bias=True
 
-    # Default: assume Qwen3-style
-    return 0, True, False
+    # Default: no qk_norm, no bias (safest)
+    return 2, False, False
 
 
 def export_weights(model_name: str, quant: str, output_path: str):
@@ -95,13 +99,16 @@ def export_weights(model_name: str, quant: str, output_path: str):
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
 
+    # Quantization mode
+    quant_id = 1 if quant == "f16" else 2  # 1=f16, 2=q8
+
     # Build header (128 bytes)
     header = struct.pack(
-        "<4sIIIIIIIIIIfIfII64s",
+        "<4sIIIIIIIIIIffIII64s",
         b"BTAI",           # magic
         1,                 # version
-        arch_id,           # arch (0=qwen3, 1=qwen2)
-        2,                 # quant (2=q8)
+        arch_id,           # arch (0=qwen3, 1=qwen2, 2=llama)
+        quant_id,          # quant (1=f16, 2=q8)
         n_layers,
         n_embd,
         n_heads,
@@ -147,6 +154,19 @@ def export_weights(model_name: str, quant: str, output_path: str):
         total_bytes += embed_f16.nbytes
         print(f"  embed_tokens: {embed_w.shape} -> f16 ({embed_f16.nbytes // 1024 // 1024} MB)")
 
+        def write_projection(f, weight, quant_mode):
+            """Write a weight matrix as either f16 or Q8."""
+            w = weight.float().numpy()
+            if quant_mode == "f16":
+                w_f16 = w.astype(np.float16)
+                f.write(w_f16.tobytes())
+                return w_f16.nbytes
+            else:
+                q8_data, scales = quantize_q8(w)
+                f.write(q8_data.tobytes())
+                f.write(scales.tobytes())
+                return q8_data.nbytes + scales.nbytes
+
         # Per-layer weights
         for i in range(n_layers):
             lp = f"{prefix}layers.{i}."
@@ -156,33 +176,17 @@ def export_weights(model_name: str, quant: str, output_path: str):
             f.write(ln1.tobytes())
             total_bytes += ln1.nbytes
 
-            # Q projection: [q_dim, n_embd] Q8
-            q_w = sd[f"{lp}self_attn.q_proj.weight"].float().numpy()
-            q_q8, q_scales = quantize_q8(q_w)
-            f.write(q_q8.tobytes())
-            f.write(q_scales.tobytes())
-            total_bytes += q_q8.nbytes + q_scales.nbytes
+            # Q projection: [q_dim, n_embd]
+            total_bytes += write_projection(f, sd[f"{lp}self_attn.q_proj.weight"], quant)
 
-            # K projection: [kv_dim, n_embd] Q8
-            k_w = sd[f"{lp}self_attn.k_proj.weight"].float().numpy()
-            k_q8, k_scales = quantize_q8(k_w)
-            f.write(k_q8.tobytes())
-            f.write(k_scales.tobytes())
-            total_bytes += k_q8.nbytes + k_scales.nbytes
+            # K projection: [kv_dim, n_embd]
+            total_bytes += write_projection(f, sd[f"{lp}self_attn.k_proj.weight"], quant)
 
-            # V projection: [kv_dim, n_embd] Q8
-            v_w = sd[f"{lp}self_attn.v_proj.weight"].float().numpy()
-            v_q8, v_scales = quantize_q8(v_w)
-            f.write(v_q8.tobytes())
-            f.write(v_scales.tobytes())
-            total_bytes += v_q8.nbytes + v_scales.nbytes
+            # V projection: [kv_dim, n_embd]
+            total_bytes += write_projection(f, sd[f"{lp}self_attn.v_proj.weight"], quant)
 
-            # O projection: [n_embd, q_dim] Q8
-            o_w = sd[f"{lp}self_attn.o_proj.weight"].float().numpy()
-            o_q8, o_scales = quantize_q8(o_w)
-            f.write(o_q8.tobytes())
-            f.write(o_scales.tobytes())
-            total_bytes += o_q8.nbytes + o_scales.nbytes
+            # O projection: [n_embd, q_dim]
+            total_bytes += write_projection(f, sd[f"{lp}self_attn.o_proj.weight"], quant)
 
             # QK-Norm (if present)
             if has_qk_norm:
@@ -218,26 +222,14 @@ def export_weights(model_name: str, quant: str, output_path: str):
             f.write(ln2.tobytes())
             total_bytes += ln2.nbytes
 
-            # gate_proj: [ffn_dim, n_embd] Q8
-            gate_w = sd[f"{lp}mlp.gate_proj.weight"].float().numpy()
-            gate_q8, gate_scales = quantize_q8(gate_w)
-            f.write(gate_q8.tobytes())
-            f.write(gate_scales.tobytes())
-            total_bytes += gate_q8.nbytes + gate_scales.nbytes
+            # gate_proj: [ffn_dim, n_embd]
+            total_bytes += write_projection(f, sd[f"{lp}mlp.gate_proj.weight"], quant)
 
-            # up_proj: [ffn_dim, n_embd] Q8
-            up_w = sd[f"{lp}mlp.up_proj.weight"].float().numpy()
-            up_q8, up_scales = quantize_q8(up_w)
-            f.write(up_q8.tobytes())
-            f.write(up_scales.tobytes())
-            total_bytes += up_q8.nbytes + up_scales.nbytes
+            # up_proj: [ffn_dim, n_embd]
+            total_bytes += write_projection(f, sd[f"{lp}mlp.up_proj.weight"], quant)
 
-            # down_proj: [n_embd, ffn_dim] Q8
-            down_w = sd[f"{lp}mlp.down_proj.weight"].float().numpy()
-            down_q8, down_scales = quantize_q8(down_w)
-            f.write(down_q8.tobytes())
-            f.write(down_scales.tobytes())
-            total_bytes += down_q8.nbytes + down_scales.nbytes
+            # down_proj: [n_embd, ffn_dim]
+            total_bytes += write_projection(f, sd[f"{lp}mlp.down_proj.weight"], quant)
 
             if (i + 1) % 4 == 0 or i == n_layers - 1:
                 print(f"  Layer {i+1}/{n_layers} done ({total_bytes // 1024 // 1024} MB)")

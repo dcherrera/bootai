@@ -221,11 +221,20 @@ static void command_infer(void) {
     int len = efi_read_line(prompt, sizeof(prompt));
     if (len <= 0) return;
 
-    /* Encode prompt directly (no chat template — works for all models).
-     * Chat models would need <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
-     * but base models (SmolLM2, Llama-base) just take raw text. */
+    /* Wrap in chat template for instruct models:
+     * <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
+     * <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n */
+    char chat_buf[2048];
+    int ci = 0;
+    const char *pre = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+    while (*pre && ci < 2000) chat_buf[ci++] = *pre++;
+    for (int p = 0; p < len && ci < 2000; p++) chat_buf[ci++] = prompt[p];
+    const char *post = "<|im_end|>\n<|im_start|>assistant\n";
+    while (*post && ci < 2000) chat_buf[ci++] = *post++;
+    chat_buf[ci] = '\0';
+
     int tokens[2048];
-    int n_prompt = ba_tokenizer_encode(g_tok, prompt, tokens, 2048);
+    int n_prompt = ba_tokenizer_encode(g_tok, chat_buf, tokens, 2048);
     if (n_prompt <= 0) {
         efi_print_ascii("  ERROR: tokenization failed\r\n");
         return;
@@ -239,8 +248,6 @@ static void command_infer(void) {
         int_to_str(num, tokens[t]); efi_print_ascii(num);
     }
     efi_print_ascii("]\r\n");
-    efi_print_ascii("  Generating...\r\n\r\n");
-
     /* Reset model state */
     ba_model_reset(g_model);
 
@@ -252,8 +259,14 @@ static void command_infer(void) {
     int im_end_id = ba_tokenizer_im_end(g_tok);
     int vocab = ba_model_vocab_size(g_model);
 
-    /* Prefill: process all prompt tokens */
-    float *logits = ba_model_forward(g_model, tokens, n_prompt);
+    /* Prefill: process prompt tokens one at a time with progress */
+    efi_print_ascii("  Prefilling");
+    float *logits = 0;
+    for (int i = 0; i < n_prompt; i++) {
+        logits = ba_model_forward(g_model, &tokens[i], 1);
+        if ((i + 1) % 5 == 0) efi_print_ascii(".");
+    }
+    efi_print_ascii(" done\r\n\r\n");
 
     /* Generate tokens */
     int n_gen = 0;

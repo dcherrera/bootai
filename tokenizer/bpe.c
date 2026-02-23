@@ -154,13 +154,11 @@ ba_tokenizer* ba_tokenizer_load(const char *path) {
     return tok;
 }
 
-/* Encode text to token IDs using BPE merge rules */
-int ba_tokenizer_encode(ba_tokenizer *tok, const char *text,
-                         int *tokens_out, int max_tokens) {
-    if (!tok || !text) return 0;
-
-    int text_len = str_len(text);
-    if (text_len == 0) return 0;
+/* BPE-encode a text segment (no special tokens) into tokens_out.
+ * Returns number of tokens written. */
+static int encode_segment(ba_tokenizer *tok, const char *text, int text_len,
+                           int *tokens_out, int max_tokens) {
+    if (text_len == 0 || max_tokens <= 0) return 0;
 
     /* Start with one token per byte */
     int n = text_len;
@@ -202,6 +200,63 @@ int ba_tokenizer_encode(ba_tokenizer *tok, const char *text,
 
     uefi_free(ids);
     return n;
+}
+
+/* Check if text at position starts with a special token.
+ * Returns the special token length and sets *id, or 0 if no match. */
+static int match_special(ba_tokenizer *tok, const char *text, int remaining, int *id) {
+    if (remaining >= 13 && memcmp(text, "<|endoftext|>", 13) == 0 && tok->eos_id >= 0) {
+        *id = tok->eos_id; return 13;
+    }
+    if (remaining >= 12 && memcmp(text, "<|im_start|>", 12) == 0 && tok->im_start_id >= 0) {
+        *id = tok->im_start_id; return 12;
+    }
+    if (remaining >= 10 && memcmp(text, "<|im_end|>", 10) == 0 && tok->im_end_id >= 0) {
+        *id = tok->im_end_id; return 10;
+    }
+    return 0;
+}
+
+/* Encode text to token IDs using BPE merge rules.
+ * Special tokens (<|im_start|>, <|im_end|>, <|endoftext|>) are matched
+ * as whole strings and emitted as single token IDs. */
+int ba_tokenizer_encode(ba_tokenizer *tok, const char *text,
+                         int *tokens_out, int max_tokens) {
+    if (!tok || !text) return 0;
+
+    int text_len = str_len(text);
+    if (text_len == 0) return 0;
+
+    int out_pos = 0;
+    int pos = 0;
+
+    while (pos < text_len && out_pos < max_tokens) {
+        /* Check for special token at current position */
+        int special_id = -1;
+        int special_len = match_special(tok, text + pos, text_len - pos, &special_id);
+        if (special_len > 0) {
+            tokens_out[out_pos++] = special_id;
+            pos += special_len;
+            continue;
+        }
+
+        /* Find end of regular text segment (next special token or end) */
+        int seg_start = pos;
+        pos++;
+        while (pos < text_len) {
+            int dummy;
+            if (match_special(tok, text + pos, text_len - pos, &dummy) > 0) break;
+            pos++;
+        }
+
+        /* BPE-encode the regular text segment */
+        int seg_len = pos - seg_start;
+        int remaining = max_tokens - out_pos;
+        int n = encode_segment(tok, text + seg_start, seg_len, tokens_out + out_pos, remaining);
+        out_pos += n;
+    }
+
+    return out_pos;
 }
 
 /* Decode token IDs to text */
