@@ -131,7 +131,7 @@ ba_tokenizer* ba_tokenizer_load(const char *path) {
             tok->im_start_id = (int)id;
         else if (name_len == 10 && memcmp(name, "<|im_end|>", 10) == 0)
             tok->im_end_id = (int)id;
-        else if (name_len == 14 && memcmp(name, "<|endoftext|>", 14) == 0)
+        else if (name_len == 13 && memcmp(name, "<|endoftext|>", 13) == 0)
             tok->eos_id = (int)id;
         else if (name_len == 3 && memcmp(name, "<s>", 3) == 0)
             tok->im_start_id = (int)id; /* BOS for Llama-family */

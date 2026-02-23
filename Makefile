@@ -150,10 +150,18 @@ endif
 	@echo "USB ready. Boot from it on any x86_64 machine."
 
 # Export model weights (run on host with Python + transformers)
+# IMPORTANT: MODEL must match the .btw weights on disk (currently SmolLM2-135M)
+MODEL ?= HuggingFaceTB/SmolLM2-135M-Instruct
 export-model:
 	python3 tools/export_weights.py \
-		--model Qwen/Qwen3-0.6B \
+		--model $(MODEL) \
 		--quant q8 \
+		--output esp/rwkvos/model.btw
+
+export-vocab:
+	python3 tools/export_weights.py \
+		--model $(MODEL) \
+		--vocab-only \
 		--output esp/rwkvos/model.btw
 
 clean:

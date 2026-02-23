@@ -317,18 +317,21 @@ def export_vocab(model_name: str, output_path: str):
             a_id = vocab.get(a_str, -1)
             b_id = vocab.get(b_str, -1)
             if a_id >= 0 and b_id >= 0:
-                merges.append((a_id, b_id))
+                result_id = vocab.get(a_str + b_str, 0)
+                merges.append((a_id, b_id, result_id))
     elif hasattr(tokenizer, "backend_tokenizer"):
-        # HF tokenizers
+        # HF tokenizers (GPT2TokenizerFast, Qwen2TokenizerFast, etc.)
+        import json
         bt = tokenizer.backend_tokenizer
-        if hasattr(bt, "model") and hasattr(bt.model, "get_vocab"):
-            try:
-                m = bt.model
-                if hasattr(m, "bpe_rank") or hasattr(m, "merges"):
-                    # Try to get merges from the model
-                    pass
-            except:
-                pass
+        data = json.loads(bt.to_str())
+        hf_merges = data.get("model", {}).get("merges", [])
+        for pair in hf_merges:
+            a_str, b_str = pair[0], pair[1]
+            a_id = vocab.get(a_str, -1)
+            b_id = vocab.get(b_str, -1)
+            if a_id >= 0 and b_id >= 0:
+                result_id = vocab.get(a_str + b_str, 0)
+                merges.append((a_id, b_id, result_id))
 
     # Special tokens
     special_tokens = {}
@@ -367,18 +370,33 @@ def export_vocab(model_name: str, output_path: str):
         # String blob
         f.write(blob)
 
-        # Merge table: merge_a[n_merges] then merge_b[n_merges]
+        # Merge table: merge_a[n_merges] then merge_b[n_merges] then merge_result[n_merges]
         if merges:
             merge_a = [m[0] for m in merges]
             merge_b = [m[1] for m in merges]
+            merge_result = [m[2] for m in merges]
             f.write(struct.pack(f"<{n_merges}I", *merge_a))
             f.write(struct.pack(f"<{n_merges}I", *merge_b))
+            f.write(struct.pack(f"<{n_merges}I", *merge_result))
 
         # Special tokens: {uint32 id, uint16 name_len, char name[]}
         for name, tid in special_tokens.items():
             name_bytes = name.encode("utf-8")
             f.write(struct.pack("<IH", tid, len(name_bytes)))
             f.write(name_bytes)
+
+        # Byte-to-token mapping: [256] uint32
+        # GPT-2 bytes_to_unicode() maps each byte to a Unicode char used in the vocab.
+        # Pre-compute byte -> token ID for the tokenizer's encode path.
+        byte_to_id = []
+        for b in range(256):
+            if 33 <= b <= 126 or 161 <= b <= 172 or 174 <= b <= 255:
+                ch = chr(b)
+            else:
+                ch = chr(256 + b)
+            tid = vocab.get(ch, 0)
+            byte_to_id.append(tid)
+        f.write(struct.pack("<256I", *byte_to_id))
 
     total_size = os.path.getsize(output_path)
     print(f"  Vocab size: {total_size / 1024:.1f} KB")
