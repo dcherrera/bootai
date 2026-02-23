@@ -15,7 +15,7 @@ CFLAGS = -O2 -msse4.2 \
 SHIM_CFLAGS = -I shim
 
 # Phase 1: EFI layer only (console + input + memory)
-EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c
+EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c
 
 # Phase 3: UEFI libc shim (malloc/printf via UEFI Boot Services)
 LIBC_SRC  = efi/uefi_libc.c
@@ -136,7 +136,7 @@ run: bootai-p4.efi
 		-m 8G \
 		-display none \
 		-serial stdio \
-		-netdev user,id=net0 \
+		-netdev user,id=net0,hostfwd=tcp::8080-:8080 \
 		-device virtio-net-pci,netdev=net0 \
 		-device virtio-rng-pci
 
@@ -156,7 +156,7 @@ run3: bootai.efi
 		-m 8G \
 		-display none \
 		-serial stdio \
-		-netdev user,id=net0 \
+		-netdev user,id=net0,hostfwd=tcp::8080-:8080 \
 		-device virtio-net-pci,netdev=net0 \
 		-device virtio-rng-pci
 

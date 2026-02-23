@@ -131,12 +131,17 @@ typedef struct {
     EFI_TCP4_COMPLETION_TOKEN CompletionToken;
 } EFI_TCP4_CLOSE_TOKEN;
 
+typedef struct {
+    EFI_TCP4_COMPLETION_TOKEN CompletionToken;
+    EFI_HANDLE                NewChildHandle;
+} EFI_TCP4_LISTEN_TOKEN;
+
 typedef struct EFI_TCP4_PROTOCOL {
     void *GetModeData;
     EFI_STATUS (EFIAPI *Configure)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_CONFIG_DATA *TcpConfigData);
     void *Routes;
     EFI_STATUS (EFIAPI *Connect)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_CONNECTION_TOKEN *ConnectionToken);
-    void *Accept;
+    EFI_STATUS (EFIAPI *Accept)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_LISTEN_TOKEN *ListenToken);
     EFI_STATUS (EFIAPI *Transmit)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_IO_TOKEN *Token);
     EFI_STATUS (EFIAPI *Receive)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_IO_TOKEN *Token);
     EFI_STATUS (EFIAPI *Close)(struct EFI_TCP4_PROTOCOL *This, EFI_TCP4_CLOSE_TOKEN *CloseToken);
@@ -456,6 +461,22 @@ EFI_STATUS efi_net_init(void);
 int efi_net_available(void);
 EFI_STATUS efi_http_get(const char *url, char *response, UINTN max_size, UINTN *out_size);
 EFI_STATUS efi_dns_resolve(const char *hostname, EFI_IPv4_ADDRESS *out_ip);
+
+/* TCP4 connection handle (used by net.c, http_server.c, api.c) */
+typedef struct {
+    EFI_TCP4_PROTOCOL *tcp4;
+    EFI_HANDLE child_handle;
+} tcp4_conn_t;
+
+/* TCP4 server primitives */
+EFI_STATUS tcp4_listen(uint16_t port, tcp4_conn_t *listener);
+EFI_STATUS tcp4_accept(tcp4_conn_t *listener, tcp4_conn_t *client);
+EFI_STATUS tcp4_send(tcp4_conn_t *conn, const void *data, UINTN len);
+INTN       tcp4_recv(tcp4_conn_t *conn, void *buf, UINTN max_len);
+void       tcp4_close(tcp4_conn_t *conn);
+
+/* HTTP server */
+void ba_http_serve(uint16_t port);
 
 /* Memory — JACLibc malloc wired to UEFI AllocatePool */
 void efi_memory_init(void);

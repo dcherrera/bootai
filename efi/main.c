@@ -160,8 +160,9 @@ static void int_to_str(char *buf, int val) {
 }
 
 /* ---- Model + Tokenizer (loaded once, persists across infer calls) ---- */
-static ba_model     *g_model = 0;
-static ba_tokenizer *g_tok   = 0;
+/* Non-static so api.c can access them for HTTP API inference */
+ba_model     *g_model = 0;
+ba_tokenizer *g_tok   = 0;
 
 #define MODEL_PATH "\\rwkvos\\model.btw"
 #define VOCAB_PATH "\\rwkvos\\vocab.btv"
@@ -315,7 +316,7 @@ static void command_repl(void) {
     char response[HTTP_RESPONSE_MAX];
 
     efi_print_ascii("\r\n");
-    efi_print_ascii("  Commands: chat, ls [path], cat <file>, fetch <url>, netinfo, tensor, exit\r\n");
+    efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>, netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -390,6 +391,28 @@ static void command_repl(void) {
             } else {
                 efi_print_ascii("  Network: unavailable\r\n");
             }
+            continue;
+        }
+
+        /* serve [port] — start HTTP server */
+        if (str_eq(line, "serve") || str_starts_with(line, "serve ")) {
+            if (!efi_net_available()) {
+                efi_print_ascii("  Network not available\r\n");
+                continue;
+            }
+            if (!ensure_model_loaded()) continue;
+
+            uint16_t port = 8080;
+            if (line[5] == ' ') {
+                const char *p = line + 6;
+                while (*p == ' ') p++;
+                if (*p >= '1' && *p <= '9') {
+                    int v = 0;
+                    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+                    if (v > 0 && v < 65536) port = (uint16_t)v;
+                }
+            }
+            ba_http_serve(port);
             continue;
         }
 

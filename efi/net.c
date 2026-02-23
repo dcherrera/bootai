@@ -287,11 +287,6 @@ int efi_net_available(void) {
 
 /* ---- TCP4 connection management ---- */
 
-typedef struct {
-    EFI_TCP4_PROTOCOL *tcp4;
-    EFI_HANDLE child_handle;
-} tcp4_conn_t;
-
 static EFI_STATUS tcp4_connect(EFI_IPv4_ADDRESS *host_ip, uint16_t port, tcp4_conn_t *conn) {
     EFI_STATUS status;
 
@@ -387,7 +382,7 @@ static EFI_STATUS tcp4_connect(EFI_IPv4_ADDRESS *host_ip, uint16_t port, tcp4_co
     return EFI_SUCCESS;
 }
 
-static EFI_STATUS tcp4_send(tcp4_conn_t *conn, const void *data, UINTN len) {
+EFI_STATUS tcp4_send(tcp4_conn_t *conn, const void *data, UINTN len) {
     EFI_STATUS status;
 
     if (!conn->tcp4 || !gBS) return EFI_NOT_READY;
@@ -430,7 +425,7 @@ static EFI_STATUS tcp4_send(tcp4_conn_t *conn, const void *data, UINTN len) {
     return tx_token.CompletionToken.Status;
 }
 
-static INTN tcp4_recv(tcp4_conn_t *conn, void *buf, UINTN max_len) {
+INTN tcp4_recv(tcp4_conn_t *conn, void *buf, UINTN max_len) {
     EFI_STATUS status;
 
     if (!conn->tcp4 || !gBS) return -1;
@@ -482,7 +477,7 @@ static INTN tcp4_recv(tcp4_conn_t *conn, void *buf, UINTN max_len) {
     return (INTN)rx_data.FragmentTable[0].FragmentLength;
 }
 
-static void tcp4_close(tcp4_conn_t *conn) {
+void tcp4_close(tcp4_conn_t *conn) {
     if (!conn->tcp4 || !gBS) return;
 
     EFI_TCP4_CLOSE_TOKEN close_token;
@@ -507,6 +502,132 @@ static void tcp4_close(tcp4_conn_t *conn) {
     tcp4_sb->DestroyChild(tcp4_sb, conn->child_handle);
     conn->tcp4 = 0;
     conn->child_handle = 0;
+}
+
+/* ---- TCP4 listen/accept (server side) ---- */
+
+EFI_STATUS tcp4_listen(uint16_t port, tcp4_conn_t *listener) {
+    EFI_STATUS status;
+
+    if (!tcp4_sb || !gBS) return EFI_NOT_READY;
+
+    ba_memset(listener, 0, sizeof(*listener));
+
+    /* Create a TCP4 child instance for the listener */
+    status = tcp4_sb->CreateChild(tcp4_sb, &listener->child_handle);
+    if (status != EFI_SUCCESS) {
+        print_status("Listen CreateChild", status);
+        return status;
+    }
+
+    status = gBS->HandleProtocol(listener->child_handle, &gEfiTcp4ProtocolGuid,
+                                 (void **)&listener->tcp4);
+    if (status != EFI_SUCCESS) {
+        print_status("Listen HandleProtocol", status);
+        tcp4_sb->DestroyChild(tcp4_sb, listener->child_handle);
+        return status;
+    }
+
+    /* Configure in passive mode (ActiveFlag=0 = listen) */
+    EFI_TCP4_CONFIG_DATA config;
+    ba_memset(&config, 0, sizeof(config));
+    config.TypeOfService = 0;
+    config.TimeToLive = 64;
+    config.AccessPoint.UseDefaultAddress = 1;
+    ba_memset(&config.AccessPoint.StationAddress, 0, sizeof(EFI_IPv4_ADDRESS));
+    ba_memset(&config.AccessPoint.SubnetMask, 0, sizeof(EFI_IPv4_ADDRESS));
+    config.AccessPoint.StationPort = port;
+    ba_memset(&config.AccessPoint.RemoteAddress, 0, sizeof(EFI_IPv4_ADDRESS));
+    config.AccessPoint.RemotePort = 0;
+    config.AccessPoint.ActiveFlag = 0;  /* passive = listen */
+    config.ControlOption = 0;
+
+    /* Retry on EFI_NO_MAPPING (DHCP not ready) */
+    for (int retry = 0; retry < 20; retry++) {
+        status = listener->tcp4->Configure(listener->tcp4, &config);
+        if (status != EFI_NO_MAPPING) break;
+        gBS->Stall(250000); /* 250ms */
+    }
+
+    if (status != EFI_SUCCESS) {
+        print_status("Listen Configure", status);
+        tcp4_sb->DestroyChild(tcp4_sb, listener->child_handle);
+        ba_memset(listener, 0, sizeof(*listener));
+        return status;
+    }
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS tcp4_accept(tcp4_conn_t *listener, tcp4_conn_t *client) {
+    EFI_STATUS status;
+
+    if (!listener->tcp4 || !gBS) return EFI_NOT_READY;
+
+    ba_memset(client, 0, sizeof(*client));
+
+    /* Create completion event for accept */
+    EFI_TCP4_LISTEN_TOKEN listen_token;
+    ba_memset(&listen_token, 0, sizeof(listen_token));
+
+    status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                              empty_notify, 0,
+                              &listen_token.CompletionToken.Event);
+    if (status != EFI_SUCCESS) return status;
+
+    listen_token.CompletionToken.Status = EFI_NOT_READY;
+    listen_token.NewChildHandle = 0;
+
+    /* Issue Accept */
+    status = listener->tcp4->Accept(listener->tcp4, &listen_token);
+    if (status != EFI_SUCCESS) {
+        gBS->CloseEvent(listen_token.CompletionToken.Event);
+        return status;
+    }
+
+    /* Poll with 500ms timeout — allows caller to check for keypress between cycles */
+    for (int wait = 0; wait < 5; wait++) {
+        listener->tcp4->Poll(listener->tcp4);
+        if (listen_token.CompletionToken.Status != EFI_NOT_READY) break;
+        gBS->Stall(100000); /* 100ms */
+    }
+
+    if (listen_token.CompletionToken.Status == EFI_NOT_READY) {
+        /* No connection yet — cancel the pending accept */
+        if (listener->tcp4->Cancel) {
+            /* Cancel is a void* but we cast to typed for safety */
+            typedef EFI_STATUS (EFIAPI *cancel_fn)(EFI_TCP4_PROTOCOL *, EFI_TCP4_COMPLETION_TOKEN *);
+            cancel_fn do_cancel = (cancel_fn)listener->tcp4->Cancel;
+            do_cancel(listener->tcp4, &listen_token.CompletionToken);
+            /* Poll to let cancel take effect */
+            for (int i = 0; i < 5; i++) {
+                listener->tcp4->Poll(listener->tcp4);
+                if (listen_token.CompletionToken.Status != EFI_NOT_READY) break;
+                gBS->Stall(50000);
+            }
+        }
+        gBS->CloseEvent(listen_token.CompletionToken.Event);
+        return EFI_TIMEOUT;
+    }
+
+    gBS->CloseEvent(listen_token.CompletionToken.Event);
+
+    if (listen_token.CompletionToken.Status != EFI_SUCCESS) {
+        return listen_token.CompletionToken.Status;
+    }
+
+    /* Get TCP4 protocol from the new child handle */
+    client->child_handle = listen_token.NewChildHandle;
+    status = gBS->HandleProtocol(client->child_handle, &gEfiTcp4ProtocolGuid,
+                                 (void **)&client->tcp4);
+    if (status != EFI_SUCCESS) {
+        print_status("Accept HandleProtocol", status);
+        tcp4_sb->DestroyChild(tcp4_sb, client->child_handle);
+        ba_memset(client, 0, sizeof(*client));
+        return status;
+    }
+
+    return EFI_SUCCESS;
 }
 
 /* ---- URL parsing ---- */

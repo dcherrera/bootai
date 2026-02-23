@@ -11,6 +11,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [UEFI Boot Architecture](architecture/uefi-boot-architecture.md) — Boot flow, memory model, build pipeline, driver binding
 - [Networking](architecture/networking.md) — DHCP, TCP4, UDP4 DNS, HTTP/1.0
 - [Inference on Bare Metal](architecture/inference-on-bare-metal.md) — Model conversion, disk image creation, running SmolLM2-135M
+- [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions
 
 ## Research
 
@@ -35,5 +36,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | Build commands | `../Makefile` |
 | UEFI types | `../efi/efi.h` |
 | Network stack | `../efi/net.c` |
+| HTTP server | `../efi/http_server.c` |
+| API handlers | `../efi/api.c` |
 | Entry point | `../efi/main.c` |
 | Project guidelines | `../CLAUDE.md` |
