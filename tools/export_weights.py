@@ -289,12 +289,25 @@ def export_vocab(model_name: str, output_path: str):
     for token_str, token_id in vocab.items():
         id_to_token[token_id] = token_str
 
-    # Encode tokens as UTF-8 bytes
+    # Build GPT-2 unicode → raw byte reverse mapping.
+    # GPT-2 bytes_to_unicode() maps non-printable bytes (0-32, 127-160, 173)
+    # to Unicode 256+n. We reverse this so token strings are stored as the
+    # original raw bytes — e.g. " the" instead of "Ġthe".
+    unicode_to_byte = {}
+    for byte_val in range(256):
+        if 33 <= byte_val <= 126 or 161 <= byte_val <= 172 or 174 <= byte_val <= 255:
+            unicode_to_byte[chr(byte_val)] = byte_val
+        else:
+            unicode_to_byte[chr(256 + byte_val)] = byte_val
+
     token_bytes = []
     for i in range(n_tokens):
         if i in id_to_token:
             s = id_to_token[i]
-            b = s.encode("utf-8", errors="replace")
+            try:
+                b = bytes([unicode_to_byte[ch] for ch in s])
+            except KeyError:
+                b = s.encode("utf-8", errors="replace")
         else:
             b = b""
         token_bytes.append(b)
