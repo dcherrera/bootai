@@ -21,6 +21,17 @@ void *memset(void *dest, int c, size_t n);
 
 /* ---- f16 conversion ---- */
 
+#ifdef __F16C__
+/* Use hardware F16C instruction (vcvtph2ps) without immintrin.h
+ * which requires stdlib.h unavailable in freestanding mode */
+static inline float f16_to_f32(uint16_t h) {
+    typedef float __v4sf __attribute__((__vector_size__(16)));
+    typedef short __v8hi __attribute__((__vector_size__(16)));
+    __v8hi v = {(short)h, 0, 0, 0, 0, 0, 0, 0};
+    __v4sf r = __builtin_ia32_vcvtph2ps(v);
+    return r[0];
+}
+#else
 static inline float f16_to_f32(uint16_t h) {
     uint32_t sign = (uint32_t)(h >> 15) << 31;
     uint32_t exp  = (h >> 10) & 0x1F;
@@ -45,6 +56,7 @@ static inline float f16_to_f32(uint16_t h) {
     };
     return u.f;
 }
+#endif
 
 /* ---- Core math ops (ported from rfa.c) ---- */
 

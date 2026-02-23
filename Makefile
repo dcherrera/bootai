@@ -4,7 +4,8 @@ OBJCOPY = x86_64-elf-objcopy
 
 # Base flags: freestanding UEFI application (never ExitBootServices, SSE available)
 # -mno-sse removed: UEFI guarantees SSE, needed for float/double in tensor ops
-CFLAGS = -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+CFLAGS = -O2 -msse4.2 -mf16c \
+         -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
          -fPIC -fshort-wchar \
          -Wall -Wextra -std=c11 \
          -I .
@@ -107,6 +108,9 @@ run: bootai-p4.efi
 	mcopy -o -i bootai.img bootai-p4.efi ::EFI/BOOT/BOOTX64.EFI
 	cp $(OVMF_VARS) esp/ovmf-vars-session.fd
 	qemu-system-x86_64 \
+		-accel tcg,thread=multi,tb-size=2048 \
+		-cpu max \
+		-smp 2 \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=esp/ovmf-vars-session.fd \
 		-drive file=bootai.img,format=raw,if=virtio \
@@ -124,6 +128,9 @@ run3: bootai.efi
 	echo "FS0:\EFI\BOOT\BOOTX64.EFI" > esp/startup.nsh
 	cp $(OVMF_VARS) esp/ovmf-vars-session.fd
 	qemu-system-x86_64 \
+		-accel tcg,thread=multi,tb-size=2048 \
+		-cpu max \
+		-smp 2 \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=esp/ovmf-vars-session.fd \
 		-drive file=bootai.img,format=raw,if=virtio \
@@ -134,7 +141,7 @@ run3: bootai.efi
 		-device virtio-net-pci,netdev=net0 \
 		-device virtio-rng-pci
 
-# Create bootable USB
+# Create bootable USB/SD card
 usb: bootai-p4.efi
 ifndef DISK
 	$(error Set DISK= to target device, e.g. make usb DISK=/dev/disk4)
@@ -144,10 +151,19 @@ endif
 	mkdir -p /Volumes/BOOTAI/rwkvos
 	mkdir -p /Volumes/BOOTAI/workspace
 	cp bootai-p4.efi /Volumes/BOOTAI/EFI/BOOT/BOOTX64.EFI
-	@if [ -f esp/rwkvos/model.btw ]; then cp esp/rwkvos/model.btw /Volumes/BOOTAI/rwkvos/; fi
-	@if [ -f esp/rwkvos/vocab.btv ]; then cp esp/rwkvos/vocab.btv /Volumes/BOOTAI/rwkvos/; fi
+	@# Extract model files from disk image (or esp/ if available)
+	@if [ -f esp/rwkvos/model.btw ]; then \
+		cp esp/rwkvos/model.btw /Volumes/BOOTAI/rwkvos/; \
+	elif [ -f bootai.img ]; then \
+		mcopy -n -i bootai.img ::rwkvos/model.btw /Volumes/BOOTAI/rwkvos/; \
+	fi
+	@if [ -f esp/rwkvos/vocab.btv ]; then \
+		cp esp/rwkvos/vocab.btv /Volumes/BOOTAI/rwkvos/; \
+	elif [ -f bootai.img ]; then \
+		mcopy -n -i bootai.img ::rwkvos/vocab.btv /Volumes/BOOTAI/rwkvos/; \
+	fi
 	diskutil eject $(DISK)
-	@echo "USB ready. Boot from it on any x86_64 machine."
+	@echo "Ready. Boot from it on any x86_64 machine."
 
 # Export model weights (run on host with Python + transformers)
 # IMPORTANT: MODEL must match the .btw weights on disk (currently SmolLM2-135M)

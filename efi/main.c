@@ -209,123 +209,102 @@ static int ensure_model_loaded(void) {
     return 1;
 }
 
-/* ---- Inference command ---- */
+/* ---- Helper: append string to buffer ---- */
+static int buf_append_str(char *buf, int pos, int max, const char *s) {
+    while (*s && pos < max) buf[pos++] = *s++;
+    return pos;
+}
 
-static void command_infer(void) {
+static int buf_append_n(char *buf, int pos, int max, const char *s, int n) {
+    for (int i = 0; i < n && pos < max; i++) buf[pos++] = s[i];
+    return pos;
+}
+
+/* ---- Chat command: multi-turn conversation ---- */
+
+static void command_chat(void) {
     if (!ensure_model_loaded()) return;
 
-    efi_print_ascii("\r\n  Enter prompt (empty line to cancel):\r\n");
-    efi_print_ascii("  > ");
-
-    char prompt[1024];
-    int len = efi_read_line(prompt, sizeof(prompt));
-    if (len <= 0) return;
-
-    /* Wrap in chat template for instruct models:
-     * <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
-     * <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n */
-    char chat_buf[2048];
-    int ci = 0;
-    const char *pre = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
-    while (*pre && ci < 2000) chat_buf[ci++] = *pre++;
-    for (int p = 0; p < len && ci < 2000; p++) chat_buf[ci++] = prompt[p];
-    const char *post = "<|im_end|>\n<|im_start|>assistant\n";
-    while (*post && ci < 2000) chat_buf[ci++] = *post++;
-    chat_buf[ci] = '\0';
-
-    int tokens[2048];
-    int n_prompt = ba_tokenizer_encode(g_tok, chat_buf, tokens, 2048);
-    if (n_prompt <= 0) {
-        efi_print_ascii("  ERROR: tokenization failed\r\n");
-        return;
-    }
-
-    char num[12];
-    /* Debug: show prompt token IDs
-    int_to_str(num, n_prompt);
-    efi_print_ascii("  Prompt: "); efi_print_ascii(num); efi_print_ascii(" tokens [");
-    for (int t = 0; t < n_prompt && t < 10; t++) {
-        if (t > 0) efi_print_ascii(", ");
-        int_to_str(num, tokens[t]); efi_print_ascii(num);
-    }
-    efi_print_ascii("]\r\n");
-    */
-    /* Reset model state */
-    ba_model_reset(g_model);
-
     ba_sample_config cfg = ba_default_config();
-    cfg.temperature = 0.0f;  /* greedy for determinism */
-    cfg.max_tokens = 256;
+    cfg.temperature = 0.7f;
+    cfg.max_tokens = 512;
 
     int eos_id = ba_tokenizer_eos(g_tok);
     int im_end_id = ba_tokenizer_im_end(g_tok);
     int vocab = ba_model_vocab_size(g_model);
 
-    /* Prefill: process prompt tokens one at a time with progress */
-    efi_print_ascii("  Prefilling");
-    float *logits = 0;
-    for (int i = 0; i < n_prompt; i++) {
-        logits = ba_model_forward(g_model, &tokens[i], 1);
-        if ((i + 1) % 5 == 0) efi_print_ascii(".");
-    }
-    efi_print_ascii(" done\r\n\r\n");
+    /* Reset KV cache for new conversation */
+    ba_model_reset(g_model);
 
-    /* Generate tokens */
-    int n_gen = 0;
+    char prompt[1024];
+    char chat_buf[2048];
+    int tokens[2048];
     char decode_buf[64];
+    char num[12];
+    int first_turn = 1;
+    float *logits = 0;
 
-    for (int i = 0; i < cfg.max_tokens; i++) {
-        /* Debug: show top-5 logits for first 5 tokens
-        if (i < 5) {
-            int top_ids[5] = {0,0,0,0,0};
-            float top_vals[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
-            for (int v = 0; v < vocab; v++) {
-                if (logits[v] > top_vals[4]) {
-                    top_vals[4] = logits[v]; top_ids[4] = v;
-                    for (int s = 4; s > 0 && top_vals[s] > top_vals[s-1]; s--) {
-                        float tv = top_vals[s]; top_vals[s] = top_vals[s-1]; top_vals[s-1] = tv;
-                        int ti = top_ids[s]; top_ids[s] = top_ids[s-1]; top_ids[s-1] = ti;
-                    }
+    efi_print_ascii("\r\n  Chat (empty line to exit)\r\n\r\n");
+
+    for (;;) {
+        efi_print_ascii("> ");
+        int len = efi_read_line(prompt, sizeof(prompt));
+        if (len <= 0) break;
+
+        /* Build token sequence for this turn */
+        int ci = 0;
+        if (first_turn) {
+            /* First turn: system prompt + user message */
+            ci = buf_append_str(chat_buf, ci, 2000,
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n");
+        } else {
+            /* Continue: close previous assistant, start new user turn.
+             * The <|im_end|> we sampled was never fed to the model,
+             * so we include it here to properly close the assistant response. */
+            ci = buf_append_str(chat_buf, ci, 2000,
+                "<|im_end|>\n<|im_start|>user\n");
+        }
+        ci = buf_append_n(chat_buf, ci, 2000, prompt, len);
+        ci = buf_append_str(chat_buf, ci, 2000,
+            "<|im_end|>\n<|im_start|>assistant\n");
+        chat_buf[ci] = '\0';
+
+        int n_prompt = ba_tokenizer_encode(g_tok, chat_buf, tokens, 2048);
+        if (n_prompt <= 0) {
+            efi_print_ascii("  ERROR: tokenization failed\r\n");
+            continue;
+        }
+
+        /* Prefill turn tokens (KV cache accumulates across turns) */
+        efi_print_ascii("  Thinking");
+        for (int i = 0; i < n_prompt; i++) {
+            logits = ba_model_forward(g_model, &tokens[i], 1);
+            if ((i + 1) % 5 == 0) efi_print_ascii(".");
+        }
+        efi_print_ascii("\r\n\r\n");
+
+        /* Generate response */
+        int n_gen = 0;
+        for (int i = 0; i < cfg.max_tokens; i++) {
+            int next = ba_model_sample(logits, vocab, &cfg);
+            if (next == eos_id || next == im_end_id) break;
+
+            ba_tokenizer_decode(g_tok, &next, 1, decode_buf, sizeof(decode_buf));
+            for (int j = 0; decode_buf[j]; j++) {
+                if (decode_buf[j] == '\n') {
+                    efi_print_ascii("\r\n");
+                } else {
+                    CHAR16 ch[2] = { (CHAR16)(unsigned char)decode_buf[j], 0 };
+                    efi_print(ch);
                 }
             }
-            uefi_printf("  [step %d] top5:", i);
-            for (int t = 0; t < 5; t++) {
-                char tbuf[32];
-                ba_tokenizer_decode(g_tok, &top_ids[t], 1, tbuf, sizeof(tbuf));
-                uefi_printf(" %d(%s)=%.2f", top_ids[t], tbuf, (double)top_vals[t]);
-            }
-            uefi_printf("\r\n");
-        }
-        */
-
-        int next = ba_model_sample(logits, vocab, &cfg);
-
-        /* Check for EOS */
-        if (next == eos_id || next == im_end_id) break;
-
-        /* Decode and display token */
-        ba_tokenizer_decode(g_tok, &next, 1, decode_buf, sizeof(decode_buf));
-
-        /* Print, converting \n to \r\n for UEFI console */
-        for (int j = 0; decode_buf[j]; j++) {
-            if (decode_buf[j] == '\n') {
-                efi_print_ascii("\r\n");
-            } else {
-                CHAR16 ch[2] = { (CHAR16)(unsigned char)decode_buf[j], 0 };
-                efi_print(ch);
-            }
+            n_gen++;
+            logits = ba_model_forward(g_model, &next, 1);
         }
 
-        n_gen++;
-
-        /* Forward pass for next token */
-        logits = ba_model_forward(g_model, &next, 1);
+        efi_print_ascii("\r\n\r\n");
+        first_turn = 0;
     }
-
-    efi_print_ascii("\r\n\r\n  [");
-    int_to_str(num, n_gen);
-    efi_print_ascii(num);
-    efi_print_ascii(" tokens generated]\r\n");
 }
 
 #define HTTP_RESPONSE_MAX 8192
@@ -336,7 +315,7 @@ static void command_repl(void) {
     char response[HTTP_RESPONSE_MAX];
 
     efi_print_ascii("\r\n");
-    efi_print_ascii("  Commands: infer, ls [path], cat <file>, fetch <url>, netinfo, tensor, exit\r\n");
+    efi_print_ascii("  Commands: chat, ls [path], cat <file>, fetch <url>, netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -351,9 +330,9 @@ static void command_repl(void) {
             break;
         }
 
-        /* infer — run inference */
-        if (str_eq(line, "infer")) {
-            command_infer();
+        /* chat — multi-turn conversation */
+        if (str_eq(line, "chat") || str_eq(line, "infer")) {
+            command_chat();
             continue;
         }
 
