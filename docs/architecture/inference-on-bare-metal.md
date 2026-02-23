@@ -6,54 +6,43 @@ How SmolLM2-135M runs on bare metal UEFI with no OS.
 
 ### 1. Convert the model
 
-The model converter (`foundry/convert/`) takes a HuggingFace model directory and produces two binary files:
+The export script downloads a model from HuggingFace, extracts weights as F16, and writes two binary files:
 
 ```bash
-cd foundry
-make USE_BLAS=1 model-convert
-
-./examples/model_convert \
-  --model-dir ../models/base/SmolLM2-135M/ \
-  --output ../bootai/esp/rwkvos/model.btw
+cd bootai
+python3 tools/export_weights.py \
+  --model HuggingFaceTB/SmolLM2-135M-Instruct \
+  --quant f16 \
+  --output ../models/base/SmolLM2-135M-Instruct/model.btw
 ```
 
-This reads `config.json`, `model.safetensors`, and `tokenizer.json` from the model directory and writes:
+This produces:
 
 - `model.btw` — weights in binary format (F16 projections, F32 norms, 128-byte header with model config)
-- `vocab.btv` — vocabulary + merge rules in binary format
+- `model.btv` — vocabulary + merge rules in binary format (written to the same directory as `model.btw`)
 
-The converter auto-detects the model family from `config.json`'s `model_type` field. Supported families: Llama 2/3, SmolLM, Mistral, Qwen 2/2.5/3, Phi-3, Gemma 2.
+The script also supports `--quant q8` for INT8 quantization and `--vocab-only` for exporting just the tokenizer.
+
+The converter auto-detects the model family from the HuggingFace config. Supported families: Llama 2/3, SmolLM, Mistral, Qwen 2/2.5/3, Phi-3, Gemma 2.
 
 ### 2. Build the EFI binary
 
 ```bash
 cd bootai
-make efi          # Builds all_bootai.efi
+make phase4       # Builds all_bootai.efi
 ```
 
-This cross-compiles with `x86_64-elf-gcc` using freestanding flags, links with a custom linker script, and converts to PE32+ format via objcopy.
+This cross-compiles with `x86_64-elf-gcc` using freestanding flags (`-O2 -msse4.2`), links with a custom linker script, and converts to PE32+ format via objcopy.
 
 ### 3. Create the disk image
 
 The disk image is a FAT32 filesystem image that QEMU mounts as a virtual disk. It contains the EFI binary, model weights, and vocabulary.
 
 ```bash
-# Create a 300MB FAT32 image with mtools
-dd if=/dev/zero of=bootai.img bs=1M count=300
-mformat -i bootai.img -F ::
-
-# Create directory structure
-mmd -i bootai.img ::EFI
-mmd -i bootai.img ::EFI/BOOT
-mmd -i bootai.img ::rwkvos
-
-# Copy files
-mcopy -i bootai.img all_bootai.efi ::EFI/BOOT/BOOTX64.EFI
-mcopy -i bootai.img esp/rwkvos/model.btw ::rwkvos/model.btw
-mcopy -i bootai.img esp/rwkvos/vocab.btv ::rwkvos/vocab.btv
+make img
 ```
 
-The image must be large enough to hold the model weights. For SmolLM2-135M (~257 MB weights + ~1.2 MB vocab), 300 MB is sufficient.
+This creates a FAT32 image sized to fit the model, then copies the EFI binary, `model.btw`, and `vocab.btv` into it. Model source paths are configurable via the `MODEL_BTW` and `MODEL_BTV` make variables, which default to `../models/base/SmolLM2-135M-Instruct/`.
 
 **Note:** `bootai.img` is gitignored because it contains large binary model weights. You must create it locally.
 
@@ -81,6 +70,9 @@ qemu-system-x86_64 \
   -drive if=pflash,format=raw,file=esp/ovmf-vars-session.fd \
   -drive file=bootai.img,format=raw,if=virtio \
   -m 8G \
+  -accel tcg,thread=multi,tb-size=2048 \
+  -cpu max \
+  -smp 2 \
   -display none \
   -serial stdio \
   -netdev user,id=net0 \
@@ -90,28 +82,45 @@ qemu-system-x86_64 \
 
 ### 6. Interact
 
-At the boot menu, select `1` (Run Live). Then at the REPL prompt:
+At the boot prompt, use the `chat` command for interactive conversation:
 
 ```
-> infer
-  Enter prompt (empty line to cancel):
-  > hello
-  Prompt: 1 tokens [28120]
-  Generating...
+BootAI v0.1 — Bare Metal AI Inference
+  Loading model from \rwkvos\model.btw...
+  SmolLM2-135M: 30 layers, 576 hidden, 9 heads, 49152 vocab
+  Loading vocab from \rwkvos\vocab.btv...
+  49152 tokens, 48900 merges loaded
 
-  , "I'm sorry, I didn't know that."
-  ...
+boot> chat
+> Hello
+Prefilling.... (21 tokens)
+Hello! How can I help you today?
+> What is 2+2?
+Prefilling... (13 tokens)
+2+2 equals 4.
 ```
 
 ## Updating the EFI binary
 
-After code changes, you can update just the EFI binary without recreating the entire image:
+After code changes, you can update just the EFI binary without recreating the entire image. The `make run` target already updates the image via mcopy, so you can just do:
 
 ```bash
-make efi
-mcopy -o -i bootai.img all_bootai.efi ::EFI/BOOT/BOOTX64.EFI
-make run
+make phase4 && make run
 ```
+
+## Flashing to USB
+
+Write the disk image to a USB drive for testing on real hardware:
+
+```bash
+make usb DISK=/dev/diskN
+```
+
+This copies the latest EFI binary into bootai.img, then writes the entire image to the USB with dd. The target device is the raw disk (e.g., `/dev/disk4`), not a partition.
+
+On macOS, find the disk number with `diskutil list external`.
+
+Tested hardware: Surface Pro 7 (Intel Ice Lake, 4GB RAM).
 
 ## Model Architecture (SmolLM2-135M)
 
@@ -171,3 +180,11 @@ The freestanding environment has no libm. All math functions (sinf, cosf, expf, 
 - **sinf/cosf:** Quadrant reduction + degree-7 minimax polynomial (<1 ULP error)
 - **expf:** Cody-Waite range reduction + degree-6 polynomial
 - **RoPE frequencies:** Iterated `sqrtf` to compute `theta^(1/n)` — avoids `powf` which would need the less-accurate `logf`
+
+### No AVX/F16C on UEFI
+
+UEFI firmware does not enable AVX (CR4.OSXSAVE is not set, XSAVE state not configured). Any VEX-encoded instruction causes #UD (Invalid Opcode) on bare metal.
+
+The F16C instruction `vcvtph2ps` uses VEX encoding, so hardware f16-to-f32 conversion cannot be used. The compiler flag `-mf16c` must NOT be used because it causes GCC to emit VEX-encoded instructions throughout the generated code (not just f16 conversion).
+
+BootAI uses a software f16-to-f32 conversion via bit manipulation instead. SSE (up to SSE4.2) is safe — UEFI guarantees SSE state is configured.

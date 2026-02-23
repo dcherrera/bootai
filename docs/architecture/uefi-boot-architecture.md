@@ -18,8 +18,9 @@ UEFI Firmware
      → efi_clear_screen()
      → efi_memory_init()          — set up bump allocator on AllocatePages
      → efi_net_init()             — ConnectController, DHCP, locate TCP4/UDP4
+     → ba_model_load()            — load model.btw + vocab.btv from \rwkvos\
      → show_boot_menu()           — [1] Run Live  [2] Install  [3] Settings
-     → command_repl()             — fetch/netinfo/exit loop
+     → command_repl()             — chat/fetch/netinfo/exit loop
 ```
 
 ## Memory Model
@@ -97,14 +98,15 @@ Called twice at init (`efi_net_init`) to ensure the full driver chain is loaded.
 ### Compilation
 
 ```bash
-x86_64-elf-gcc -ffreestanding -mno-red-zone -mno-sse -fno-stack-protector \
-               -fPIC -fshort-wchar -Wall -Wextra -std=c11 -I . -c file.c -o file.o
+x86_64-elf-gcc -ffreestanding -mno-red-zone -msse4.2 -fno-stack-protector \
+               -fPIC -fshort-wchar -O2 -Wall -Wextra -std=c11 -I . -c file.c -o file.o
 ```
 
 Key flags:
 - `-ffreestanding` — no libc, no standard startup
 - `-mno-red-zone` — UEFI uses Microsoft ABI; red zone isn't safe
-- `-mno-sse` — avoid SSE instructions (UEFI doesn't guarantee SSE state)
+- `-msse4.2` — enable SSE up to SSE4.2 (UEFI guarantees SSE state is configured)
+- `-O2` — optimization (critical for inference performance on real hardware)
 - `-fPIC` — position-independent code (firmware loads at arbitrary address)
 - `-fshort-wchar` — `wchar_t` = 16-bit (matches UEFI `CHAR16`)
 
@@ -162,6 +164,18 @@ GCC5_BIN=/opt/homebrew/bin/x86_64-elf- build -a X64 -t GCC5 \
 
 OVMF uses split pflash: `ovmf-code.fd` (readonly code) and `ovmf-vars.fd` (writable NVRAM). The vars file is copied per-session to avoid corruption.
 
+### No AVX on UEFI
+
+UEFI firmware does not enable AVX. The `CR4.OSXSAVE` bit is not set and XSAVE state is not configured, so any VEX-encoded instruction (including `vmovaps`, `vcvtph2ps`, etc.) triggers a `#UD` (Invalid Opcode) exception.
+
+This means:
+- Never use `-mavx`, `-mavx2`, `-mf16c`, or `-mfma` compiler flags
+- SSE (including SSE4.2) is safe — UEFI guarantees SSE state
+- The F16C hardware instruction for f16→f32 conversion uses VEX encoding and cannot be used
+- GCC will emit VEX instructions throughout the binary (not just in f16 code) when AVX-family flags are enabled
+
+BootAI was initially compiled with `-mf16c` which worked in QEMU (which enables AVX) but caused `#UD` crashes on real hardware (Surface Pro 7).
+
 ## Source Files
 
 | File | Purpose |
@@ -175,3 +189,11 @@ OVMF uses split pflash: `ovmf-code.fd` (readonly code) and `ovmf-vars.fd` (writa
 | `efi/efi_memory.c` | Memory allocation (bump heap on AllocatePages) |
 | `efi/reloc.c` | PE relocation fixup handler |
 | `efi/uefi.lds` | Linker script for ELF → PE32+ conversion |
+| `efi/uefi_libc.c` | Freestanding libc: malloc, printf, 29 math functions |
+| `model/qwen2.c` | Qwen2/SmolLM forward pass (RMSNorm, GQA, SwiGLU, RoPE) |
+| `model/loader.c` | Weight loader (.btw binary format) |
+| `model/sampling.c` | Token sampling (temperature, top-k, top-p) |
+| `model/rope.c` | Rotary position embeddings |
+| `model/kv_cache.c` | KV cache (per-layer, oldest-half eviction) |
+| `tokenizer/bpe.c` | BPE tokenizer with special token handling |
+| `tools/export_weights.py` | Model converter (HuggingFace → .btw/.btv) |

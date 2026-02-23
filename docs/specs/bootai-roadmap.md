@@ -9,7 +9,7 @@
 | 1 | Boot + Console + Input | COMPLETE |
 | 2 | Networking (DHCP, TCP4, HTTP, DNS) | COMPLETE |
 | 3 | Foundry Tensor Library on UEFI | COMPLETE |
-| 4 | Model Loading + Inference | IN PROGRESS |
+| 4 | Model Loading + Inference | COMPLETE |
 | 5 | WiFi + Network API | PLANNED |
 | 6 | Tool Use | PLANNED |
 | 7 | Full AI Assistant | PLANNED |
@@ -52,9 +52,9 @@ Foundry's tensor.c (9,318 lines) and quantization.c compile and run as part of t
 - Tensor self-tests pass: matmul, softmax, rms_norm, silu
 - Key lesson: `static inline __builtin_*` wrappers crash in PE/COFF (PLT calls); declarations-only + global symbols work
 
-## Phase 4: Model Loading + Inference (IN PROGRESS)
+## Phase 4: Model Loading + Inference (COMPLETE)
 
-Load quantized models and run inference on bare metal. Current model: **SmolLM2-135M** (30 layers, 576 hidden, 9/3 GQA heads, 49K vocab).
+Load quantized models and run inference on bare metal. Current model: **SmolLM2-135M-Instruct** (30 layers, 576 hidden, 9/3 GQA heads, 49K vocab).
 
 ### Completed
 
@@ -64,18 +64,25 @@ Load quantized models and run inference on bare metal. Current model: **SmolLM2-
 - Qwen2/Llama forward pass: RMSNorm, GQA attention, RoPE (halved/rotate_half format), SwiGLU FFN, F16 weights with F32 activations (`model/qwen2.c`)
 - KV cache: per-layer pre-allocated, oldest-half eviction when full (`model/kv_cache.c`)
 - BPE tokenizer: GPT-2 style, loaded from `.btv` binary format (`tokenizer/bpe.c`)
+- BPE special token handling: `<|im_start|>`, `<|im_end|>`, `<|endoftext|>` mapped correctly
+- Chat template support: system/user/assistant message formatting
+- Multi-turn chat with KV cache persistence across turns (model state preserved between exchanges)
 - Token sampling: temperature, top-k, top-p, repeat penalty (`model/sampling.c`)
 - Inference REPL: `infer` command → prompt → generate → display (`efi/main.c`)
+- Full line editing: arrow keys (left/right), home/end, insert at cursor, backspace/delete
 - Math library: 29 functions in pure C (sinf, cosf, expf, sqrtf, etc.) for freestanding environment (`efi/uefi_libc.c`)
+- `make img` target: creates FAT32 disk image with EFI binary + model + vocab from scratch
+- `make usb DISK=/dev/diskN`: writes disk image directly to USB via dd
+- Export script: `tools/export_weights.py` converts HuggingFace models to `.btw`/`.btv` format (f16 and q8)
 - **First successful inference**: SmolLM2-135M generates coherent text on bare metal, logits match Python F32 reference
+- **Instruct model working**: SmolLM2-135M-Instruct with chat template produces instruction-following responses
+- **Real hardware tested**: Surface Pro 7 (Intel Ice Lake, 4GB RAM) and QEMU with TCG software emulation
 
 ### Remaining
 
-- EOS detection: model doesn't stop generating (needs EOS token mapping fix)
 - RWKV-X forward pass (WKV-7 kernel, sparse attention) — code exists but untested on bare metal
 - RWKV World tokenizer (trie-based) — code exists but untested
 - Larger models: Qwen2.5-Coder-7B (Q4), RWKV-X 3.6B (Q8)
-- Performance: currently ~0.5 tok/s on SmolLM2-135M in QEMU (no hardware acceleration)
 
 ## Phase 5: WiFi + Network API (PLANNED)
 
