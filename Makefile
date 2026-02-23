@@ -4,7 +4,8 @@ OBJCOPY = x86_64-elf-objcopy
 
 # Base flags: freestanding UEFI application (never ExitBootServices, SSE available)
 # -mno-sse removed: UEFI guarantees SSE, needed for float/double in tensor ops
-CFLAGS = -O2 -msse4.2 -mf16c \
+# -mf16c removed: F16C uses VEX/AVX encoding, UEFI doesn't enable AVX (causes #UD)
+CFLAGS = -O2 -msse4.2 \
          -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
          -fPIC -fshort-wchar \
          -Wall -Wextra -std=c11 \
@@ -49,7 +50,11 @@ OVMF_CODE ?= ovmf-code.fd
 OVMF_VARS ?= ovmf-vars.fd
 
 # Targets
-.PHONY: phase1 phase3 phase4 efi run clean usb
+.PHONY: phase1 phase3 phase4 efi run clean usb img
+
+# Model files (source paths)
+MODEL_BTW ?= ../models/base/SmolLM2-135M-Instruct/model.btw
+MODEL_BTV ?= ../models/base/SmolLM2-135M-Instruct/model.btv
 
 phase1: PHASE3_OBJ = $(PHASE1_OBJ)
 phase1: bootai.efi
@@ -102,10 +107,24 @@ foundry/quantization/quantization.o: foundry/quantization/quantization.c
 	    -I foundry/tensor -I foundry/quantization -Wno-unused-parameter -Wno-sign-compare \
 	    -c -o $@ $<
 
+# Create FAT32 disk image with EFI binary + model + vocab
+# Size: model + vocab + 50MB headroom, rounded up to nearest MB
+img: bootai-p4.efi
+	@echo "Creating bootai.img..."
+	@size=$$(( ($$(stat -f%z $(MODEL_BTW)) + $$(stat -f%z $(MODEL_BTV)) + 52428800) / 1048576 )); \
+	dd if=/dev/zero of=bootai.img bs=1m count=$$size 2>/dev/null
+	mformat -i bootai.img -F ::
+	mmd -i bootai.img ::EFI ::EFI/BOOT ::rwkvos ::workspace
+	mcopy -i bootai.img bootai-p4.efi ::EFI/BOOT/BOOTX64.EFI
+	mcopy -i bootai.img $(MODEL_BTW) ::rwkvos/model.btw
+	mcopy -i bootai.img $(MODEL_BTV) ::rwkvos/vocab.btv
+	@echo "bootai.img ready ($$(ls -lh bootai.img | awk '{print $$5}'))"
+
 # Run in QEMU (phase 4)
 # Uses bootai.img (FAT32 disk image built with mtools)
 run: bootai-p4.efi
 	mcopy -o -i bootai.img bootai-p4.efi ::EFI/BOOT/BOOTX64.EFI
+	mkdir -p esp
 	cp $(OVMF_VARS) esp/ovmf-vars-session.fd
 	qemu-system-x86_64 \
 		-accel tcg,thread=multi,tb-size=2048 \
@@ -141,27 +160,14 @@ run3: bootai.efi
 		-device virtio-net-pci,netdev=net0 \
 		-device virtio-rng-pci
 
-# Create bootable USB/SD card
+# Create bootable USB/SD card — writes the same image QEMU uses
 usb: bootai-p4.efi
 ifndef DISK
 	$(error Set DISK= to target device, e.g. make usb DISK=/dev/disk4)
 endif
-	diskutil eraseDisk FAT32 BOOTAI MBRFormat $(DISK)
-	mkdir -p /Volumes/BOOTAI/EFI/BOOT
-	mkdir -p /Volumes/BOOTAI/rwkvos
-	mkdir -p /Volumes/BOOTAI/workspace
-	cp bootai-p4.efi /Volumes/BOOTAI/EFI/BOOT/BOOTX64.EFI
-	@# Extract model files from disk image (or esp/ if available)
-	@if [ -f esp/rwkvos/model.btw ]; then \
-		cp esp/rwkvos/model.btw /Volumes/BOOTAI/rwkvos/; \
-	elif [ -f bootai.img ]; then \
-		mcopy -n -i bootai.img ::rwkvos/model.btw /Volumes/BOOTAI/rwkvos/; \
-	fi
-	@if [ -f esp/rwkvos/vocab.btv ]; then \
-		cp esp/rwkvos/vocab.btv /Volumes/BOOTAI/rwkvos/; \
-	elif [ -f bootai.img ]; then \
-		mcopy -n -i bootai.img ::rwkvos/vocab.btv /Volumes/BOOTAI/rwkvos/; \
-	fi
+	mcopy -o -i bootai.img bootai-p4.efi ::EFI/BOOT/BOOTX64.EFI
+	diskutil unmountDisk $(DISK)
+	dd if=bootai.img of=$(DISK) bs=1m
 	diskutil eject $(DISK)
 	@echo "Ready. Boot from it on any x86_64 machine."
 
