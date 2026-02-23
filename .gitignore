@@ -4,5 +4,6 @@
 *.bin
 *.fd
 *.elf
+*.img
 esp/
 .DS_Store

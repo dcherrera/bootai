@@ -7,6 +7,10 @@
 
 #include "efi.h"
 #include "foundry/tensor/tensor.h"
+#include "model/model.h"
+
+/* Printf (provided by uefi_libc.c) */
+int uefi_printf(const char *fmt, ...);
 
 /* Globals */
 EFI_SYSTEM_TABLE  *gST = 0;
@@ -142,6 +146,173 @@ done:
     efi_print_ascii("  Tensor self-test complete.\r\n");
 }
 
+/* ---- Integer-to-ASCII helper (freestanding) ---- */
+static void int_to_str(char *buf, int val) {
+    if (val == 0) { buf[0] = '0'; buf[1] = '\0'; return; }
+    int neg = 0;
+    if (val < 0) { neg = 1; val = -val; }
+    char tmp[12]; int ti = 0;
+    while (val > 0) { tmp[ti++] = '0' + val % 10; val /= 10; }
+    int si = 0;
+    if (neg) buf[si++] = '-';
+    while (ti > 0) buf[si++] = tmp[--ti];
+    buf[si] = '\0';
+}
+
+/* ---- Model + Tokenizer (loaded once, persists across infer calls) ---- */
+static ba_model     *g_model = 0;
+static ba_tokenizer *g_tok   = 0;
+
+#define MODEL_PATH "\\rwkvos\\model.btw"
+#define VOCAB_PATH "\\rwkvos\\vocab.btv"
+
+static int ensure_model_loaded(void) {
+    if (g_model && g_tok) return 1;
+
+    /* Initialize filesystem */
+    if (efi_fs_init() != EFI_SUCCESS) {
+        efi_print_ascii("  ERROR: filesystem init failed\r\n");
+        return 0;
+    }
+
+    if (!g_model) {
+        efi_print_ascii("  Loading model from " MODEL_PATH "...\r\n");
+        g_model = ba_model_load(MODEL_PATH);
+        if (!g_model) {
+            efi_print_ascii("  ERROR: failed to load model\r\n");
+            return 0;
+        }
+
+        ba_model_config *cfg = &g_model->config;
+        char num[12];
+        efi_print_ascii("  Model loaded: ");
+        int_to_str(num, cfg->n_layers); efi_print_ascii(num); efi_print_ascii(" layers, ");
+        int_to_str(num, cfg->n_embd); efi_print_ascii(num); efi_print_ascii(" hidden, ");
+        int_to_str(num, cfg->vocab_size); efi_print_ascii(num); efi_print_ascii(" vocab\r\n");
+
+        /* Print size */
+        uint64_t mb = g_model->raw_size / (1024 * 1024);
+        int_to_str(num, (int)mb);
+        efi_print_ascii("  Weights: "); efi_print_ascii(num); efi_print_ascii(" MB\r\n");
+    }
+
+    if (!g_tok) {
+        efi_print_ascii("  Loading vocab from " VOCAB_PATH "...\r\n");
+        g_tok = ba_tokenizer_load(VOCAB_PATH);
+        if (!g_tok) {
+            efi_print_ascii("  ERROR: failed to load vocab\r\n");
+            return 0;
+        }
+        efi_print_ascii("  Vocab loaded.\r\n");
+    }
+
+    return 1;
+}
+
+/* ---- Inference command ---- */
+
+static void command_infer(void) {
+    if (!ensure_model_loaded()) return;
+
+    efi_print_ascii("\r\n  Enter prompt (empty line to cancel):\r\n");
+    efi_print_ascii("  > ");
+
+    char prompt[1024];
+    int len = efi_read_line(prompt, sizeof(prompt));
+    if (len <= 0) return;
+
+    /* Encode prompt directly (no chat template — works for all models).
+     * Chat models would need <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+     * but base models (SmolLM2, Llama-base) just take raw text. */
+    int tokens[2048];
+    int n_prompt = ba_tokenizer_encode(g_tok, prompt, tokens, 2048);
+    if (n_prompt <= 0) {
+        efi_print_ascii("  ERROR: tokenization failed\r\n");
+        return;
+    }
+
+    char num[12];
+    int_to_str(num, n_prompt);
+    efi_print_ascii("  Prompt: "); efi_print_ascii(num); efi_print_ascii(" tokens [");
+    for (int t = 0; t < n_prompt && t < 10; t++) {
+        if (t > 0) efi_print_ascii(", ");
+        int_to_str(num, tokens[t]); efi_print_ascii(num);
+    }
+    efi_print_ascii("]\r\n");
+    efi_print_ascii("  Generating...\r\n\r\n");
+
+    /* Reset model state */
+    ba_model_reset(g_model);
+
+    ba_sample_config cfg = ba_default_config();
+    cfg.temperature = 0.0f;  /* greedy for determinism */
+    cfg.max_tokens = 256;
+
+    int eos_id = ba_tokenizer_eos(g_tok);
+    int im_end_id = ba_tokenizer_im_end(g_tok);
+    int vocab = ba_model_vocab_size(g_model);
+
+    /* Prefill: process all prompt tokens */
+    float *logits = ba_model_forward(g_model, tokens, n_prompt);
+
+    /* Generate tokens */
+    int n_gen = 0;
+    char decode_buf[64];
+
+    for (int i = 0; i < cfg.max_tokens; i++) {
+        /* Debug: show top-5 logits for first 5 tokens */
+        if (i < 5) {
+            int top_ids[5] = {0,0,0,0,0};
+            float top_vals[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+            for (int v = 0; v < vocab; v++) {
+                if (logits[v] > top_vals[4]) {
+                    top_vals[4] = logits[v]; top_ids[4] = v;
+                    /* bubble up */
+                    for (int s = 4; s > 0 && top_vals[s] > top_vals[s-1]; s--) {
+                        float tv = top_vals[s]; top_vals[s] = top_vals[s-1]; top_vals[s-1] = tv;
+                        int ti = top_ids[s]; top_ids[s] = top_ids[s-1]; top_ids[s-1] = ti;
+                    }
+                }
+            }
+            uefi_printf("  [step %d] top5:", i);
+            for (int t = 0; t < 5; t++) {
+                char tbuf[32];
+                ba_tokenizer_decode(g_tok, &top_ids[t], 1, tbuf, sizeof(tbuf));
+                uefi_printf(" %d(%s)=%.2f", top_ids[t], tbuf, (double)top_vals[t]);
+            }
+            uefi_printf("\r\n");
+        }
+
+        int next = ba_model_sample(logits, vocab, &cfg);
+
+        /* Check for EOS */
+        if (next == eos_id || next == im_end_id) break;
+
+        /* Decode and display token */
+        ba_tokenizer_decode(g_tok, &next, 1, decode_buf, sizeof(decode_buf));
+
+        /* Print, converting \n to \r\n for UEFI console */
+        for (int j = 0; decode_buf[j]; j++) {
+            if (decode_buf[j] == '\n') {
+                efi_print_ascii("\r\n");
+            } else {
+                CHAR16 ch[2] = { (CHAR16)(unsigned char)decode_buf[j], 0 };
+                efi_print(ch);
+            }
+        }
+
+        n_gen++;
+
+        /* Forward pass for next token */
+        logits = ba_model_forward(g_model, &next, 1);
+    }
+
+    efi_print_ascii("\r\n\r\n  [");
+    int_to_str(num, n_gen);
+    efi_print_ascii(num);
+    efi_print_ascii(" tokens generated]\r\n");
+}
+
 #define HTTP_RESPONSE_MAX 8192
 #define DISPLAY_MAX       2048
 
@@ -150,7 +321,7 @@ static void command_repl(void) {
     char response[HTTP_RESPONSE_MAX];
 
     efi_print_ascii("\r\n");
-    efi_print_ascii("  Command REPL — commands: fetch <url>, netinfo, tensor, exit\r\n");
+    efi_print_ascii("  Commands: infer, ls [path], cat <file>, fetch <url>, netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -163,6 +334,59 @@ static void command_repl(void) {
         /* exit */
         if (str_eq(line, "exit")) {
             break;
+        }
+
+        /* infer — run inference */
+        if (str_eq(line, "infer")) {
+            command_infer();
+            continue;
+        }
+
+        /* ls [path] — list directory */
+        if (str_eq(line, "ls") || str_starts_with(line, "ls ")) {
+            if (efi_fs_init() != EFI_SUCCESS) {
+                efi_print_ascii("  Filesystem not available\r\n");
+                continue;
+            }
+            const char *path = line[2] == ' ' ? line + 3 : "";
+            while (*path == ' ') path++;
+            efi_list_dir(path);
+            continue;
+        }
+
+        /* cat <file> — read and display file */
+        if (str_starts_with(line, "cat ")) {
+            const char *path = line + 4;
+            while (*path == ' ') path++;
+            if (*path == '\0') {
+                efi_print_ascii("  Usage: cat <file>\r\n");
+                continue;
+            }
+            if (efi_fs_init() != EFI_SUCCESS) {
+                efi_print_ascii("  Filesystem not available\r\n");
+                continue;
+            }
+            void *buf = 0;
+            UINTN fsize = 0;
+            if (efi_read_file(path, &buf, &fsize) == EFI_SUCCESS && buf) {
+                /* Display up to 2KB */
+                UINTN show = fsize > 2048 ? 2048 : fsize;
+                char *p = (char *)buf;
+                for (UINTN i = 0; i < show; i++) {
+                    if (p[i] == '\n') {
+                        efi_print_ascii("\r\n");
+                    } else if (p[i] >= 0x20 && p[i] < 0x7F) {
+                        CHAR16 ch[2] = { (CHAR16)(unsigned char)p[i], 0 };
+                        efi_print(ch);
+                    }
+                }
+                efi_print_ascii("\r\n");
+                if (fsize > 2048) efi_print_ascii("  (truncated to 2KB)\r\n");
+                gBS->FreePool(buf);
+            } else {
+                efi_print_ascii("  File not found\r\n");
+            }
+            continue;
         }
 
         /* netinfo */
@@ -314,6 +538,14 @@ EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_T
 }
 
 static void __attribute__((used)) app_main(void) {
+    /* Initialize filesystem */
+    efi_print_ascii("  Initializing filesystem...\r\n");
+    if (efi_fs_init() == EFI_SUCCESS) {
+        efi_print_ascii("  Filesystem: ready\r\n");
+    } else {
+        efi_print_ascii("  Filesystem: unavailable\r\n");
+    }
+
     /* Initialize networking */
     efi_print_ascii("  Initializing network...\r\n");
     EFI_STATUS net_status = efi_net_init();

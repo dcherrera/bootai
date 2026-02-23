@@ -232,6 +232,56 @@ typedef struct EFI_IP4_CONFIG2_PROTOCOL {
 #define IP4_CONFIG2_POLICY_STATIC 0
 #define IP4_CONFIG2_POLICY_DHCP   1
 
+/* ---- Simple File System Protocol ---- */
+
+typedef struct EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
+
+/* File open modes */
+#define EFI_FILE_MODE_READ   0x0000000000000001ULL
+#define EFI_FILE_MODE_WRITE  0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
+
+/* File attributes */
+#define EFI_FILE_READ_ONLY  0x0000000000000001ULL
+#define EFI_FILE_DIRECTORY  0x0000000000000010ULL
+
+/* EFI_FILE_INFO GUID */
+#define EFI_FILE_INFO_GUID { 0x09576e92, 0x6d3f, 0x11d2, \
+    {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b} }
+
+typedef struct {
+    uint64_t Size;          /* Size of this struct + FileName */
+    uint64_t FileSize;
+    uint64_t PhysicalSize;
+    uint8_t  CreateTime[16];  /* EFI_TIME (16 bytes) */
+    uint8_t  LastAccessTime[16];
+    uint8_t  ModificationTime[16];
+    uint64_t Attribute;
+    CHAR16   FileName[1];   /* Null-terminated, variable length */
+} EFI_FILE_INFO;
+
+struct EFI_FILE_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *Open)(EFI_FILE_PROTOCOL *This, EFI_FILE_PROTOCOL **NewHandle,
+                              CHAR16 *FileName, uint64_t OpenMode, uint64_t Attributes);
+    EFI_STATUS (EFIAPI *Close)(EFI_FILE_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *Delete)(EFI_FILE_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *Read)(EFI_FILE_PROTOCOL *This, UINTN *BufferSize, void *Buffer);
+    EFI_STATUS (EFIAPI *Write)(EFI_FILE_PROTOCOL *This, UINTN *BufferSize, void *Buffer);
+    void *GetPosition;
+    EFI_STATUS (EFIAPI *SetPosition)(EFI_FILE_PROTOCOL *This, uint64_t Position);
+    EFI_STATUS (EFIAPI *GetInfo)(EFI_FILE_PROTOCOL *This, EFI_GUID *InformationType,
+                                 UINTN *BufferSize, void *Buffer);
+    void *SetInfo;
+    void *Flush;
+};
+
+typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *OpenVolume)(struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *This,
+                                     EFI_FILE_PROTOCOL **Root);
+} EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+
 /* ---- DNS4 Protocol (minimal) ---- */
 
 typedef struct {
@@ -396,6 +446,7 @@ int efi_read_line(char *buf, int max_len);
 
 /* Filesystem */
 EFI_STATUS efi_fs_init(void);
+EFI_STATUS efi_file_size(const char *path, UINTN *size_out);
 EFI_STATUS efi_read_file(const char *path, void **buffer, UINTN *size);
 EFI_STATUS efi_write_file(const char *path, const void *data, UINTN size);
 EFI_STATUS efi_list_dir(const char *path);

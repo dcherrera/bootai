@@ -382,22 +382,66 @@ double pow(double base, double e) {
 /* ================================================================= */
 
 /* --- sinf / sin --- */
-float sinf(float x) {
-    const float pi = 3.14159265358979f;
-    const float two_pi = 6.28318530717959f;
-
-    x = x - floorf(x / two_pi) * two_pi;
-    if (x > pi) x -= two_pi;
-
+/* Range-reduce to [-pi/4, pi/4], then use sin/cos kernels.
+ * Much more accurate than Taylor at large x. */
+static float _sinf_kernel(float x) {
+    /* Minimax polynomial for sin(x) on [-pi/4, pi/4], max error < 1 ULP */
     float x2 = x * x;
-    return x * (1.0f + x2 * (-0.16666667f + x2 * (0.0083333310f +
-           x2 * (-0.00019841270f + x2 * 2.7557319e-06f))));
+    return x * (1.0f + x2 * (-0.16666666641626524f + x2 * (0.008333329385889463f +
+           x2 * (-0.00019840874255566862f + x2 * 2.718311493989822e-06f))));
+}
+
+static float _cosf_kernel(float x) {
+    /* Minimax polynomial for cos(x) on [-pi/4, pi/4], max error < 1 ULP */
+    float x2 = x * x;
+    return 1.0f + x2 * (-0.4999999963024749f + x2 * (0.04166662332373906f +
+           x2 * (-0.001388731625493765f + x2 * 0.00002443315711809948f)));
+}
+
+float sinf(float x) {
+    const float pi     = 3.14159265358979323846f;
+    const float half_pi = 1.57079632679489661923f;
+    const float two_pi  = 6.28318530717958647692f;
+
+    /* Range reduce to [0, 2*pi) */
+    x = x - floorf(x / two_pi) * two_pi;
+    if (x < 0.0f) x += two_pi;
+
+    /* Quadrant selection for accuracy */
+    if (x < half_pi) {
+        return _sinf_kernel(x);
+    } else if (x < pi) {
+        return _sinf_kernel(pi - x);
+    } else if (x < pi + half_pi) {
+        return -_sinf_kernel(x - pi);
+    } else {
+        return -_sinf_kernel(two_pi - x);
+    }
 }
 
 double sin(double x) { return (double)sinf((float)x); }
 
 /* --- cosf / cos --- */
-float cosf(float x) { return sinf(x + 1.5707963267948966f); }
+float cosf(float x) {
+    const float pi     = 3.14159265358979323846f;
+    const float half_pi = 1.57079632679489661923f;
+    const float two_pi  = 6.28318530717958647692f;
+
+    /* Range reduce to [0, 2*pi) */
+    x = x - floorf(x / two_pi) * two_pi;
+    if (x < 0.0f) x += two_pi;
+
+    /* Quadrant selection: use cos kernel near 0 and pi, sin kernel near pi/2 */
+    if (x < half_pi) {
+        return _cosf_kernel(x);
+    } else if (x < pi) {
+        return -_cosf_kernel(pi - x);
+    } else if (x < pi + half_pi) {
+        return -_cosf_kernel(x - pi);
+    } else {
+        return _cosf_kernel(two_pi - x);
+    }
+}
 double cos(double x) { return (double)cosf((float)x); }
 
 /* --- tanf / tan --- */

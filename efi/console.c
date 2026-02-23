@@ -61,8 +61,7 @@ void efi_print_ascii(const char *str) {
         serial_inited = 1;
     }
 
-    /* Mirror to serial */
-    serial_puts(str);
+    /* ConOut is mirrored to serial by OVMF — no separate serial_puts needed */
 
     /* Convert ASCII to UCS-2 in a stack buffer, flush in chunks */
     CHAR16 buf[128];

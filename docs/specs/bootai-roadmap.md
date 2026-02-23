@@ -8,8 +8,8 @@
 |-------|-------------|--------|
 | 1 | Boot + Console + Input | COMPLETE |
 | 2 | Networking (DHCP, TCP4, HTTP, DNS) | COMPLETE |
-| 3 | Filesystem (EFI_SIMPLE_FILE_SYSTEM) | PLANNED |
-| 4 | Model Loading + Inference | PLANNED |
+| 3 | Foundry Tensor Library on UEFI | COMPLETE |
+| 4 | Model Loading + Inference | IN PROGRESS |
 | 5 | Tool Use | PLANNED |
 | 6 | Full AI Assistant | PLANNED |
 
@@ -41,30 +41,40 @@ Full IP networking: DHCP, TCP4, DNS, HTTP/1.0 GET.
 - REPL commands: `fetch <url>`, `netinfo`, `exit`
 - Custom OVMF build with `NETWORK_IP4_ENABLE=TRUE`
 
-## Phase 3: Filesystem (PLANNED)
+## Phase 3: Foundry Tensor Library on UEFI (COMPLETE)
 
-Read/write files on the boot FAT32 partition.
+Foundry's tensor.c (9,318 lines) and quantization.c compile and run as part of the EFI binary.
 
-- Initialize `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`
-- Open, read, write, close files
-- Directory listing
-- Model weight file loading from disk
-- Conversation history persistence
-- Settings storage (JSON or key-value)
+- Shim headers (`shim/math.h`, `shim/string.h`, `shim/stdlib.h`, `shim/stdio.h`, `shim/time.h`) provide declaration-only libc interface
+- `efi/uefi_libc.c` implements malloc/free via UEFI `AllocatePool`/`FreePool`, printf via ConOut, 29 math functions in pure C
+- `efi/uefi_libc.h` force-included via `-include` redirects `malloc`→`uefi_malloc`, `printf`→`uefi_printf`, etc.
+- Tensor self-tests pass: matmul, softmax, rms_norm, silu
+- Key lesson: `static inline __builtin_*` wrappers crash in PE/COFF (PLT calls); declarations-only + global symbols work
 
-## Phase 4: Model Loading + Inference (PLANNED)
+## Phase 4: Model Loading + Inference (IN PROGRESS)
 
-Load quantized models and run inference on bare metal.
+Load quantized models and run inference on bare metal. Current model: **SmolLM2-135M** (30 layers, 576 hidden, 9/3 GQA heads, 49K vocab).
 
-- Foundry tensor library integration (pure C, `tensor.c`)
-- JACLibc wiring (`malloc` via `AllocatePages`, `printf` via ConOut)
-- Weight loader (auto-detect Qwen2.5 Q4 vs RWKV-X Q8)
-- Qwen2.5-Coder-7B forward pass (RoPE, GQA, SwiGLU, Q4 dequant)
-- RWKV-X 3.6B forward pass (WKV-7 kernel, sparse attention, Q8 dequant)
-- KV cache management (bounded memory budget)
-- BPE tokenizer (Qwen2.5) and RWKV World tokenizer (trie)
-- Token sampling (temperature, top-k, top-p)
-- Inference REPL (prompt -> generate -> display)
+### Completed
+
+- Filesystem: read/write files via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` (`efi/fs.c`)
+- Weight loader: reads `.btw` binary format, auto-detects architecture from header (`model/loader.c`)
+- Model converter: `foundry/convert/` converts HuggingFace safetensors → `.btw` (weights) + `.btv` (vocab). Supports Llama, Qwen2/2.5, Qwen3, Phi-3, Gemma2 families
+- Qwen2/Llama forward pass: RMSNorm, GQA attention, RoPE (halved/rotate_half format), SwiGLU FFN, F16 weights with F32 activations (`model/qwen2.c`)
+- KV cache: per-layer pre-allocated, oldest-half eviction when full (`model/kv_cache.c`)
+- BPE tokenizer: GPT-2 style, loaded from `.btv` binary format (`tokenizer/bpe.c`)
+- Token sampling: temperature, top-k, top-p, repeat penalty (`model/sampling.c`)
+- Inference REPL: `infer` command → prompt → generate → display (`efi/main.c`)
+- Math library: 29 functions in pure C (sinf, cosf, expf, sqrtf, etc.) for freestanding environment (`efi/uefi_libc.c`)
+- **First successful inference**: SmolLM2-135M generates coherent text on bare metal, logits match Python F32 reference
+
+### Remaining
+
+- EOS detection: model doesn't stop generating (needs EOS token mapping fix)
+- RWKV-X forward pass (WKV-7 kernel, sparse attention) — code exists but untested on bare metal
+- RWKV World tokenizer (trie-based) — code exists but untested
+- Larger models: Qwen2.5-Coder-7B (Q4), RWKV-X 3.6B (Q8)
+- Performance: currently ~0.5 tok/s on SmolLM2-135M in QEMU (no hardware acceleration)
 
 ## Phase 5: Tool Use (PLANNED)
 
