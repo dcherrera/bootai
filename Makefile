@@ -15,7 +15,7 @@ CFLAGS = -O2 -msse4.2 \
 SHIM_CFLAGS = -I shim
 
 # Phase 1: EFI layer only (console + input + memory)
-EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c
+EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c
 
 # Phase 3: UEFI libc shim (malloc/printf via UEFI Boot Services)
 LIBC_SRC  = efi/uefi_libc.c
@@ -114,8 +114,9 @@ img: bootai-p4.efi
 	@size=$$(( ($$(stat -f%z $(MODEL_BTW)) + $$(stat -f%z $(MODEL_BTV)) + 52428800) / 1048576 )); \
 	dd if=/dev/zero of=bootai.img bs=1m count=$$size 2>/dev/null
 	mformat -i bootai.img -F ::
-	mmd -i bootai.img ::EFI ::EFI/BOOT ::rwkvos ::workspace
+	mmd -i bootai.img ::EFI ::EFI/BOOT ::rwkvos ::workspace ::drivers
 	mcopy -i bootai.img bootai-p4.efi ::EFI/BOOT/BOOTX64.EFI
+	mcopy -i bootai.img wifi.conf.template ::wifi.conf
 	mcopy -i bootai.img $(MODEL_BTW) ::rwkvos/model.btw
 	mcopy -i bootai.img $(MODEL_BTV) ::rwkvos/vocab.btv
 	@echo "bootai.img ready ($$(ls -lh bootai.img | awk '{print $$5}'))"

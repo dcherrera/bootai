@@ -34,6 +34,13 @@ typedef struct {
     uint8_t  Data4[8];
 } EFI_GUID;
 
+/* EFI_DEVICE_PATH_PROTOCOL */
+typedef struct {
+    uint8_t Type;
+    uint8_t SubType;
+    uint8_t Length[2];
+} EFI_DEVICE_PATH_PROTOCOL;
+
 /* Status codes */
 #define EFI_SUCCESS              0
 #define EFI_ERROR_MASK           0x8000000000000000ULL
@@ -382,8 +389,12 @@ struct EFI_BOOT_SERVICES {
     void *InstallConfigurationTable;
 
     /* Image */
-    void *LoadImage;
-    void *StartImage;
+    EFI_STATUS (EFIAPI *LoadImage)(BOOLEAN BootPolicy, EFI_HANDLE ParentImageHandle,
+                                   EFI_DEVICE_PATH_PROTOCOL *DevicePath,
+                                   void *SourceBuffer, UINTN SourceSize,
+                                   EFI_HANDLE *ImageHandle);
+    EFI_STATUS (EFIAPI *StartImage)(EFI_HANDLE ImageHandle, UINTN *ExitDataSize,
+                                    CHAR16 **ExitData);
     void *Exit;
     void *UnloadImage;
     void *ExitBootServices;
@@ -423,6 +434,98 @@ struct EFI_SYSTEM_TABLE {
     EFI_BOOT_SERVICES              *BootServices;
 };
 
+/* ---- 802.11 / WiFi types (UEFI 2.7+) ---- */
+
+typedef struct {
+    uint8_t Addr[6];
+} EFI_80211_MAC_ADDRESS;
+
+#define EFI_MAX_SSID_LEN 32
+
+typedef struct {
+    uint8_t SSIdLen;
+    uint8_t SSId[EFI_MAX_SSID_LEN];
+} EFI_80211_SSID;
+
+typedef enum {
+    IeeeInfrastructure = 0,
+    IeeeIBSS           = 1,
+    IeeeAny             = 2,
+} EFI_80211_BSS_TYPE;
+
+typedef enum {
+    Ieee80211OpenSystem      = 0,
+    Ieee80211SharedKey       = 1,
+    Ieee80211WPAPSK          = 2,
+    Ieee80211WPA2PSK         = 3,
+} EFI_80211_AKM_SUITE_TYPE;
+
+typedef struct {
+    EFI_80211_SSID         SSId;
+    EFI_80211_BSS_TYPE     BSSType;
+    EFI_80211_MAC_ADDRESS  BSSId;
+    int16_t                RSSI;       /* Signal strength in dBm */
+    EFI_80211_AKM_SUITE_TYPE AKMSuite;
+} EFI_80211_NETWORK;
+
+typedef struct {
+    uint32_t             NetworkCount;
+    EFI_80211_NETWORK    Network[1];   /* Variable-length array */
+} EFI_80211_NETWORK_DESCRIPTION;
+
+/* WiFi2 completion token */
+typedef struct {
+    EFI_EVENT  Event;
+    EFI_STATUS Status;
+} EFI_80211_COMPLETION_TOKEN;
+
+typedef struct {
+    EFI_80211_COMPLETION_TOKEN Token;
+    EFI_80211_NETWORK_DESCRIPTION *Result;
+} EFI_80211_GET_NETWORKS_TOKEN;
+
+typedef struct {
+    EFI_80211_COMPLETION_TOKEN Token;
+    EFI_80211_NETWORK_DESCRIPTION *Data;  /* Network to connect to */
+} EFI_80211_CONNECT_NETWORK_TOKEN;
+
+typedef struct {
+    EFI_80211_COMPLETION_TOKEN Token;
+} EFI_80211_DISCONNECT_NETWORK_TOKEN;
+
+/* EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL (WiFi2) */
+typedef struct EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL {
+    EFI_STATUS (EFIAPI *GetNetworks)(
+        struct EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL *This,
+        EFI_80211_GET_NETWORKS_TOKEN *Token);
+    EFI_STATUS (EFIAPI *ConnectNetwork)(
+        struct EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL *This,
+        EFI_80211_CONNECT_NETWORK_TOKEN *Token);
+    EFI_STATUS (EFIAPI *DisconnectNetwork)(
+        struct EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL *This,
+        EFI_80211_DISCONNECT_NETWORK_TOKEN *Token);
+} EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL;
+
+/* Supplicant data types */
+#define EFI_SUPPLICANT_DATA_TYPE_SSID  0
+#define EFI_SUPPLICANT_DATA_TYPE_PSK   1
+
+/* EFI_SUPPLICANT_PROTOCOL */
+typedef struct EFI_SUPPLICANT_PROTOCOL {
+    void *BuildResponsePacket;
+    void *ProcessPacket;
+    EFI_STATUS (EFIAPI *SetData)(
+        struct EFI_SUPPLICANT_PROTOCOL *This,
+        uint32_t DataType,
+        void *Data,
+        UINTN DataSize);
+    EFI_STATUS (EFIAPI *GetData)(
+        struct EFI_SUPPLICANT_PROTOCOL *This,
+        uint32_t DataType,
+        void **Data,
+        UINTN *DataSize);
+} EFI_SUPPLICANT_PROTOCOL;
+
 /* Protocol GUIDs */
 extern EFI_GUID gEfiSimpleFileSystemProtocolGuid;
 extern EFI_GUID gEfiGraphicsOutputProtocolGuid;
@@ -433,10 +536,13 @@ extern EFI_GUID gEfiUdp4ServiceBindingGuid;
 extern EFI_GUID gEfiUdp4ProtocolGuid;
 extern EFI_GUID gEfiDns4ServiceBindingGuid;
 extern EFI_GUID gEfiDns4ProtocolGuid;
+extern EFI_GUID gEfiWiFi2ProtocolGuid;
+extern EFI_GUID gEfiSupplicantProtocolGuid;
 
-/* Global system table — set in efi_main */
+/* Global system table + image handle — set in efi_main */
 extern EFI_SYSTEM_TABLE *gST;
 extern EFI_BOOT_SERVICES *gBS;
+extern EFI_HANDLE gImageHandle;
 
 /* Console */
 void efi_print(const CHAR16 *str);
@@ -480,5 +586,20 @@ void ba_http_serve(uint16_t port);
 
 /* Memory — JACLibc malloc wired to UEFI AllocatePool */
 void efi_memory_init(void);
+
+/* Driver loading */
+void efi_load_drivers(void);
+
+/* WiFi */
+int  efi_wifi_available(void);
+void efi_wifi_scan(void);
+EFI_STATUS efi_wifi_connect(const char *ssid, const char *password);
+void efi_wifi_disconnect(void);
+void efi_wifi_auto_connect(void);
+void efi_wifi_save(const char *ssid, const char *password);
+void efi_wifi_status(void);
+
+/* Network helpers (used by drivers.c and wifi.c) */
+void connect_all_controllers(void);
 
 #endif /* BOOTAI_EFI_H */

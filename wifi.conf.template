@@ -1,0 +1,6 @@
+# wifi.conf — BootAI WiFi Configuration
+# Add your networks below. First match wins during auto-connect.
+#
+# [network]
+# ssid=YourNetworkName
+# password=YourPassword

@@ -12,6 +12,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [Networking](architecture/networking.md) — DHCP, TCP4, UDP4 DNS, HTTP/1.0
 - [Inference on Bare Metal](architecture/inference-on-bare-metal.md) — Model conversion, disk image creation, running SmolLM2-135M
 - [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions
+- [WiFi & Driver Loader](architecture/wifi-and-drivers.md) — UEFI driver loading from disk, WiFi scan/connect via WiFi2 protocol, wifi.conf auto-connect
 
 ## Research
 
@@ -36,6 +37,8 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | Build commands | `../Makefile` |
 | UEFI types | `../efi/efi.h` |
 | Network stack | `../efi/net.c` |
+| WiFi management | `../efi/wifi.c` |
+| Driver loader | `../efi/drivers.c` |
 | HTTP server | `../efi/http_server.c` |
 | API handlers | `../efi/api.c` |
 | Entry point | `../efi/main.c` |

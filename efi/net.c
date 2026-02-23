@@ -151,7 +151,7 @@ static void EFIAPI empty_notify(EFI_EVENT event, void *ctx) {
 #define SEARCH_ALL_HANDLES 0
 #define SEARCH_BY_PROTOCOL 2
 
-static void connect_all_controllers(void) {
+void connect_all_controllers(void) {
     UINTN handle_count = 0;
     EFI_HANDLE *handles = 0;
 

@@ -15,6 +15,7 @@ int uefi_printf(const char *fmt, ...);
 /* Globals */
 EFI_SYSTEM_TABLE  *gST = 0;
 EFI_BOOT_SERVICES *gBS = 0;
+EFI_HANDLE         gImageHandle = 0;
 
 /* Protocol GUIDs */
 EFI_GUID gEfiSimpleFileSystemProtocolGuid = {
@@ -316,7 +317,8 @@ static void command_repl(void) {
     char response[HTTP_RESPONSE_MAX];
 
     efi_print_ascii("\r\n");
-    efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>, netinfo, tensor, exit\r\n");
+    efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
+    efi_print_ascii("            wifi [scan|connect|disconnect|save], netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -489,6 +491,70 @@ static void command_repl(void) {
             continue;
         }
 
+        /* wifi — WiFi management commands */
+        if (str_eq(line, "wifi")) {
+            efi_wifi_status();
+            continue;
+        }
+        if (str_eq(line, "wifi scan")) {
+            efi_wifi_scan();
+            continue;
+        }
+        if (str_eq(line, "wifi disconnect")) {
+            efi_wifi_disconnect();
+            continue;
+        }
+        if (str_starts_with(line, "wifi save")) {
+            const char *ssid = line + 9;
+            while (*ssid == ' ') ssid++;
+            if (*ssid == '\0') {
+                efi_print_ascii("  Usage: wifi save <SSID> [password]\r\n");
+                continue;
+            }
+            /* Check if password is provided after SSID (space-separated) */
+            const char *pw = ssid;
+            while (*pw && *pw != ' ') pw++;
+            if (*pw == ' ') {
+                /* Split SSID and password */
+                char save_ssid[64];
+                int slen = (int)(pw - ssid);
+                if (slen > 63) slen = 63;
+                for (int i = 0; i < slen; i++) save_ssid[i] = ssid[i];
+                save_ssid[slen] = '\0';
+                pw++;
+                while (*pw == ' ') pw++;
+                efi_wifi_save(save_ssid, pw);
+            } else {
+                efi_wifi_save(ssid, "");
+            }
+            continue;
+        }
+        if (str_starts_with(line, "wifi connect ")) {
+            const char *ssid = line + 13;
+            while (*ssid == ' ') ssid++;
+            if (*ssid == '\0') {
+                efi_print_ascii("  Usage: wifi connect <SSID>\r\n");
+                continue;
+            }
+            /* Prompt for password */
+            efi_print_ascii("  Password: ");
+            char password[128];
+            int plen = efi_read_line(password, sizeof(password));
+            if (plen < 0) plen = 0;
+            password[plen] = '\0';
+
+            EFI_STATUS ws = efi_wifi_connect(ssid, password);
+            if (ws == EFI_SUCCESS) {
+                efi_print_ascii("  Save to wifi.conf? (y/n) ");
+                char yn[8];
+                efi_read_line(yn, sizeof(yn));
+                if (yn[0] == 'y' || yn[0] == 'Y') {
+                    efi_wifi_save(ssid, password);
+                }
+            }
+            continue;
+        }
+
         /* tensor — run tensor self-test */
         if (str_eq(line, "tensor")) {
             tensor_self_test();
@@ -524,10 +590,9 @@ static void __attribute__((used)) app_main(void);
 
 /* EFI application entry point — must use MS x64 calling convention */
 EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
-    (void)ImageHandle;
-
     gST = SystemTable;
     gBS = SystemTable->BootServices;
+    gImageHandle = ImageHandle;
 
     /* Clear screen */
     efi_clear_screen();
@@ -563,7 +628,10 @@ static void __attribute__((used)) app_main(void) {
         efi_print_ascii("  Filesystem: unavailable\r\n");
     }
 
-    /* Initialize networking */
+    /* Load third-party UEFI drivers from \drivers\ */
+    efi_load_drivers();
+
+    /* Initialize networking (wired Ethernet + DHCP) */
     efi_print_ascii("  Initializing network...\r\n");
     EFI_STATUS net_status = efi_net_init();
     if (net_status == EFI_SUCCESS && efi_net_available()) {
@@ -571,6 +639,9 @@ static void __attribute__((used)) app_main(void) {
     } else {
         efi_print_ascii("  Network: unavailable\r\n");
     }
+
+    /* Auto-connect WiFi if adapter present and wifi.conf exists */
+    efi_wifi_auto_connect();
 
     /* Run tensor self-test at boot */
     tensor_self_test();
