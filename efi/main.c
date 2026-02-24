@@ -8,6 +8,7 @@
 #include "efi.h"
 #include "foundry/tensor/tensor.h"
 #include "model/model.h"
+#include "iwn/iwn.h"
 
 /* Printf (provided by uefi_libc.c) */
 int uefi_printf(const char *fmt, ...);
@@ -318,7 +319,7 @@ static void command_repl(void) {
 
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
-    efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, netinfo, tensor, exit\r\n");
+    efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -574,6 +575,12 @@ static void command_repl(void) {
                 }
                 ba_mdns_stop();
             }
+            continue;
+        }
+
+        /* iwn — PCI probe for Intel WiFi */
+        if (str_eq(line, "iwn")) {
+            iwn_probe();
             continue;
         }
 

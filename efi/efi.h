@@ -235,6 +235,75 @@ typedef struct EFI_IP4_CONFIG2_PROTOCOL {
     void *UnregisterDataNotify;
 } EFI_IP4_CONFIG2_PROTOCOL;
 
+/* ---- PCI IO Protocol ---- */
+
+typedef enum {
+    EfiPciIoWidthUint8 = 0,
+    EfiPciIoWidthUint16,
+    EfiPciIoWidthUint32,
+    EfiPciIoWidthUint64,
+} EFI_PCI_IO_PROTOCOL_WIDTH;
+
+typedef struct EFI_PCI_IO_PROTOCOL EFI_PCI_IO_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_IO_MEM)(
+    EFI_PCI_IO_PROTOCOL *This,
+    EFI_PCI_IO_PROTOCOL_WIDTH Width,
+    uint8_t BarIndex,
+    uint64_t Offset,
+    UINTN Count,
+    void *Buffer);
+
+typedef struct {
+    EFI_PCI_IO_PROTOCOL_IO_MEM Read;
+    EFI_PCI_IO_PROTOCOL_IO_MEM Write;
+} EFI_PCI_IO_PROTOCOL_ACCESS;
+
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_CONFIG)(
+    EFI_PCI_IO_PROTOCOL *This,
+    EFI_PCI_IO_PROTOCOL_WIDTH Width,
+    uint32_t Offset,
+    UINTN Count,
+    void *Buffer);
+
+typedef struct {
+    EFI_PCI_IO_PROTOCOL_CONFIG Read;
+    EFI_PCI_IO_PROTOCOL_CONFIG Write;
+} EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS;
+
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_GET_LOCATION)(
+    EFI_PCI_IO_PROTOCOL *This,
+    UINTN *SegmentNumber,
+    UINTN *BusNumber,
+    UINTN *DeviceNumber,
+    UINTN *FunctionNumber);
+
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_ATTRIBUTES)(
+    EFI_PCI_IO_PROTOCOL *This,
+    uint32_t Operation,  /* 0=Get, 1=Set, 2=Enable, 3=Disable */
+    uint64_t Attributes,
+    uint64_t *Result);
+
+struct EFI_PCI_IO_PROTOCOL {
+    void *PollMem;
+    void *PollIo;
+    EFI_PCI_IO_PROTOCOL_ACCESS Mem;
+    EFI_PCI_IO_PROTOCOL_ACCESS Io;
+    EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS Pci;
+    void *CopyMem;
+    void *Map;
+    void *Unmap;
+    void *AllocateBuffer;
+    void *FreeBuffer;
+    void *Flush;
+    EFI_PCI_IO_PROTOCOL_GET_LOCATION GetLocation;
+    EFI_PCI_IO_PROTOCOL_ATTRIBUTES Attributes;
+    void *GetBarAttributes;
+    void *SetBarAttributes;
+    uint64_t RomSize;
+    void *RomImage;
+};
+
 /* IP4Config2 data types */
 #define IP4_CONFIG2_DATA_TYPE_INTERFACEINFO 0
 #define IP4_CONFIG2_DATA_TYPE_POLICY        1
@@ -538,6 +607,7 @@ extern EFI_GUID gEfiDns4ServiceBindingGuid;
 extern EFI_GUID gEfiDns4ProtocolGuid;
 extern EFI_GUID gEfiWiFi2ProtocolGuid;
 extern EFI_GUID gEfiSupplicantProtocolGuid;
+extern EFI_GUID gEfiPciIoProtocolGuid;
 
 /* Global system table + image handle — set in efi_main */
 extern EFI_SYSTEM_TABLE *gST;
