@@ -15,7 +15,8 @@ bootai/
 │   ├── console.c                # Framebuffer text output via GOP
 │   ├── input.c                  # Keyboard via Simple Text Input protocol
 │   ├── fs.c                     # File ops via Simple File System protocol
-│   └── net.c                    # Networking via TCP4/HTTP protocols
+│   ├── net.c                    # Networking via TCP4/HTTP protocols
+│   └── mdns.c                   # mDNS/Bonjour responder (bootai.local)
 ├── model/
 │   ├── model.h                  # Common model interface (forward, load, sample)
 │   ├── qwen2.h                  # Qwen2.5 config + forward pass
@@ -56,14 +57,57 @@ bootai/
 ## Build Commands
 
 ```bash
-make efi              # Build rwkvos.efi
-make run              # Run in QEMU with OVMF
+make efi              # Build all_bootai.efi (full build)
+make run              # Run in QEMU with OVMF (interactive — do NOT run from Claude)
 make clean            # Clean build artifacts
-make usb DISK=/dev/X  # Write bootable USB
 
 # Model export
 python3 tools/export_weights.py --model Qwen/Qwen2.5-Coder-7B-Instruct --quant q4_k_m --output model.bin
 ```
+
+## Flashing USB
+
+The USB drive is FAT32 with an existing EFI directory structure. To flash the latest build, mount and copy — do NOT use `dd` or `sudo`:
+
+```bash
+# 1. Find the USB disk
+diskutil list external
+# Look for the BOOTAI partition (e.g. /dev/disk11s1)
+
+# 2. Mount, copy EFI binary, eject
+diskutil mount /dev/diskNs1
+cp all_bootai.efi /Volumes/BOOTAI/EFI/BOOT/BOOTX64.EFI
+diskutil eject /dev/diskN
+```
+
+### USB directory layout
+
+The USB must have this structure for the model to load:
+
+```
+BOOTAI/
+├── EFI/BOOT/BOOTX64.EFI          ← all_bootai.efi
+├── rwkvos/
+│   ├── model.btw                  ← quantized weights
+│   └── vocab.btv                  ← tokenizer vocabulary
+├── drivers/                       ← optional UEFI drivers
+├── workspace/                     ← user files
+└── wifi.conf                      ← saved WiFi credentials
+```
+
+### First-time USB setup
+
+If the model/vocab files are missing, copy them:
+
+```bash
+# Source files are in ../models/base/SmolLM2-135M-Instruct/
+cp ../models/base/SmolLM2-135M-Instruct/model.btw /Volumes/BOOTAI/rwkvos/model.btw
+cp ../models/base/SmolLM2-135M-Instruct/model.btv /Volumes/BOOTAI/rwkvos/vocab.btv
+```
+
+**Note:** The source vocab file is named `model.btv` but the code expects `vocab.btv`. Always rename when copying.
+
+**Important:** `dd` requires sudo which is not available from Claude's shell. Always use mount+copy instead.
 
 ## Key Architecture
 
