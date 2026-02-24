@@ -316,8 +316,9 @@ int iwn5000_load_firmware(iwn_dev *dev, const uint8_t *text, uint32_t text_len,
 
 int iwn_poll_rx(iwn_dev *dev, uint8_t expected_type, int timeout_ms) {
     struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
+    int found = 0;
 
-    for (int t = 0; t < timeout_ms; t++) {
+    for (int t = 0; t < timeout_ms && !found; t++) {
         /* HW write index from status page (closed_count is updated by HW) */
         uint32_t hw_idx = stat->closed_count & 0x0fff;
 
@@ -327,15 +328,18 @@ int iwn_poll_rx(iwn_dev *dev, uint8_t expected_type, int timeout_ms) {
             struct iwn_rx_desc *desc = (struct iwn_rx_desc *)buf;
 
             if (desc->type == expected_type)
-                return 0;
+                found = 1;
 
             /* Save calibration results inline */
             if (desc->type == IWN5000_CALIBRATION_RESULT) {
                 if (dev->n_calib < IWN_MAX_CALIB_RESULTS) {
-                    /* Calibration data follows the rx_desc header */
+                    /*
+                     * Calibration data follows the rx_desc header.
+                     * desc->len includes payload + 4-byte trailer.
+                     * Reference: OpenBSD uses (len & MASK) - 4.
+                     */
                     uint8_t *calib_data = (uint8_t *)buf + sizeof(struct iwn_rx_desc);
-                    uint32_t calib_len = (desc->len & IWN_RX_DESC_LEN_MASK) -
-                                         sizeof(struct iwn_rx_desc);
+                    uint32_t calib_len = (desc->len & IWN_RX_DESC_LEN_MASK) - 4;
                     if (calib_len > sizeof(dev->calib[0].data))
                         calib_len = sizeof(dev->calib[0].data);
                     iwn_memcpy(dev->calib[dev->n_calib].data,
@@ -345,12 +349,16 @@ int iwn_poll_rx(iwn_dev *dev, uint8_t expected_type, int timeout_ms) {
                 }
             }
 
-            /* Advance read index */
+            /* Advance read index — must happen even for expected_type,
+             * otherwise HW can't reuse this RX buffer slot */
             dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
 
             /* Tell HW we consumed this buffer — update RX write pointer */
             iwn_write(dev, IWN_FH_RX_WPTR,
                       ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) % IWN_RX_RING_COUNT) & ~7);
+
+            if (found)
+                return 0;
         }
 
         gBS->Stall(1000);  /* 1 ms */
@@ -508,7 +516,19 @@ void iwn5000_post_alive(iwn_dev *dev) {
 
     iwn_nic_unlock(dev);
 
+    /* Let scheduler settle before sending commands */
+    gBS->Stall(2000);  /* 2 ms */
+
     /* ---- Send calibration commands ---- */
+
+    /* WiMAX coexistence — must be sent before calibration (per OpenBSD).
+     * For non-6050 devices: all zeros = WiMAX coex disabled. */
+    struct iwn5000_wimax_coex wimax;
+    iwn_memset(&wimax, 0, sizeof(wimax));
+    if (iwn_cmd(dev, IWN5000_CMD_WIMAX_COEX, &wimax, sizeof(wimax)) != 0) {
+        efi_print_ascii("  iwn: WiMAX coex cmd failed\r\n");
+        return;
+    }
 
     /* Crystal calibration from EEPROM */
     struct iwn5000_phy_calib_crystal crystal_cmd;
@@ -519,7 +539,10 @@ void iwn5000_post_alive(iwn_dev *dev) {
     crystal_cmd.cap_pin[0] = (uint8_t)(dev->eeprom_crystal & 0xff);
     crystal_cmd.cap_pin[1] = (uint8_t)((dev->eeprom_crystal >> 16) & 0xff);
 
-    iwn_cmd(dev, IWN_CMD_PHY_CALIB, &crystal_cmd, sizeof(crystal_cmd));
+    if (iwn_cmd(dev, IWN_CMD_PHY_CALIB, &crystal_cmd, sizeof(crystal_cmd)) != 0) {
+        efi_print_ascii("  iwn: crystal calib cmd failed\r\n");
+        return;
+    }
 
     /* Query calibration — triggers firmware to run full calibration sequence */
     struct iwn5000_calib_config calib_cfg;
@@ -530,15 +553,69 @@ void iwn5000_post_alive(iwn_dev *dev) {
     calib_cfg.ucode.once.apply  = 0xffffffff;
     calib_cfg.ucode.flags       = 0xffffffff;
 
-    iwn_cmd(dev, IWN5000_CMD_CALIB_CONFIG, &calib_cfg, sizeof(calib_cfg));
+    if (iwn_cmd(dev, IWN5000_CMD_CALIB_CONFIG, &calib_cfg, sizeof(calib_cfg)) != 0) {
+        efi_print_ascii("  iwn: calib config cmd failed\r\n");
+        return;
+    }
 
-    /* Wait for calibration done (type 103) — up to 5 seconds */
-    if (iwn_poll_rx(dev, IWN5000_CALIBRATION_DONE, 5000) != 0) {
-        efi_print_ascii("  iwn: calibration timeout\r\n");
-    } else {
-        efi_print_ascii("  Calibration complete (");
-        print_dec((uint32_t)dev->n_calib);
-        efi_print_ascii(" results saved)\r\n");
+    /* Wait for calibration done (type 103) — up to 5 seconds.
+     * Debug: log every RX notification type to diagnose timeouts. */
+    {
+        struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
+        int done = 0;
+
+        for (int t = 0; t < 5000 && !done; t++) {
+            uint32_t hw_idx = stat->closed_count & 0x0fff;
+
+            while ((uint32_t)dev->rxq.cur != hw_idx) {
+                void *buf = dev->rxq.buf[dev->rxq.cur].vaddr;
+                struct iwn_rx_desc *desc = (struct iwn_rx_desc *)buf;
+
+                /* Debug: print every notification type */
+                efi_print_ascii("  rx[");
+                print_dec((uint32_t)desc->type);
+                efi_print_ascii("] len=");
+                print_dec(desc->len & IWN_RX_DESC_LEN_MASK);
+                efi_print_ascii("\r\n");
+
+                if (desc->type == IWN5000_CALIBRATION_DONE) {
+                    done = 1;
+                }
+
+                /* Save calibration results */
+                if (desc->type == IWN5000_CALIBRATION_RESULT) {
+                    if (dev->n_calib < IWN_MAX_CALIB_RESULTS) {
+                        uint8_t *calib_data = (uint8_t *)buf + sizeof(struct iwn_rx_desc);
+                        uint32_t calib_len = (desc->len & IWN_RX_DESC_LEN_MASK) - 4;
+                        if (calib_len > sizeof(dev->calib[0].data))
+                            calib_len = sizeof(dev->calib[0].data);
+                        iwn_memcpy(dev->calib[dev->n_calib].data,
+                                   calib_data, calib_len);
+                        dev->calib[dev->n_calib].len = calib_len;
+                        dev->n_calib++;
+                    }
+                }
+
+                /* Advance and return buffer to HW */
+                dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
+                iwn_write(dev, IWN_FH_RX_WPTR,
+                          ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) % IWN_RX_RING_COUNT) & ~7);
+
+                if (done)
+                    break;
+            }
+
+            if (!done)
+                gBS->Stall(1000);  /* 1 ms */
+        }
+
+        if (!done) {
+            efi_print_ascii("  iwn: calibration timeout\r\n");
+        } else {
+            efi_print_ascii("  Calibration complete (");
+            print_dec((uint32_t)dev->n_calib);
+            efi_print_ascii(" results saved)\r\n");
+        }
     }
 }
 

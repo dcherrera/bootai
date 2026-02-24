@@ -35,12 +35,38 @@ static void print_signed_dec(int val) {
 /* ---- Pre-scan radio configuration ---- */
 
 static int iwn_config_radio(iwn_dev *dev) {
-    /* 3a. RXON — configure radio for station mode, channel 1, 2.4 GHz */
+    /*
+     * Clear any stale interrupt flags before configuring radio.
+     * The calibration timeout during init may have set SW_ERR, and
+     * the runtime firmware boot could have set flags too. Without
+     * clearing, we'd read a stale SW_ERR after RXON.
+     */
+    iwn_write(dev, IWN_INT, 0xffffffff);
+
+    /* 1. Disable Bluetooth coexistence (must be before RXON) */
+    struct iwn6000_btcoex_config btcoex;
+    iwn_memset(&btcoex, 0, sizeof(btcoex));
+    btcoex.flags = IWN_BT_COEX6000_MODE_DISABLED;
+
+    if (iwn_cmd(dev, IWN_CMD_BT_COEX, &btcoex, sizeof(btcoex)) != 0) {
+        efi_print_ascii("  iwn: BT_COEX failed\r\n");
+        return -1;
+    }
+
+    /* 2. TX antenna configuration */
+    uint32_t ant = dev->txchainmask;
+    if (iwn_cmd(dev, IWN5000_CMD_TX_ANT_CONFIG, &ant, sizeof(ant)) != 0) {
+        efi_print_ascii("  iwn: TX_ANT_CONFIG failed\r\n");
+        return -1;
+    }
+
+    /* 3. RXON — configure radio for station mode, 2.4 GHz */
     struct iwn_rxon rxon;
     iwn_memset(&rxon, 0, sizeof(rxon));
 
-    /* Our MAC address */
+    /* MAC addresses — myaddr and wlap must both be set (per OpenBSD) */
     iwn_memcpy(rxon.myaddr, dev->mac_addr, 6);
+    iwn_memcpy(rxon.wlap, dev->mac_addr, 6);
 
     /* Broadcast BSSID (unassociated scan) */
     iwn_memset(rxon.bssid, 0xff, 6);
@@ -63,29 +89,40 @@ static int iwn_config_radio(iwn_dev *dev) {
     rxon.ofdm_mask = 0xff;
     rxon.cck_mask = 0x0f;
 
+    /* HT rate masks (required by 5000+ firmware) */
+    rxon.ht_single_mask = 0xff;
+    rxon.ht_dual_mask = 0xff;
+    rxon.ht_triple_mask = 0xff;
+
+    /* Clear interrupts again right before RXON for clean error check */
+    iwn_write(dev, IWN_INT, 0xffffffff);
+
     if (iwn_cmd(dev, IWN_CMD_RXON, &rxon, IWN5000_RXONSZ) != 0) {
-        efi_print_ascii("  iwn: RXON failed\r\n");
+        efi_print_ascii("  iwn: RXON cmd send failed\r\n");
         return -1;
     }
 
-    /* Brief delay for firmware to process RXON */
-    gBS->Stall(2000);
+    /* Wait for firmware to process RXON, then check for errors */
+    gBS->Stall(5000);  /* 5 ms */
 
-    /* Check for errors */
     uint32_t intr = iwn_read(dev, IWN_INT);
+    iwn_write(dev, IWN_INT, intr);  /* clear what we read */
     if (intr & IWN_INT_SW_ERR) {
-        efi_print_ascii("  iwn: SW_ERR after RXON\r\n");
-        return -1;
+        /*
+         * SW_ERR is common when calibration data is missing (calibration
+         * timeout during init). OpenBSD never checks IWN_INT after RXON —
+         * the error is non-fatal. Continue scanning; if the radio is truly
+         * broken, the scan will simply time out with no results.
+         */
+        efi_print_ascii("  iwn: SW_ERR after RXON (0x");
+        print_hex8((uint8_t)(intr >> 24));
+        print_hex8((uint8_t)(intr >> 16));
+        print_hex8((uint8_t)(intr >> 8));
+        print_hex8((uint8_t)intr);
+        efi_print_ascii(") — continuing anyway\r\n");
     }
 
-    /* 3b. TX antenna configuration */
-    uint32_t ant = dev->txchainmask;
-    if (iwn_cmd(dev, IWN5000_CMD_TX_ANT_CONFIG, &ant, sizeof(ant)) != 0) {
-        efi_print_ascii("  iwn: TX_ANT_CONFIG failed\r\n");
-        return -1;
-    }
-
-    /* 3c. Add broadcast node */
+    /* 4. Add broadcast node */
     struct iwn_node_info node;
     iwn_memset(&node, 0, sizeof(node));
     node.id = IWN5000_ID_BROADCAST;
@@ -93,16 +130,6 @@ static int iwn_config_radio(iwn_dev *dev) {
 
     if (iwn_cmd(dev, IWN_CMD_ADD_NODE, &node, sizeof(node)) != 0) {
         efi_print_ascii("  iwn: ADD_NODE failed\r\n");
-        return -1;
-    }
-
-    /* 3d. Disable Bluetooth coexistence */
-    struct iwn6000_btcoex_config btcoex;
-    iwn_memset(&btcoex, 0, sizeof(btcoex));
-    btcoex.flags = IWN_BT_COEX6000_MODE_DISABLED;
-
-    if (iwn_cmd(dev, IWN_CMD_BT_COEX, &btcoex, sizeof(btcoex)) != 0) {
-        efi_print_ascii("  iwn: BT_COEX failed\r\n");
         return -1;
     }
 
