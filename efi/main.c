@@ -584,6 +584,12 @@ static void command_repl(void) {
             continue;
         }
 
+        /* iwn scan — scan for WiFi networks (Phase 3) */
+        if (str_eq(line, "iwn scan")) {
+            iwn_scan_cmd();
+            continue;
+        }
+
         /* tensor — run tensor self-test */
         if (str_eq(line, "tensor")) {
             tensor_self_test();

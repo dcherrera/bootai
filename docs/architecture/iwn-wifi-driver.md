@@ -54,21 +54,21 @@ All PCI IDs are vendor `8086` (Intel). These cards were shipped in millions of l
 
 ```
 bootai/iwn/
-├── iwn.h              # Public API (iwn_probe, iwn_init, iwn_attach)
-├── iwn_internal.h     # Shared internal header (MMIO, prph, lock, DMA, FW functions)
-├── iwn_shim.h         # UEFI shim: OpenBSD types → stdint, bus_space stubs
+├── iwn.h              # Public API (iwn_probe, iwn_init, iwn_attach, iwn_scan_cmd)
+├── iwn_internal.h     # Shared internal header (MMIO, prph, lock, DMA, FW, scan functions)
+├── iwn_shim.h         # UEFI shim: OpenBSD types → stdint, byte-order no-ops, bus_space stubs
 ├── if_iwnreg.h        # Hardware registers (from OpenBSD, with additions)
-├── if_iwnvar.h        # iwn_dev struct, DMA ring structs, device ID table, flags
+├── if_iwnvar.h        # iwn_dev struct, DMA ring structs, scan results, device ID table, flags
 ├── iwn_pci.c          # PCI enumeration, device matching, iwn_init() entry point
 ├── iwn_hw.c           # MMIO primitives, NIC lock, APM init/stop, EEPROM read, iwn_attach()
 ├── iwn_dma.c          # DMA memory allocation, TX/RX ring setup, scheduler table
-└── iwn_fw.c           # Firmware parse/upload, hw_init sequence, calibration, host commands
+├── iwn_fw.c           # Firmware parse/upload, hw_init sequence, calibration, host commands (big + small)
+└── iwn_scan.c         # Radio config, scan command, beacon parsing, result display
 ```
 
 Future phases will add:
 
 ```
-├── iwn_scan.c         # RXON state machine, scan commands, channel iteration
 ├── iwn_crypto.c       # WPA2-PSK (PBKDF2, HMAC-SHA1, AES-128, 4-way handshake)
 └── iwn_snp.c          # EFI_SIMPLE_NETWORK_PROTOCOL wrapper
 ```
@@ -308,13 +308,121 @@ The firmware responds with `CALIBRATION_RESULT` (type 102) notifications contain
 
 **9. Legacy v2 firmware format.** The `iwlwifi-6000-4.ucode` file uses legacy v2 format (not TLV). Detection: first uint32 is non-zero (it's the version number). The TLV format has a zero padding word first.
 
-### Phase 3: TX/RX Rings + Scanning
+### Phase 3: Scanning (done)
 
-TX/RX rings are already allocated and programmed in Phase 2. Phase 3 adds:
+First RF activity on real hardware. Configures the radio, sends a scan command across all 11 2.4 GHz channels, receives beacon/probe response frames, parses SSIDs, and displays results.
 
-- Send `IWN_CMD_RXON` to configure radio (channel, BSSID, mode)
-- Send `IWN_CMD_SCAN` to scan for APs, collect beacon results from RX ring
-- Parse scan results: SSID, BSSID, channel, signal strength, security flags
+REPL commands: `iwn` (init) → `iwn scan`
+
+#### Big Command Support
+
+The scan command is ~900 bytes, but `iwn_tx_cmd.data[]` is only 136 bytes. The driver now supports big commands via 2-segment TX descriptors:
+
+```
+Small command (≤136 bytes):     Big command (>136 bytes):
+┌──────────────┐                ┌──────────────┐    ┌──────────────┐
+│ Segment 0    │                │ Segment 0    │    │ Segment 1    │
+│ cmd header + │                │ cmd header   │    │ payload      │
+│ payload      │                │ (4 bytes)    │    │ (from DMA    │
+│ (from ring)  │                │ (from ring)  │    │  buffer)     │
+└──────────────┘                └──────────────┘    └──────────────┘
+desc->nsegs = 1                 desc->nsegs = 2
+```
+
+Segment 0 points to the 4-byte command header (code, flags, idx, qid) in the ring's `cmd` slot. Segment 1 points to the payload in a lazily-allocated 4 KB DMA page (`dev->cmd_dma`). The scheduler byte count covers both segments: `(4 + len + 3) / 4`.
+
+#### Pre-Scan Radio Configuration
+
+Four commands sent before the scan, all using the small-command (≤136 byte) path:
+
+| # | Command | Code | Size | Purpose |
+|---|---------|------|------|---------|
+| 1 | RXON | 16 | ~50 B | Configure radio: STA mode, channel 1, 2.4 GHz, broadcast BSSID, RX chain config |
+| 2 | TX_ANT_CONFIG | 152 | 4 B | Set TX antenna chain mask |
+| 3 | ADD_NODE | 24 | ~92 B | Add broadcast node (ID 15, MAC FF:FF:FF:FF:FF:FF) |
+| 4 | BT_COEX | 155 | ~65 B | Disable Bluetooth coexistence |
+
+RXON flags: `IWN_RXON_24GHZ | IWN_RXON_AUTO | IWN_RXON_SHSLOT`
+Filter: `IWN_FILTER_MULTICAST`
+RX chain: `DRIVER_FORCE | VALID(chains) | FORCE_SEL(chains) | IDLE_COUNT(2) | MIMO_COUNT(2)`
+
+#### Scan Command Layout
+
+The scan command (code 128, `IWN_CMD_SCAN`) is a variable-length buffer built in `iwn_send_scan()`:
+
+```
+Offset   Size        Content
+0        32 B        iwn_scan_hdr — nchan=11, rxchain, flags, filter, crc_threshold=0xffff
+32       44 B        iwn_cmd_data — TX params for probe requests (6 Mbps OFDM, auto-seq)
+76       680 B       20 × iwn_scan_essid — all zeroed (broadcast/wildcard scan)
+756      16 B        Probe body — Supported Rates IE (8 rates) + Extended Rates IE (4 rates)
+772      132 B       11 × iwn_scan_chan — channels 1-11, active scan, 30ms/110ms dwell
+                     ─────────
+Total    ~904 B      Sent via big-command path
+```
+
+Channel parameters: `IWN_CHAN_ACTIVE | IWN_CHAN_NPBREQS(2)`, `rf_gain=0x28`, `dsp_gain=0x50`.
+
+The `crc_threshold` is set to `IWN_GOOD_CRC_TH_NEVER` (0xffff) to work around a firmware bug where `CRC_TH_DISABLED` (0) triggers a sysassert on radar channels.
+
+#### RX Polling and Beacon Parsing
+
+After sending the scan command, `iwn_poll_scan_results()` polls the RX ring for up to 8 seconds, handling these notification types:
+
+| Type | Code | Action |
+|------|------|--------|
+| `IWN_START_SCAN` | 130 | Print "Scanning ch N" for each channel |
+| `IWN_RX_PHY` | 192 | Cache RSSI: max of 3 antenna chains, subtract 44 dBm offset |
+| `IWN_MPDU_RX_DONE` | 193 | Parse beacon frame from `iwn_rx_mpdu` → `iwn_parse_beacon()` |
+| `IWN_STOP_SCAN` | 132 | Scan complete — print summary, return |
+| Other | — | Ignored (stats, calibration remnants, etc.) |
+
+**RSSI calculation**: Each `IWN_RX_PHY` notification contains per-chain RSSI values in `iwn5000_rx_phystat.rssi[3]`. The driver takes the maximum across chains and subtracts `IWN_RSSI_TO_DBM` (44) to convert to dBm. If no PHY notification precedes an MPDU, RSSI defaults to -100.
+
+**Beacon parsing** (`iwn_parse_beacon`):
+1. Verify frame control: must be Beacon (subtype 8) or Probe Response (subtype 5)
+2. Extract BSSID from bytes 16-21 of the MAC header
+3. Deduplicate by BSSID (update RSSI if stronger signal seen)
+4. Walk Information Elements (TLV at byte 36+):
+   - Tag 0 (SSID): copy name, length 0 = hidden
+   - Tag 3 (DS Parameter Set): channel number
+   - Tag 48 (RSN): mark WPA2 security
+   - Tag 221 (Vendor, OUI `00:50:F2:01`): mark WPA security
+
+Results are stored in `dev->scan_results[]` (max 32 entries), sorted by RSSI descending for display.
+
+#### Expected Output
+
+```
+> iwn scan
+  Configuring radio...
+  Scanning ch 1 2 3 4 5 6 7 8 9 10 11
+  Scan complete: 11 channels, 5 networks found
+
+  #  SSID                              CH  RSSI  Security
+  1  HomeNetwork                        6  -42   WPA2
+  2  CoffeeShop                         1  -68   Open
+  3  Neighbor5G                         11  -75   WPA2
+  4  (hidden)                            3  -80   WPA2
+  5  ATT-XXXX                            9  -82   WPA+WPA2
+```
+
+#### Debug Guide
+
+If scanning doesn't work on first try:
+
+| Symptom | Likely Cause | Check |
+|---------|-------------|-------|
+| No `IWN_START_SCAN` (130) | RXON rejected or scan cmd malformed | Check `IWN_INT` for `SW_ERR` after RXON |
+| `IWN_START_SCAN` but no `IWN_MPDU_RX_DONE` (193) | Radio not receiving | Check antenna config, RF/DSP gain values |
+| `IWN_STOP_SCAN` with `nchan=0` | Firmware aborted scan | Check channel list validity |
+| RSSI all -100 | PHY notifications missing | Firmware may not send `IWN_RX_PHY` on this API version |
+| No scan results but frames received | Frame parsing issue | Check frame control, BSSID extraction offset |
+
+**Incremental testing** if full scan fails:
+1. Send only RXON → poll for any RX notification
+2. Send RXON + scan → check for `IWN_START_SCAN`
+3. Full scan with frame parsing
 
 ### Phase 4: Association + WPA2
 
@@ -354,3 +462,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-23 | Phase 1 implemented: MMIO, APM, OTP, EEPROM read — MAC/domain/RF confirmed on Dell E6510 |
 | 2026-02-24 | Phase 2 implemented: DMA rings, firmware parse (legacy v2), FH DMA upload, hw_init sequence |
 | 2026-02-24 | Phase 2 bug fixes: 9 bugs found and fixed (wrong DMA channel, missing TXBUF_STATUS, NIC lock, DMA enable, shadow regs, VMAIN, nic_config, RFKILL, scheduler timing) |
+| 2026-02-24 | Phase 3 implemented: big-command path (2-segment TX descriptors), radio config (RXON + node + antenna + BT coex), scan command (~900 bytes, 11 channels), beacon/probe response parsing, RSSI calculation, security detection (WPA/WPA2), sorted result display |

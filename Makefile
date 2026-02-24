@@ -15,7 +15,7 @@ CFLAGS = -O2 -msse4.2 \
 SHIM_CFLAGS = -I shim
 
 # Phase 1: EFI layer only (console + input + memory)
-EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c efi/mdns.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c
+EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c efi/mdns.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c
 
 # Phase 3: UEFI libc shim (malloc/printf via UEFI Boot Services)
 LIBC_SRC  = efi/uefi_libc.c

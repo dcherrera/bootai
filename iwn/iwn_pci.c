@@ -15,8 +15,8 @@ EFI_GUID gEfiPciIoProtocolGuid = {
 };
 
 /* Global device state — persists across REPL commands */
-static iwn_dev g_iwn;
-static int g_iwn_found = 0;
+iwn_dev g_iwn;
+int g_iwn_found = 0;
 
 /* ---- Freestanding helpers ---- */
 

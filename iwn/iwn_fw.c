@@ -13,16 +13,16 @@
 
 #include "iwn_internal.h"
 
-/* ---- Helper: memcpy for freestanding (no libc) ---- */
+/* ---- Helper: memcpy/memset for freestanding (no libc) ---- */
 
-static void iwn_memcpy(void *dst, const void *src, uint32_t n) {
+void iwn_memcpy(void *dst, const void *src, uint32_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
     for (uint32_t i = 0; i < n; i++)
         d[i] = s[i];
 }
 
-static void iwn_memset(void *dst, uint8_t val, uint32_t n) {
+void iwn_memset(void *dst, uint8_t val, uint32_t n) {
     uint8_t *d = (uint8_t *)dst;
     for (uint32_t i = 0; i < n; i++)
         d[i] = val;
@@ -364,13 +364,14 @@ int iwn_poll_rx(iwn_dev *dev, uint8_t expected_type, int timeout_ms) {
 int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len) {
     iwn_tx_ring *ring = &dev->txq[4];
     int idx = ring->cur;
+    int is_big = (len > sizeof(((struct iwn_tx_cmd *)0)->data));
 
-    if (len > sizeof(((struct iwn_tx_cmd *)0)->data)) {
-        efi_print_ascii("  iwn: cmd payload too large\r\n");
+    if (is_big && len > 4096 - 4) {
+        efi_print_ascii("  iwn: cmd payload too large (>4092)\r\n");
         return -1;
     }
 
-    /* Build TX command */
+    /* Build TX command header */
     struct iwn_tx_cmd *cmd = (struct iwn_tx_cmd *)
         ((uint8_t *)ring->cmd.vaddr + idx * sizeof(struct iwn_tx_cmd));
     iwn_memset(cmd, 0, sizeof(*cmd));
@@ -378,27 +379,60 @@ int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len) {
     cmd->flags = 0;
     cmd->idx = (uint8_t)idx;
     cmd->qid = 4;
-    if (payload && len > 0)
-        iwn_memcpy(cmd->data, payload, len);
 
-    /* Build TX descriptor — single segment pointing to command */
+    /* Build TX descriptor */
     struct iwn_tx_desc *desc = (struct iwn_tx_desc *)
         ((uint8_t *)ring->desc.vaddr + idx * sizeof(struct iwn_tx_desc));
     iwn_memset(desc, 0, sizeof(*desc));
-    desc->nsegs = 1;
+
     uint64_t cmd_paddr = ring->cmd.paddr + idx * sizeof(struct iwn_tx_cmd);
-    uint16_t totlen = (uint16_t)(4 + len);  /* 4-byte cmd header + payload */
-    desc->segs[0].addr = IWN_LOADDR(cmd_paddr);
-    desc->segs[0].len = (uint16_t)(IWN_HIADDR(cmd_paddr) | (totlen << 4));
+
+    if (!is_big) {
+        /* Small command — single segment, payload fits in cmd->data[] */
+        if (payload && len > 0)
+            iwn_memcpy(cmd->data, payload, len);
+
+        desc->nsegs = 1;
+        uint16_t totlen = (uint16_t)(4 + len);
+        desc->segs[0].addr = IWN_LOADDR(cmd_paddr);
+        desc->segs[0].len = (uint16_t)(IWN_HIADDR(cmd_paddr) | (totlen << 4));
+    } else {
+        /* Big command — 2 segments: cmd header from ring, payload from DMA buf */
+
+        /* Lazily allocate 4KB DMA buffer for big commands */
+        if (!dev->cmd_dma.vaddr) {
+            uint64_t addr = 0xFFFFFFFF;
+            EFI_STATUS s = gBS->AllocatePages(1, EfiLoaderData, 1, &addr);
+            if (s != EFI_SUCCESS) {
+                efi_print_ascii("  iwn: DMA alloc failed (cmd_dma)\r\n");
+                return -1;
+            }
+            dev->cmd_dma.paddr = addr;
+            dev->cmd_dma.vaddr = (void *)(uintptr_t)addr;
+            dev->cmd_dma.size = 4096;
+        }
+
+        /* Copy payload to DMA buffer */
+        iwn_memcpy(dev->cmd_dma.vaddr, payload, len);
+
+        /* Segment 0: 4-byte cmd header (code, flags, idx, qid) */
+        desc->nsegs = 2;
+        desc->segs[0].addr = IWN_LOADDR(cmd_paddr);
+        desc->segs[0].len = (uint16_t)(IWN_HIADDR(cmd_paddr) | (4 << 4));
+
+        /* Segment 1: payload from DMA buffer */
+        uint64_t dma_paddr = dev->cmd_dma.paddr;
+        desc->segs[1].addr = IWN_LOADDR(dma_paddr);
+        desc->segs[1].len = (uint16_t)(IWN_HIADDR(dma_paddr) | (len << 4));
+    }
 
     /* Update scheduler byte count table */
     uint16_t *sched = (uint16_t *)dev->sched.vaddr;
-    /* Queue 4, slot idx: offset = qid * (IWN_TX_RING_COUNT + IWN_SCHED_WINSZ) + idx */
     int sched_idx = 4 * IWN5000_SCHED_COUNT + idx;
-    uint16_t bc = (uint16_t)(4 + len + 3);  /* 4-byte cmd header + payload, 4-byte aligned */
+    uint16_t bc = (uint16_t)(4 + len + 3);
     bc = (bc / 4) & 0x0fff;
     sched[sched_idx] = bc;
-    sched[sched_idx + IWN_TX_RING_COUNT] = bc;  /* window shadow */
+    sched[sched_idx + IWN_TX_RING_COUNT] = bc;
 
     /* Kick hardware: advance write pointer */
     ring->cur = (idx + 1) % IWN_TX_RING_COUNT;

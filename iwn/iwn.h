@@ -21,3 +21,6 @@ EFI_STATUS iwn_attach(iwn_dev *dev);
 
 /* Phase 2: DMA + firmware — allocate rings, load firmware, get UC_READY */
 int iwn_init(iwn_dev *dev);
+
+/* Phase 3: WiFi scanning — scan for nearby networks */
+void iwn_scan_cmd(void);

@@ -51,6 +51,11 @@ void iwn5000_nic_config(iwn_dev *dev);
 
 int iwn_read_prom_data(iwn_dev *dev, uint32_t addr, void *data, int count);
 
+/* ---- Memory helpers (freestanding, no libc) ---- */
+
+void iwn_memcpy(void *dst, const void *src, uint32_t n);
+void iwn_memset(void *dst, uint8_t val, uint32_t n);
+
 /* ---- Print helpers ---- */
 
 void print_dec(uint32_t val);
@@ -76,3 +81,12 @@ int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len);
 void iwn5000_post_alive(iwn_dev *dev);
 void iwn_replay_calibration(iwn_dev *dev);
 int iwn_hw_init(iwn_dev *dev);
+
+/* ---- Scan (iwn_scan.c) ---- */
+
+int iwn_scan(iwn_dev *dev);
+
+/* ---- Global device state (iwn_pci.c) ---- */
+
+extern iwn_dev g_iwn;
+extern int g_iwn_found;

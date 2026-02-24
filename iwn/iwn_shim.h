@@ -37,6 +37,12 @@ typedef uint64_t  bus_size_t;
 #define BUS_SPACE_BARRIER_READ   0x01
 #define BUS_SPACE_BARRIER_WRITE  0x02
 
+/* Byte-order macros — x86 is little-endian, so these are no-ops */
+#define htole16(x) ((uint16_t)(x))
+#define htole32(x) ((uint32_t)(x))
+#define letoh16(x) ((uint16_t)(x))
+#define letoh32(x) ((uint32_t)(x))
+
 /* Compiler attributes */
 #ifndef __packed
 #define __packed __attribute__((packed))

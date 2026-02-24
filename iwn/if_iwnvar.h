@@ -68,6 +68,18 @@ typedef struct {
 /* FH DMA firmware upload chunk size (128 KB) */
 #define IWN_FW_CHUNK_SIZE      (128 * 1024)
 
+/* ---- Scan result entry ---- */
+typedef struct {
+    uint8_t  bssid[6];
+    char     ssid[33];       /* 32 + NUL */
+    uint8_t  ssid_len;
+    int8_t   rssi;           /* dBm */
+    uint8_t  channel;
+    uint8_t  security;       /* 0=open, 1=WPA, 2=WPA2, 3=WPA+WPA2 */
+} iwn_scan_result;
+
+#define IWN_MAX_SCAN_RESULTS 32
+
 /* ---- Device struct ---- */
 typedef struct iwn_dev {
     /* Phase 1: PCI + EEPROM state */
@@ -101,6 +113,11 @@ typedef struct iwn_dev {
 
     /* Phase 2: DMA scratch buffer for firmware upload */
     iwn_dma_info    fw_dma;                 /* DMA buffer for firmware sections */
+
+    /* Phase 3: Scan state */
+    iwn_scan_result  scan_results[IWN_MAX_SCAN_RESULTS];
+    int              n_scan_results;
+    iwn_dma_info     cmd_dma;               /* DMA buffer for big commands (4KB) */
 } iwn_dev;
 
 /* ---- Device identification table ---- */
