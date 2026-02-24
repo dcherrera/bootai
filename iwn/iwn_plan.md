@@ -4,19 +4,17 @@ Port OpenBSD's `iwn` driver to UEFI for Intel 6200 WiFi on the Dell E6510.
 
 ## Phase Overview
 
-| Phase | Name | Deliverable | Est. Time |
-|-------|------|-------------|-----------|
-| 0 | Setup & Headers | Register headers, build system, PCI probe | 1 week |
-| 1 | MMIO & EEPROM | Read hardware registers, dump EEPROM/MAC address | 1 week |
-| 2 | DMA & Firmware | Allocate DMA rings, load firmware, get `UC_READY` | 2 weeks |
-| 3 | Scan | Send scan command, parse results, print SSIDs | 2 weeks |
-| 4 | Associate (Open) | Connect to an open network (no encryption) | 2 weeks |
-| 5 | Crypto | AES-128, SHA-1, HMAC, PBKDF2, PRF | 1-2 weeks |
-| 6 | WPA2-PSK | 4-way handshake, key install, encrypted data | 2-3 weeks |
-| 7 | SNP Integration | Wrap as EFI_SIMPLE_NETWORK_PROTOCOL, DHCP, full stack | 2 weeks |
-| 8 | Polish | Error handling, reconnect, wifi.c UI integration | 1-2 weeks |
-
-**Total: ~14-18 weeks** (3.5-4.5 months)
+| Phase | Name | Deliverable | Status |
+|-------|------|-------------|--------|
+| 0 | Setup & Headers | Register headers, build system, PCI probe | **DONE** |
+| 1 | MMIO & EEPROM | Read hardware registers, dump EEPROM/MAC address | **DONE** |
+| 2 | DMA & Firmware | Allocate DMA rings, load firmware, get `UC_READY` | Pending |
+| 3 | Scan | Send scan command, parse results, print SSIDs | Pending |
+| 4 | Associate (Open) | Connect to an open network (no encryption) | Pending |
+| 5 | Crypto | AES-128, SHA-1, HMAC, PBKDF2, PRF | Pending |
+| 6 | WPA2-PSK | 4-way handshake, key install, encrypted data | Pending |
+| 7 | SNP Integration | Wrap as EFI_SIMPLE_NETWORK_PROTOCOL, DHCP, full stack | Pending |
+| 8 | Polish | Error handling, reconnect, wifi.c UI integration | Pending |
 
 Each phase is self-contained and testable on real hardware (Dell E6510 via USB boot).
 
@@ -69,29 +67,71 @@ bootai/iwn/
 
 ### Tasks
 
-- [ ] Implement MMIO access shims:
-  - `iwn_read(sc, reg)` → `PciIo->Mem.Read(EfiPciIoWidthUint32, 0, reg, 1, &val)`
-  - `iwn_write(sc, reg, val)` → `PciIo->Mem.Write(...)`
-  - `iwn_barrier(sc)` → memory barrier (compiler fence + `PciIo->Flush()`)
-- [ ] Implement `iwn_nic_lock()` / `iwn_nic_unlock()` — acquire exclusive NIC access via `IWN_GP_CNTRL`
-- [ ] Implement `iwn_apm_init()` — power management init (enable clocks, set power source)
-- [ ] Implement `iwn_read_eeprom()`:
-  - Lock EEPROM via `IWN_OTP_GP` register
-  - Read MAC address (offset varies by chip — 6200 is 5000+ series)
-  - Read regulatory domain
-  - Read available channels
-- [ ] Print MAC address and regulatory domain
-- [ ] Read `IWN_HW_REV` register, confirm chip identification
+- [x] Enable PCI MEMORY + BUS_MASTER attributes before BAR0 access
+- [x] Implement MMIO access primitives:
+  - `iwn_read(dev, reg)` → `PciIo->Mem.Read(EfiPciIoWidthUint32, 0, reg, 1, &val)`
+  - `iwn_write(dev, reg, val)` → `PciIo->Mem.Write(...)`
+  - `iwn_write_1(dev, reg, val)` — 8-bit BAR0 write
+  - `iwn_setbits(dev, reg, mask)` / `iwn_clrbits(dev, reg, mask)` — read-modify-write
+- [x] Implement peripheral register access (NIC-internal at 0x3000+):
+  - `iwn_prph_read(dev, addr)` / `iwn_prph_write(dev, addr, val)` — via PRPH_RADDR/WADDR registers
+  - Address flag: `IWN_PRPH_DWORD | addr`
+  - Compiler barrier after address writes
+- [x] Implement `iwn_nic_lock()` / `iwn_nic_unlock()` — MAC_ACCESS_REQ handshake via `IWN_GP_CNTRL`
+- [x] Implement `iwn_clock_wait()` — set INIT_DONE, poll MAC_CLOCK_READY
+- [x] Implement `iwn_hw_prepare()` — take NIC from Intel AMT (NIC_READY → PREPARE → retry)
+- [x] Find PCIe capability offset for ASPM L1 check
+- [x] Implement `iwn_apm_init()` — full power-on sequence:
+  - GIO_CHICKEN workarounds (DIS_L0S_TIMER, L1A_NO_L0S_RX)
+  - HPET threshold
+  - HAP_WAKE_L1A
+  - PCIe ASPM L1 check → set/clear GIO L0S_ENA
+  - Clock wait
+  - NIC lock → DMA clock enable → L1A disable → NIC unlock
+- [x] Implement `iwn_apm_stop()` — stop master, SW reset, clear INIT_DONE
+- [x] Implement `iwn_eeprom_lock()` / `iwn_eeprom_unlock()`
+- [x] Implement `iwn_init_otprom()` — OTP init for 6000+ series (APMG reset, auto clock gate, clear ECC)
+- [x] Implement `iwn_read_prom_data()` — read 16-bit words with READ_VALID polling and OTP ECC checking
+- [x] Implement `iwn_attach()` — full Phase 1 sequence:
+  - Disable interrupts
+  - Read HW_REV → set chip-specific chain masks
+  - hw_prepare → check OTP → apm_init → verify ROM signature
+  - EEPROM lock → OTP init → read MAC, SKU, RF config, regulatory domain, calibration
+  - APM stop → EEPROM unlock → print results
+- [x] Expand `if_iwnvar.h` with `iwn_dev` struct and full device ID table (~38 cards)
+- [x] Rewrite `iwn_pci.c` to match against ID table and call `iwn_attach()`
 
 ### Test on Hardware
 
-Boot → `iwn` → should print MAC address (e.g., `MAC: 00:24:D7:xx:xx:xx`) and chip revision.
+Boot → `iwn` → prints MAC address, HW type, regulatory domain, RF config.
+
+### Results (2026-02-23)
+
+```
+> iwn
+  Centrino Advanced-N 6200 found at 2:0.0
+  HW type: 7 (6000 series)
+  OTP: yes
+  MAC: 00:27:10:56:ad:80
+  Domain: Mo
+  RF config: type=1 step=3 dash=1 tx=0x03 rx=0x03
+  Calibration ver: 6
+  802.11n: yes
+  Intel WiFi ready.
+```
+
+### Bugs Encountered
+
+1. **HW type 31 (all 1s)**: BAR0 reads returned `0xffffffff` because PCI MMIO wasn't enabled. Fix: call `Attributes(Enable, MEMORY | BUS_MASTER)` before any register access.
+2. **Multiple definition of `iwn_mcs2ridx`**: Non-static array in `if_iwnreg.h` included by both `.c` files. Fix: add `static` qualifier.
 
 ### Files
 
 ```
 bootai/iwn/
-└── iwn_hw.c            ← MMIO, EEPROM, APM init
+├── if_iwnvar.h        ← iwn_dev struct, device ID table (~38 IDs), flag constants
+├── iwn_pci.c          ← PCI probe, attribute enable, call iwn_attach()
+└── iwn_hw.c           ← MMIO, prph, NIC lock, APM, OTP, EEPROM, iwn_attach() (~340 lines)
 ```
 
 ---
@@ -457,7 +497,7 @@ test-iwn-crypto: iwn/iwn_crypto.c iwn/test_crypto.c
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Firmware won't load (DMA timing) | Blocks Phase 2+ | Compare register sequences with itlwm, add delays |
-| EEPROM read fails on E6510 | Blocks Phase 1 | Use OTP (one-time programmable) path for 6000 series |
+| ~~EEPROM read fails on E6510~~ | ~~Blocks Phase 1~~ | ~~Resolved: OTP path works, MAC/domain/RF read successfully~~ |
 | Scan returns no results | Blocks Phase 3 | Check antenna config, TX power, regulatory domain |
 | WPA2 handshake timing | Blocks Phase 6 | AP typically retries; add timeout + retry logic |
 | SNP binding fails | Blocks Phase 7 | May need `InstallMultipleProtocolInterfaces` with device path |

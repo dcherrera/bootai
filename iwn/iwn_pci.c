@@ -1,8 +1,8 @@
 /*
- * iwn_pci.c — PCI bus enumeration for Intel Wireless N driver
+ * iwn_pci.c — PCI bus probe + attach for Intel Wireless N driver
  *
- * Phase 0: Walk EFI_PCI_IO_PROTOCOL handles, read vendor/device IDs,
- * and match the Intel Centrino Advanced-N 6200 WiFi card.
+ * Phase 0: Walk EFI_PCI_IO_PROTOCOL handles, match against device ID table.
+ * Phase 1: Save PCI IO handle, call iwn_attach() for MMIO/EEPROM access.
  */
 
 #include "iwn.h"
@@ -14,21 +14,13 @@ EFI_GUID gEfiPciIoProtocolGuid = {
     {0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a}
 };
 
+/* Global device state — persists across REPL commands */
+static iwn_dev g_iwn;
+static int g_iwn_found = 0;
+
 /* ---- Freestanding helpers ---- */
 
-static const char hex[] = "0123456789abcdef";
-
-static void print_hex16(uint16_t val) {
-    char buf[5];
-    buf[0] = hex[(val >> 12) & 0xf];
-    buf[1] = hex[(val >>  8) & 0xf];
-    buf[2] = hex[(val >>  4) & 0xf];
-    buf[3] = hex[(val >>  0) & 0xf];
-    buf[4] = '\0';
-    efi_print_ascii(buf);
-}
-
-static void print_dec(UINTN val) {
+static void print_dec_pci(UINTN val) {
     if (val == 0) { efi_print_ascii("0"); return; }
     char buf[21];
     int i = 20;
@@ -60,12 +52,12 @@ EFI_STATUS iwn_probe(void) {
         return status;
     }
 
-    efi_print_ascii("  Scanning ");
-    print_dec(handle_count);
-    efi_print_ascii(" PCI devices...\r\n");
+    /* Walk each device, match against iwn device ID table */
+    const struct iwn_ident *match = NULL;
+    EFI_PCI_IO_PROTOCOL *matched_pci_io = NULL;
+    uint16_t matched_device_id = 0;
+    UINTN matched_bus = 0, matched_dev = 0, matched_func = 0;
 
-    /* Walk each device, read vendor/device ID from config space */
-    int found = 0;
     for (UINTN i = 0; i < handle_count; i++) {
         EFI_PCI_IO_PROTOCOL *pci_io = 0;
         status = gBS->HandleProtocol(
@@ -74,47 +66,65 @@ EFI_STATUS iwn_probe(void) {
             (void **)&pci_io);
         if (status != EFI_SUCCESS) continue;
 
-        /* PCI config space offset 0x00 = vendor ID (16-bit) */
-        /* PCI config space offset 0x02 = device ID (16-bit) */
         uint16_t vendor_id = 0, device_id = 0;
         pci_io->Pci.Read(pci_io, EfiPciIoWidthUint16, 0x00, 1, &vendor_id);
         pci_io->Pci.Read(pci_io, EfiPciIoWidthUint16, 0x02, 1, &device_id);
 
-        /* Print every device for diagnostic purposes */
-        efi_print_ascii("    ");
-        print_hex16(vendor_id);
-        efi_print_ascii(":");
-        print_hex16(device_id);
-
-        /* Get BDF (bus:device.function) location */
-        UINTN seg = 0, bus = 0, dev = 0, func = 0;
-        pci_io->GetLocation(pci_io, &seg, &bus, &dev, &func);
-
-        efi_print_ascii(" @ ");
-        print_dec(bus);
-        efi_print_ascii(":");
-        print_dec(dev);
-        efi_print_ascii(".");
-        print_dec(func);
-
-        /* Check for Intel 6200 match */
-        if (vendor_id == PCI_VENDOR_INTEL &&
-            (device_id == IWN_DID_6200_1 || device_id == IWN_DID_6200_2)) {
-            efi_print_ascii("  <-- Intel 6200 WiFi!");
-            found = 1;
-            /* TODO Phase 1: save pci_io handle for MMIO access */
+        /* Check against device ID table */
+        for (const struct iwn_ident *id = iwn_ident_table; id->name != NULL; id++) {
+            if (vendor_id == id->vendor && device_id == id->device) {
+                match = id;
+                matched_pci_io = pci_io;
+                matched_device_id = device_id;
+                pci_io->GetLocation(pci_io, &(UINTN){0},
+                                    &matched_bus, &matched_dev, &matched_func);
+                break;
+            }
         }
-
-        efi_print_ascii("\r\n");
+        if (match) break;
     }
 
     gBS->FreePool(handles);
 
-    if (found) {
-        efi_print_ascii("  Intel 6200 WiFi detected.\r\n");
-    } else {
-        efi_print_ascii("  No Intel 6200 WiFi card detected.\r\n");
+    if (!match) {
+        efi_print_ascii("  No Intel WiFi card detected.\r\n");
+        return EFI_NOT_FOUND;
     }
 
-    return found ? EFI_SUCCESS : EFI_NOT_FOUND;
+    /* Print matched card info */
+    efi_print_ascii("  ");
+    efi_print_ascii(match->name);
+    efi_print_ascii(" found at ");
+    print_dec_pci(matched_bus);
+    efi_print_ascii(":");
+    print_dec_pci(matched_dev);
+    efi_print_ascii(".");
+    print_dec_pci(matched_func);
+    efi_print_ascii("\r\n");
+
+    /* Enable PCI MMIO + Bus Master before any BAR0 access */
+    #define EFI_PCI_IO_ATTRIBUTE_MEMORY      0x0200
+    #define EFI_PCI_IO_ATTRIBUTE_BUS_MASTER  0x0400
+    uint64_t pci_attrs = EFI_PCI_IO_ATTRIBUTE_MEMORY | EFI_PCI_IO_ATTRIBUTE_BUS_MASTER;
+    status = matched_pci_io->Attributes(matched_pci_io, 2 /* Enable */, pci_attrs, NULL);
+    if (status != EFI_SUCCESS) {
+        efi_print_ascii("  iwn: failed to enable PCI attributes\r\n");
+        return status;
+    }
+
+    /* Save device state and call attach */
+    g_iwn.pci_io = matched_pci_io;
+    g_iwn.device_id = matched_device_id;
+    g_iwn.flags = 0;
+    g_iwn.prom_base = 0;
+
+    status = iwn_attach(&g_iwn);
+    if (status == EFI_SUCCESS) {
+        g_iwn_found = 1;
+        efi_print_ascii("  Intel WiFi ready.\r\n");
+    } else {
+        g_iwn_found = 0;
+    }
+
+    return status;
 }

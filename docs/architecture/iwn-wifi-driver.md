@@ -57,8 +57,9 @@ bootai/iwn/
 ├── iwn.h              # Public API (iwn_probe, future: iwn_init, iwn_scan, ...)
 ├── iwn_shim.h         # UEFI shim: OpenBSD types → stdint, bus_space stubs
 ├── if_iwnreg.h        # Hardware registers (copied from OpenBSD, verbatim)
-├── if_iwnvar.h        # Driver structs (Phase 0: stub with PCI IDs only)
-└── iwn_pci.c          # PCI enumeration and device matching
+├── if_iwnvar.h        # iwn_dev struct, device ID table, flag constants
+├── iwn_pci.c          # PCI enumeration, device matching, PCI attribute enable
+└── iwn_hw.c           # MMIO primitives, NIC lock, APM init/stop, EEPROM read, iwn_attach()
 ```
 
 Future phases will add:
@@ -137,35 +138,71 @@ IEEE 802.11 constants normally from `<net80211/ieee80211.h>`:
 
 ## Phase Plan
 
-### Phase 0: PCI Probe (current)
+### Phase 0: PCI Probe (done)
 
 - Enumerate PCI bus via `EFI_PCI_IO_PROTOCOL`
-- Match Intel 6200 by vendor:device ID
-- Print all PCI devices with BDF locations
+- Match against full device ID table (~38 cards)
+- Print matched card name with BDF location
 - REPL command: `iwn`
 
-### Phase 1: MMIO + Firmware Load
+### Phase 1: MMIO + EEPROM (done)
 
-- Map BAR0 for register access
-- Implement `bus_space_read_4`/`bus_space_write_4` via PCI IO Mem
+- Enable PCI MEMORY + BUS_MASTER attributes before BAR0 access
+- MMIO via `EFI_PCI_IO_PROTOCOL.Mem.Read/Write` on BAR0
+- Peripheral register access (prph_read/write) for NIC-internal registers at 0x3000+
+- NIC lock/unlock (MAC_ACCESS_REQ handshake)
+- Hardware prepare (take NIC from Intel AMT)
+- APM init: GIO chicken workarounds, HPET threshold, PCIe ASPM L1 check, DMA clock enable, L1A disable
+- OTP init for 6000+ series (APMG reset, auto clock gate, clear ECC)
+- EEPROM word read with READ_VALID polling and OTP ECC checking
+- Read MAC address, SKU capabilities, RF config, regulatory domain, calibration version, crystal calibration
+
+#### Hardware Test Results (Dell E6510)
+
+```
+> iwn
+  Centrino Advanced-N 6200 found at 2:0.0
+  HW type: 7 (6000 series)
+  OTP: yes
+  MAC: 00:27:10:56:ad:80
+  Domain: Mo
+  RF config: type=1 step=3 dash=1 tx=0x03 rx=0x03
+  Calibration ver: 6
+  802.11n: yes
+  Intel WiFi ready.
+```
+
+#### Key Lesson: PCI Attribute Enable
+
+UEFI does not enable MMIO by default. Without calling `Attributes(Enable, MEMORY | BUS_MASTER)`, all BAR0 reads return `0xffffffff`. This manifested as HW type 31 (all 1s) and NIC lock timeouts on first attempt.
+
+```c
+#define EFI_PCI_IO_ATTRIBUTE_MEMORY      0x0200
+#define EFI_PCI_IO_ATTRIBUTE_BUS_MASTER  0x0400
+pci_io->Attributes(pci_io, 2 /* Enable */, 0x0200 | 0x0400, NULL);
+```
+
+### Phase 2: Firmware Load
+
 - Load firmware from `\drivers\iwn-6000` on the EFI partition
-- Parse TLV firmware header, upload via DMA
+- Parse TLV firmware header
+- Allocate DMA memory via `AllocatePages()`
+- Upload firmware sections via DMA
 
-### Phase 2: TX/RX Rings + Scanning
+### Phase 3: TX/RX Rings + Scanning
 
-- Allocate DMA rings via `AllocatePages()`
 - Initialize TX queues (command queue + data queues)
 - Initialize RX ring (64 entries, 4KB buffers)
 - Send `IWN_CMD_SCAN`, collect results
 
-### Phase 3: Association + WPA2
+### Phase 4: Association + WPA2
 
 - Implement RXON state machine (INIT → SCAN → AUTH → ASSOC → RUN)
 - WPA2-PSK crypto: SHA-1, HMAC-SHA1, PBKDF2, AES-128, PRF-384
 - 4-way EAPOL handshake
 - Install temporal key for hardware CCMP
 
-### Phase 4: SNP + Integration
+### Phase 5: SNP + Integration
 
 - Implement `EFI_SIMPLE_NETWORK_PROTOCOL` (Transmit/Receive/GetStatus)
 - Install SNP on new handle
@@ -193,3 +230,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | Date | Change |
 |------|--------|
 | 2026-02-23 | Phase 0 implemented: PCI probe, register headers, REPL command |
+| 2026-02-23 | Phase 1 implemented: MMIO, APM, OTP, EEPROM read — MAC/domain/RF confirmed on Dell E6510 |

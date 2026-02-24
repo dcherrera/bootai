@@ -1830,7 +1830,7 @@ static const struct iwn_rate {
 };
 
 /* Convert an MCS index into an iwn_rates[] index. */
-const int iwn_mcs2ridx[] = { 4, 6, 7, 8, 9, 10, 11, 12 };
+static const int iwn_mcs2ridx[] = { 4, 6, 7, 8, 9, 10, 11, 12 };
 
 #define IWN4965_MAX_PWR_INDEX	107
 
