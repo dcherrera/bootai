@@ -27,6 +27,12 @@ void iwn_prph_write(iwn_dev *dev, uint32_t addr, uint32_t val);
 void iwn_prph_setbits(iwn_dev *dev, uint32_t addr, uint32_t mask);
 void iwn_prph_clrbits(iwn_dev *dev, uint32_t addr, uint32_t mask);
 
+/* ---- NIC-internal SRAM access (require NIC lock held) ---- */
+
+uint32_t iwn_mem_read(iwn_dev *dev, uint32_t addr);
+void iwn_mem_write(iwn_dev *dev, uint32_t addr, uint32_t val);
+void iwn_mem_set_region_4(iwn_dev *dev, uint32_t addr, uint32_t val, int count);
+
 /* ---- NIC lock (10ms timeout) ---- */
 
 int iwn_nic_lock(iwn_dev *dev);

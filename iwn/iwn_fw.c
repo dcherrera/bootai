@@ -347,6 +347,10 @@ int iwn_poll_rx(iwn_dev *dev, uint8_t expected_type, int timeout_ms) {
 
             /* Advance read index */
             dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
+
+            /* Tell HW we consumed this buffer — update RX write pointer */
+            iwn_write(dev, IWN_FH_RX_WPTR,
+                      ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) % IWN_RX_RING_COUNT) & ~7);
         }
 
         gBS->Stall(1000);  /* 1 ms */
@@ -382,8 +386,10 @@ int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len) {
         ((uint8_t *)ring->desc.vaddr + idx * sizeof(struct iwn_tx_desc));
     iwn_memset(desc, 0, sizeof(*desc));
     desc->nsegs = 1;
-    desc->segs[0].addr = (uint32_t)(ring->cmd.paddr + idx * sizeof(struct iwn_tx_cmd));
-    desc->segs[0].len = (uint16_t)(4 + len);  /* header (4 bytes) + payload */
+    uint64_t cmd_paddr = ring->cmd.paddr + idx * sizeof(struct iwn_tx_cmd);
+    uint16_t totlen = (uint16_t)(4 + len);  /* 4-byte cmd header + payload */
+    desc->segs[0].addr = IWN_LOADDR(cmd_paddr);
+    desc->segs[0].len = (uint16_t)(IWN_HIADDR(cmd_paddr) | (totlen << 4));
 
     /* Update scheduler byte count table */
     uint16_t *sched = (uint16_t *)dev->sched.vaddr;
@@ -402,8 +408,8 @@ int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len) {
     return 0;
 }
 
-/* ---- Post-alive: activate scheduler + send calibration (init firmware) ---- */
-/* Reference: OpenBSD iwn5000_post_alive() + iwn_init() RFKILL sequence */
+/* ---- Post-alive: full scheduler setup + calibration (init firmware) ---- */
+/* Reference: OpenBSD/FreeBSD iwn5000_post_alive() */
 
 void iwn5000_post_alive(iwn_dev *dev) {
     dev->n_calib = 0;
@@ -413,26 +419,64 @@ void iwn5000_post_alive(iwn_dev *dev) {
     iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
     iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
 
-    /* Activate TX scheduler — now that firmware is alive */
-    if (iwn_nic_lock(dev) == 0) {
-        /* Disable TX scheduler first */
-        iwn_prph_write(dev, IWN5000_SCHED_TXFACT, 0);
+    /* ---- Full TX scheduler setup (must be done after firmware ALIVE) ---- */
 
-        /* Set scheduler DRAM base address */
-        iwn_prph_write(dev, IWN5000_SCHED_DRAM_ADDR,
-                       (uint32_t)(dev->sched.paddr >> 10));
-
-        /* Activate command queue (queue 4) */
-        iwn_prph_write(dev, IWN5000_SCHED_QUEUE_STATUS(4),
-                       IWN5000_TXQ_STATUS_ACTIVE);
-
-        /* Enable TX scheduler for queue 4 */
-        iwn_prph_write(dev, IWN5000_SCHED_TXFACT, (1 << 4));
-
-        iwn_nic_unlock(dev);
+    if (iwn_nic_lock(dev) != 0) {
+        efi_print_ascii("  iwn: nic lock failed (post_alive)\r\n");
+        return;
     }
 
-    /* Send crystal calibration from EEPROM */
+    /* Read scheduler base address from firmware */
+    uint32_t sched_base = iwn_prph_read(dev, IWN_SCHED_SRAM_ADDR);
+
+    /* Clear TX scheduler context in SRAM */
+    iwn_mem_set_region_4(dev, sched_base + IWN5000_SCHED_CTX_OFF, 0,
+                         IWN5000_SCHED_CTX_LEN / 4);
+
+    /* Set physical address of TX scheduler rings (1KB aligned) */
+    iwn_prph_write(dev, IWN5000_SCHED_DRAM_ADDR,
+                   (uint32_t)(dev->sched.paddr >> 10));
+
+    /* Disable scheduler chain extension */
+    iwn_prph_write(dev, IWN5000_SCHED_CHAINEXT_EN, 0);
+
+    /* Enable scheduler retry */
+    iwn_setbits(dev, IWN_FH_TX_CHICKEN, IWN_FH_TX_CHICKEN_SCHED_RETRY);
+
+    /* Chain mode for all queues except command queue (queue 4) */
+    iwn_prph_write(dev, IWN5000_SCHED_QCHAIN_SEL, 0xfffef);
+    iwn_prph_write(dev, IWN5000_SCHED_AGGR_SEL, 0);
+
+    /* Reset all queue pointers and set window/limit in SRAM */
+    for (int qid = 0; qid < IWN5000_NTXQUEUES; qid++) {
+        iwn_prph_write(dev, IWN5000_SCHED_QUEUE_RDPTR(qid), 0);
+        iwn_write(dev, IWN_HBUS_TARG_WRPTR, (qid << 8) | 0);
+
+        iwn_mem_write(dev, sched_base + IWN5000_SCHED_QUEUE_OFFSET(qid), 0);
+        /* Window size and frame limit */
+        iwn_mem_write(dev, sched_base + IWN5000_SCHED_QUEUE_OFFSET(qid) + 4,
+                      (IWN_SCHED_LIMIT << 16) | IWN_SCHED_WINSZ);
+    }
+
+    /* Enable interrupts for all 20 queues */
+    iwn_prph_write(dev, IWN5000_SCHED_INTR_MASK, 0xfffff);
+
+    /* Identify TX FIFO rings 0-7 */
+    iwn_prph_write(dev, IWN5000_SCHED_TXFACT, 0xff);
+
+    /* Mark queues 0-6 as active with FIFO mapping */
+    /* Queue-to-FIFO: { 3, 2, 1, 0, 7, 5, 6 } */
+    static const uint8_t qid2fifo[] = { 3, 2, 1, 0, 7, 5, 6 };
+    for (int qid = 0; qid < 7; qid++) {
+        iwn_prph_write(dev, IWN5000_SCHED_QUEUE_STATUS(qid),
+                       IWN5000_TXQ_STATUS_ACTIVE | qid2fifo[qid]);
+    }
+
+    iwn_nic_unlock(dev);
+
+    /* ---- Send calibration commands ---- */
+
+    /* Crystal calibration from EEPROM */
     struct iwn5000_phy_calib_crystal crystal_cmd;
     iwn_memset(&crystal_cmd, 0, sizeof(crystal_cmd));
     crystal_cmd.code = IWN5000_PHY_CALIB_CRYSTAL;
@@ -442,6 +486,17 @@ void iwn5000_post_alive(iwn_dev *dev) {
     crystal_cmd.cap_pin[1] = (uint8_t)((dev->eeprom_crystal >> 16) & 0xff);
 
     iwn_cmd(dev, IWN_CMD_PHY_CALIB, &crystal_cmd, sizeof(crystal_cmd));
+
+    /* Query calibration — triggers firmware to run full calibration sequence */
+    struct iwn5000_calib_config calib_cfg;
+    iwn_memset(&calib_cfg, 0, sizeof(calib_cfg));
+    calib_cfg.ucode.once.enable = 0xffffffff;
+    calib_cfg.ucode.once.start  = 0xffffffff;
+    calib_cfg.ucode.once.send   = 0xffffffff;
+    calib_cfg.ucode.once.apply  = 0xffffffff;
+    calib_cfg.ucode.flags       = 0xffffffff;
+
+    iwn_cmd(dev, IWN5000_CMD_CALIB_CONFIG, &calib_cfg, sizeof(calib_cfg));
 
     /* Wait for calibration done (type 103) — up to 5 seconds */
     if (iwn_poll_rx(dev, IWN5000_CALIBRATION_DONE, 5000) != 0) {
@@ -611,23 +666,56 @@ int iwn_hw_init(iwn_dev *dev) {
     }
     efi_print_ascii("  Runtime firmware alive!\r\n");
 
-    /* 17. Clear RFKILL for runtime firmware */
+    /* 17. Full post-alive scheduler setup for runtime firmware
+     * Same sequence as iwn5000_post_alive but skips calibration commands
+     * and instead replays saved calibration results from init firmware.
+     * Reference: OpenBSD iwn_init() after runtime UC_READY */
+
+    /* Clear RFKILL (3 times, per OpenBSD) */
     iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
     iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
     iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
 
-    /* 18. Activate TX scheduler for runtime firmware */
     if (iwn_nic_lock(dev) == 0) {
-        iwn_prph_write(dev, IWN5000_SCHED_TXFACT, 0);
+        /* Read scheduler base from firmware */
+        uint32_t rt_sched_base = iwn_prph_read(dev, IWN_SCHED_SRAM_ADDR);
+
+        /* Clear scheduler context in SRAM */
+        iwn_mem_set_region_4(dev, rt_sched_base + IWN5000_SCHED_CTX_OFF, 0,
+                             IWN5000_SCHED_CTX_LEN / 4);
+
+        /* Set physical address of TX scheduler rings */
         iwn_prph_write(dev, IWN5000_SCHED_DRAM_ADDR,
                        (uint32_t)(dev->sched.paddr >> 10));
-        iwn_prph_write(dev, IWN5000_SCHED_QUEUE_STATUS(4),
-                       IWN5000_TXQ_STATUS_ACTIVE);
-        iwn_prph_write(dev, IWN5000_SCHED_TXFACT, (1 << 4));
+
+        iwn_prph_write(dev, IWN5000_SCHED_CHAINEXT_EN, 0);
+        iwn_setbits(dev, IWN_FH_TX_CHICKEN, IWN_FH_TX_CHICKEN_SCHED_RETRY);
+        iwn_prph_write(dev, IWN5000_SCHED_QCHAIN_SEL, 0xfffef);
+        iwn_prph_write(dev, IWN5000_SCHED_AGGR_SEL, 0);
+
+        /* Reset all queue pointers and set window/limit */
+        for (int qid = 0; qid < IWN5000_NTXQUEUES; qid++) {
+            iwn_prph_write(dev, IWN5000_SCHED_QUEUE_RDPTR(qid), 0);
+            iwn_write(dev, IWN_HBUS_TARG_WRPTR, (qid << 8) | 0);
+            iwn_mem_write(dev, rt_sched_base + IWN5000_SCHED_QUEUE_OFFSET(qid), 0);
+            iwn_mem_write(dev, rt_sched_base + IWN5000_SCHED_QUEUE_OFFSET(qid) + 4,
+                          (IWN_SCHED_LIMIT << 16) | IWN_SCHED_WINSZ);
+        }
+
+        iwn_prph_write(dev, IWN5000_SCHED_INTR_MASK, 0xfffff);
+        iwn_prph_write(dev, IWN5000_SCHED_TXFACT, 0xff);
+
+        /* Mark queues 0-6 active with FIFO mapping */
+        static const uint8_t rt_qid2fifo[] = { 3, 2, 1, 0, 7, 5, 6 };
+        for (int qid = 0; qid < 7; qid++) {
+            iwn_prph_write(dev, IWN5000_SCHED_QUEUE_STATUS(qid),
+                           IWN5000_TXQ_STATUS_ACTIVE | rt_qid2fifo[qid]);
+        }
+
         iwn_nic_unlock(dev);
     }
 
-    /* 19. Replay saved calibration results to runtime ucode */
+    /* 18. Replay saved calibration results to runtime ucode */
     iwn_replay_calibration(dev);
 
     dev->fw_loaded = 1;

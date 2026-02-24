@@ -8,7 +8,7 @@ Port OpenBSD's `iwn` driver to UEFI for Intel 6200 WiFi on the Dell E6510.
 |-------|------|-------------|--------|
 | 0 | Setup & Headers | Register headers, build system, PCI probe | **DONE** |
 | 1 | MMIO & EEPROM | Read hardware registers, dump EEPROM/MAC address | **DONE** |
-| 2 | DMA & Firmware | Allocate DMA rings, load firmware, get `UC_READY` | Pending |
+| 2 | DMA & Firmware | Allocate DMA rings, load firmware, get `UC_READY` | **DONE** |
 | 3 | Scan | Send scan command, parse results, print SSIDs | Pending |
 | 4 | Associate (Open) | Connect to an open network (no encryption) | Pending |
 | 5 | Crypto | AES-128, SHA-1, HMAC, PBKDF2, PRF | Pending |
@@ -142,42 +142,112 @@ bootai/iwn/
 
 ### Tasks
 
-- [ ] Implement DMA allocation shims:
-  - `iwn_dma_alloc(size, alignment)` → `gBS->AllocatePages()` with 4K alignment
-  - Map physical address (identity-mapped in UEFI, so virt == phys)
+- [x] Implement DMA allocation below 4GB:
+  - `AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &addr)` with max `0xFFFFFFFF`
+  - Identity-mapped in UEFI (virt == phys), no IOMMU needed
   - `iwn_dma_free()` → `gBS->FreePages()`
-- [ ] Implement `iwn_alloc_rx_ring()` — 64 RX descriptors + 64 pre-allocated 4KB buffers
-- [ ] Implement `iwn_alloc_tx_ring()` — 256 TX descriptors per queue (allocate queues 0-4 only)
-- [ ] Implement `iwn_alloc_sched()` — TX scheduler byte count table
-- [ ] Implement `iwn_alloc_kw()` — "keep warm" page
-- [ ] Implement firmware parser:
+- [x] Implement `iwn_alloc_rx_ring()` — 64 RX descriptors + status page + 64 pre-allocated 4KB buffers
+- [x] Implement `iwn_alloc_tx_ring()` — 256 TX descriptors (128B each) + 256 commands (140B each) per queue
+- [x] Implement `iwn_alloc_sched()` — TX scheduler byte count table (320 entries per queue × 20 queues)
+- [x] Implement `iwn_alloc_kw()` — "keep warm" page (4KB)
+- [x] Implement firmware parser (`iwn_fw_parse`):
   - Load `\drivers\iwn-6000` from EFI filesystem via `efi_read_file()`
-  - Parse TLV header: verify signature `0x0a4c5749`
+  - Auto-detect format: legacy v2 (first word != 0) or TLV (first word == 0, check signature)
   - Extract sections: init text, init data, runtime text, runtime data
-- [ ] Implement `iwn5000_load_firmware()`:
-  - Reset DMA engine
-  - Upload firmware sections in 128KB chunks via DMA
-  - Wait for `IWN_UC_READY` notification on RX ring
-- [ ] Implement basic RX notification polling:
-  - Read `IWN_FH_RX_STATUS` register for new RX descriptors
-  - Parse `iwn_rx_desc.type` — handle `IWN_UC_READY` (type 1)
-- [ ] Implement `iwn_hw_init()` — full hardware init sequence:
-  - Stop DMA channels
-  - Configure TX rings and RX ring in hardware registers
-  - Load firmware
-  - Post-alive calibration (`iwn5000_post_alive()`)
-  - NIC config (`iwn5000_nic_config()`)
+  - The 6200 uses legacy v2 format (API 4), not TLV
+- [x] Implement `iwn5000_load_firmware()`:
+  - Upload firmware sections via FH DMA service channel 9 (`IWN_SRVC_DMACHNL`)
+  - 128KB chunk transfers with DMA idle polling
+  - Release CPU from reset (`IWN_RESET = 0`) to start firmware execution
+- [x] Implement RX ring notification polling (`iwn_poll_rx`):
+  - Read `closed_count` from RX status page (hardware-updated)
+  - Walk RX ring buffers, parse `iwn_rx_desc.type`
+  - Handle `IWN_UC_READY` (type 1), `IWN5000_CALIBRATION_RESULT` (type 102), `IWN5000_CALIBRATION_DONE` (type 103)
+  - Save calibration results for replay to runtime firmware
+  - Update `IWN_FH_RX_WPTR` after consuming buffers
+- [x] Implement host command sending (`iwn_cmd`) via TX ring 4:
+  - Build `iwn_tx_cmd` (code + payload) and `iwn_tx_desc` (single segment)
+  - TX descriptor len field: `(totlen << 4) | HIADDR` encoding (not raw byte count)
+  - Update scheduler byte count table
+  - Kick hardware via `IWN_HBUS_TARG_WRPTR`
+- [x] Implement `iwn5000_nic_config()` — write radio/antenna config to `IWN_HW_IF_CONFIG`
+- [x] Implement `iwn_mem_read/write/set_region_4` — NIC-internal SRAM access via `IWN_MEM_RADDR/WADDR`
+- [x] Implement `iwn5000_post_alive()` — full post-alive sequence:
+  - Clear RFKILL (3x)
+  - Read scheduler base from firmware (`IWN_SCHED_SRAM_ADDR`)
+  - Clear scheduler context in SRAM, set DRAM address, reset all 20 queue pointers
+  - Set window/limit, FIFO mapping for queues 0-6, enable TXFACT + interrupts
+  - Send crystal calibration (`IWN_CMD_PHY_CALIB`) and `IWN5000_CMD_CALIB_CONFIG` (code 101)
+  - Poll for `IWN5000_CALIBRATION_DONE`
+- [x] Implement `iwn_replay_calibration()` — replay saved calib results to runtime firmware
+- [x] Implement `iwn_hw_init()` — full 18-step hardware init sequence:
+  - APM init → NIC config → DMA alloc → stop FH → program rings → clear interrupts
+  - Parse firmware → load init firmware → poll UC_READY → post-alive calibration
+  - Power cycle → reset rings → re-program → load runtime firmware → poll UC_READY
+  - Full scheduler setup for runtime → replay calibration
 
 ### Test on Hardware
 
-Boot → `iwn` → should print "Firmware loaded, UC_READY received"
+Boot → `iwn` → prints "Init firmware alive!" + "Runtime firmware alive!" + "Intel WiFi ready."
+
+### Results (2026-02-24)
+
+```
+> iwn
+  Centrino Advanced-N 6200 found at 2:0.0
+  HW type: 7 (6000 series)
+  OTP: yes
+  MAC: 00:27:10:56:ad:80
+  Domain: Mo
+  RF config: type=1 step=3 dash=1 tx=0x03 rx=0x03
+  Calibration ver: 6
+  802.11n: yes
+  DMA allocated: KW, sched, TX x2, RX (64 buffers)
+  Loading firmware: drivers/iwn-6000 (454608 bytes)
+  FW format: legacy v2, API 4
+  Init text: 145124 bytes, Init data: 81920 bytes
+  Main text: 145616 bytes, Main data: 81920 bytes
+  Init firmware alive!
+  iwn: calibration timeout
+  Runtime firmware alive!
+  Intel WiFi ready.
+```
+
+- Both init and runtime firmware alive — Phase 2 goal achieved
+- Calibration timeout is non-blocking (needed for Phase 3+ radio quality, not for Phase 2)
+- Total DMA allocation: ~2.5 MB below 4GB
+- Firmware file: `iwlwifi-6000-4.ucode` (454,608 bytes, legacy v2, API 4)
+
+### Bugs Encountered (9 total for UC_READY, 5 for calibration)
+
+**UC_READY fixes (init firmware wouldn't boot):**
+
+1. **Wrong DMA channel**: Used FH channel 0 instead of service channel 9 (`IWN_SRVC_DMACHNL`). The 5000+ series uploads firmware via the service channel, not the regular TX channels.
+2. **Missing TXBUF_STATUS write**: FH DMA requires `IWN_FH_TXBUF_STATUS` to be programmed with `TBNUM(1) | TBIDX(1) | TFBD_VALID` before starting transfer.
+3. **NIC lock not held during FH writes**: The FH register programming sequence must be done under `iwn_nic_lock()` to prevent concurrent access issues.
+4. **Missing DMA channel enable**: Channels 0-7 must be enabled with `DMA_ENA | DMA_CREDIT_ENA` before firmware load. Without this, the RX ring can't receive notifications.
+5. **Missing shadow register enable**: 6000+ series requires shadow register control bit (`0x800fffff`) for write pointer updates to propagate.
+6. **Missing VMAIN power source**: `IWN_APMG_PS` PWR_SRC_MASK must be cleared to select VMAIN power.
+7. **Wrong iwn5000_nic_config**: Was clearing `RADIO_SI`/`MAC_SI` bits instead of setting them. Also needed `IWN_APMG_DIGITAL_SVR_DIS_EARLY_PWROFF` to prevent early poweroff.
+8. **Missing RFKILL clear after firmware alive**: RF kill override must be cleared 3x after firmware boots.
+9. **Premature scheduler activation**: TX scheduler DRAM address was being set before firmware was alive. Firmware must be running before scheduler setup.
+
+**Calibration fixes (still timing out — deferred to Phase 3):**
+
+1. **TX descriptor len encoding**: `segs[0].len` was raw byte count, should be `(totlen << 4) | HIADDR(cmd_paddr)`. Firmware couldn't read command payloads.
+2. **Missing CALIB_CONFIG command**: Crystal calibration alone doesn't trigger the calibration sequence. Must send `IWN5000_CMD_CALIB_CONFIG` (code 101) with all enable/start/send/apply flags set.
+3. **Incomplete scheduler setup**: Missing SRAM context clear, queue pointer resets, FIFO mapping, chain/interrupt config. Full setup needed for firmware to process commands.
+4. **Missing RX WPTR update**: After consuming RX buffers, must write `IWN_FH_RX_WPTR` to tell hardware those slots are available. Without this, hardware runs out of RX buffers.
+5. **Simplified runtime scheduler**: Runtime firmware had a 4-line scheduler activation instead of the full setup. Now uses same full sequence as init firmware.
 
 ### Files
 
 ```
 bootai/iwn/
-├── iwn_dma.c           ← DMA allocation, ring setup
-└── iwn_fw.c            ← Firmware parsing and loading
+├── iwn_internal.h     ← shared internal header (MMIO, prph, lock, APM, mem, DMA, FW declarations)
+├── iwn_dma.c          ← DMA allocation, ring setup/reset/free (~200 lines)
+├── iwn_fw.c           ← FW parse, FH DMA upload, hw_init, post_alive, cmd, poll_rx (~730 lines)
+└── iwn_hw.c           ← MMIO, prph, NIC lock, APM, EEPROM, NIC config, mem access (~570 lines)
 ```
 
 ---
@@ -188,11 +258,8 @@ bootai/iwn/
 
 ### Tasks
 
-- [ ] Implement `iwn_cmd()` — send host command to firmware via TX queue 4:
-  - Build `iwn_tx_cmd` with opcode and payload
-  - Write to TX ring
-  - Kick hardware via write to `IWN_HBUS_TARG_WRPTR`
-  - Poll for completion (check TX ring read pointer)
+- [x] `iwn_cmd()` — host command sending via TX queue 4 (implemented in Phase 2)
+- [ ] Debug calibration timeout (deferred from Phase 2 — may resolve itself once commands are flowing)
 - [ ] Send initial configuration commands:
   - `IWN_CMD_RXON` (0x10) — set MAC address, channel, filter flags
   - `IWN_CMD_ADD_NODE` (0x18) — add broadcast node
@@ -496,12 +563,13 @@ test-iwn-crypto: iwn/iwn_crypto.c iwn/test_crypto.c
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Firmware won't load (DMA timing) | Blocks Phase 2+ | Compare register sequences with itlwm, add delays |
+| ~~Firmware won't load (DMA timing)~~ | ~~Blocks Phase 2+~~ | ~~Resolved: 9 bugs fixed, both init+runtime firmware alive~~ |
 | ~~EEPROM read fails on E6510~~ | ~~Blocks Phase 1~~ | ~~Resolved: OTP path works, MAC/domain/RF read successfully~~ |
 | Scan returns no results | Blocks Phase 3 | Check antenna config, TX power, regulatory domain |
 | WPA2 handshake timing | Blocks Phase 6 | AP typically retries; add timeout + retry logic |
 | SNP binding fails | Blocks Phase 7 | May need `InstallMultipleProtocolInterfaces` with device path |
-| Not enough memory for DMA | Blocks Phase 2 | TX/RX rings need ~5MB total; E6510 has 4-8GB |
+| ~~Not enough memory for DMA~~ | ~~Blocks Phase 2~~ | ~~Resolved: ~2.5MB allocated below 4GB, no issues~~ |
+| Calibration timeout | Degrades Phase 3+ | 5 fixes applied, still times out. May need debug prints to trace command flow. Radio may work without it (degraded signal). |
 | Dell E6510 firmware quirks | Any phase | Test each phase on hardware, not just QEMU |
 
 ## Dependencies

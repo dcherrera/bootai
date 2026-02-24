@@ -57,6 +57,25 @@ void iwn_prph_clrbits(iwn_dev *dev, uint32_t addr, uint32_t mask) {
     iwn_prph_write(dev, addr, iwn_prph_read(dev, addr) & ~mask);
 }
 
+/* ---- NIC-internal SRAM access (require NIC lock held) ---- */
+
+uint32_t iwn_mem_read(iwn_dev *dev, uint32_t addr) {
+    iwn_write(dev, IWN_MEM_RADDR, addr);
+    __asm__ volatile("" ::: "memory");
+    return iwn_read(dev, IWN_MEM_RDATA);
+}
+
+void iwn_mem_write(iwn_dev *dev, uint32_t addr, uint32_t val) {
+    iwn_write(dev, IWN_MEM_WADDR, addr);
+    __asm__ volatile("" ::: "memory");
+    iwn_write(dev, IWN_MEM_WDATA, val);
+}
+
+void iwn_mem_set_region_4(iwn_dev *dev, uint32_t addr, uint32_t val, int count) {
+    for (int i = 0; i < count; i++)
+        iwn_mem_write(dev, addr + i * 4, val);
+}
+
 /* ---- NIC lock/unlock (required for peripheral register access) ---- */
 
 int iwn_nic_lock(iwn_dev *dev) {
