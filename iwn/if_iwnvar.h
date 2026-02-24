@@ -1,7 +1,7 @@
 /*
- * if_iwnvar.h — Intel Wireless N driver state for BootAI (Phase 1)
+ * if_iwnvar.h — Intel Wireless N driver state for BootAI (Phase 1+2)
  *
- * Device struct, device ID table, flag/HW type constants.
+ * Device struct, DMA ring structs, firmware state, device ID table.
  * Adapted from OpenBSD's if_iwnvar.h for freestanding UEFI.
  */
 
@@ -22,8 +22,55 @@
 #define IWN_FLAG_ADV_BT_COEX  (1 << 4)
 #define IWN_FLAG_PAN_SUPPORT  (1 << 5)
 
+/* ---- Phase 2: DMA ring structures ---- */
+
+/* DMA memory descriptor (physical address + virtual address + size) */
+typedef struct {
+    uint64_t    paddr;      /* physical address */
+    void       *vaddr;      /* virtual address (== paddr in UEFI) */
+    uint32_t    size;       /* bytes allocated */
+} iwn_dma_info;
+
+/* RX ring — 64 descriptor slots + status page + 64 x 4KB buffers */
+typedef struct {
+    iwn_dma_info    desc;       /* 64 x uint32_t descriptor array */
+    iwn_dma_info    stat;       /* status page (hw read pointer) */
+    iwn_dma_info    buf[IWN_RX_RING_COUNT]; /* 64 x 4KB buffers */
+    int             cur;        /* current read index */
+} iwn_rx_ring;
+
+/* TX ring — 256 descriptors (128 bytes each) + 256 commands (140 bytes each) */
+typedef struct {
+    iwn_dma_info    desc;       /* 256 x 128-byte descriptors */
+    iwn_dma_info    cmd;        /* 256 x 140-byte commands */
+    int             qid;        /* queue ID */
+    int             cur;        /* current write index */
+    int             queued;     /* entries queued */
+} iwn_tx_ring;
+
+/* Parsed firmware image sections */
+typedef struct {
+    const uint8_t  *main_text;  uint32_t main_text_len;
+    const uint8_t  *main_data;  uint32_t main_data_len;
+    const uint8_t  *init_text;  uint32_t init_text_len;
+    const uint8_t  *init_data;  uint32_t init_data_len;
+    uint32_t        fw_api;     /* firmware API version */
+} iwn_fw;
+
+/* Calibration result (saved from init ucode, replayed to runtime ucode) */
+typedef struct {
+    uint8_t     data[2048];     /* raw calibration command data */
+    uint32_t    len;            /* bytes used */
+} iwn_calib_cmd;
+
+#define IWN_MAX_CALIB_RESULTS  16
+
+/* FH DMA firmware upload chunk size (128 KB) */
+#define IWN_FW_CHUNK_SIZE      (128 * 1024)
+
 /* ---- Device struct ---- */
 typedef struct iwn_dev {
+    /* Phase 1: PCI + EEPROM state */
     EFI_PCI_IO_PROTOCOL *pci_io;    /* UEFI PCI IO handle */
     uint16_t        device_id;      /* PCI device ID */
     uint8_t         hw_type;        /* (HW_REV >> 4) & 0x1f */
@@ -37,6 +84,23 @@ typedef struct iwn_dev {
     uint8_t         rxchainmask;    /* RX antenna chain mask */
     uint8_t         calib_ver;      /* calibration version */
     uint32_t        eeprom_crystal; /* crystal calibration value */
+
+    /* Phase 2: DMA rings */
+    iwn_dma_info    kw;                     /* keep-warm page (4 KB) */
+    iwn_dma_info    sched;                  /* TX scheduler table */
+    iwn_tx_ring     txq[5];                 /* TX queues 0-4 (4 = cmd) */
+    iwn_rx_ring     rxq;                    /* RX queue */
+
+    /* Phase 2: Firmware */
+    iwn_fw          fw;                     /* parsed firmware sections */
+    void           *fw_rawbuf;              /* raw file buffer (freed after parse) */
+    UINTN           fw_rawsize;             /* raw file size */
+    iwn_calib_cmd   calib[IWN_MAX_CALIB_RESULTS]; /* saved calibration */
+    int             n_calib;                /* number of saved calibration results */
+    int             fw_loaded;              /* 1 if runtime ucode running */
+
+    /* Phase 2: DMA scratch buffer for firmware upload */
+    iwn_dma_info    fw_dma;                 /* DMA buffer for firmware sections */
 } iwn_dev;
 
 /* ---- Device identification table ---- */

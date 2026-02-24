@@ -141,10 +141,36 @@ Advertise BootAI on the local network so clients can connect without knowing the
 - Reuse existing UDP4 infrastructure from Phase 2
 - Respond to mDNS queries (RFC 6762)
 
+### 5e. Native Intel WiFi Driver — IWN (IN PROGRESS)
+
+Bare-metal Intel WiFi driver ported from OpenBSD's `iwn` for machines without UEFI WiFi2 protocol support (e.g. Dell E6510 with Intel Centrino Advanced-N 6200). See [IWN WiFi Driver Architecture](../architecture/iwn-wifi-driver.md) for full details.
+
+The driver has its own internal phases:
+
+| IWN Phase | Description | Status |
+|-----------|-------------|--------|
+| 0 | PCI probe — enumerate bus, match device IDs | COMPLETE |
+| 1 | MMIO + EEPROM — power on, read MAC/domain/RF config | COMPLETE |
+| 2 | DMA + Firmware — allocate rings, load firmware, get UC_READY | COMPLETE |
+| 3 | Scanning — RXON config, CMD_SCAN, parse beacon results | PLANNED |
+| 4 | Association + WPA2 — EAPOL handshake, CCMP keys | PLANNED |
+| 5 | SNP integration — EFI_SIMPLE_NETWORK_PROTOCOL wrapper | PLANNED |
+
+**IWN Phase 0-1** (2026-02-23): PCI bus enumeration finds Intel 6200, enables MMIO + bus master, reads EEPROM (MAC, RF config, calibration data, regulatory domain). Confirmed on Dell E6510 hardware.
+
+**IWN Phase 2** (2026-02-24): DMA memory allocation below 4GB (~2.5MB total), firmware parsing (legacy v2 format), FH DMA upload via service channel 9, TX/RX ring setup, full hardware init sequence with post-alive calibration. 9 bugs found and fixed during real-hardware testing.
+
+**Files**: `bootai/iwn/` — 8 source files (~1,500 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c)
+
+**Firmware**: `iwlwifi-6000-4.ucode` (454KB, legacy v2 format) renamed to `iwn-6000`, placed in `\drivers\` on the EFI partition.
+
+**Supported hardware**: Full Intel 4965/5000/6000 family (~38 cards from ~2007-2013 laptops). See architecture doc for complete device table.
+
 ### Remaining
 
 - mDNS discovery (5d) — quality-of-life, not a blocker
 - Streaming mode (`stream: true`) for chat completions (chunked transfer encoding + SSE)
+- IWN Phase 3-5: scanning, association, WPA2, SNP integration
 
 ## Phase 6: Tool Use (SCAFFOLDED)
 

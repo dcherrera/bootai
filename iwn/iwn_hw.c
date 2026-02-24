@@ -1,65 +1,65 @@
 /*
- * iwn_hw.c — Intel Wireless N hardware access for BootAI (Phase 1)
+ * iwn_hw.c — Intel Wireless N hardware access for BootAI (Phase 1+2)
  *
- * MMIO primitives, NIC lock, APM init/stop, EEPROM read, and iwn_attach().
- * All register access goes through EFI_PCI_IO_PROTOCOL.Mem.Read/Write on BAR0.
+ * MMIO primitives, NIC lock, APM init/stop, EEPROM read, NIC config,
+ * and iwn_attach(). All register access goes through
+ * EFI_PCI_IO_PROTOCOL.Mem.Read/Write on BAR0.
  *
  * Reference: OpenBSD sys/dev/pci/if_iwn.c (ISC license)
  */
 
-#include "iwn.h"
-#include "if_iwnvar.h"
+#include "iwn_internal.h"
 
 /* ---- MMIO primitives ---- */
 
-static uint32_t iwn_read(iwn_dev *dev, uint32_t reg) {
+uint32_t iwn_read(iwn_dev *dev, uint32_t reg) {
     uint32_t val;
     dev->pci_io->Mem.Read(dev->pci_io, EfiPciIoWidthUint32, 0, reg, 1, &val);
     return val;
 }
 
-static void iwn_write(iwn_dev *dev, uint32_t reg, uint32_t val) {
+void iwn_write(iwn_dev *dev, uint32_t reg, uint32_t val) {
     dev->pci_io->Mem.Write(dev->pci_io, EfiPciIoWidthUint32, 0, reg, 1, &val);
 }
 
-static void iwn_write_1(iwn_dev *dev, uint32_t reg, uint8_t val) {
+void iwn_write_1(iwn_dev *dev, uint32_t reg, uint8_t val) {
     dev->pci_io->Mem.Write(dev->pci_io, EfiPciIoWidthUint8, 0, reg, 1, &val);
 }
 
-static void iwn_setbits(iwn_dev *dev, uint32_t reg, uint32_t mask) {
+void iwn_setbits(iwn_dev *dev, uint32_t reg, uint32_t mask) {
     iwn_write(dev, reg, iwn_read(dev, reg) | mask);
 }
 
-static void iwn_clrbits(iwn_dev *dev, uint32_t reg, uint32_t mask) {
+void iwn_clrbits(iwn_dev *dev, uint32_t reg, uint32_t mask) {
     iwn_write(dev, reg, iwn_read(dev, reg) & ~mask);
 }
 
 /* ---- Peripheral (NIC-internal) register access ---- */
 
-static uint32_t iwn_prph_read(iwn_dev *dev, uint32_t addr) {
+uint32_t iwn_prph_read(iwn_dev *dev, uint32_t addr) {
     iwn_write(dev, IWN_PRPH_RADDR, IWN_PRPH_DWORD | addr);
     /* Compiler barrier — ensure address write commits before data read */
     __asm__ volatile("" ::: "memory");
     return iwn_read(dev, IWN_PRPH_RDATA);
 }
 
-static void iwn_prph_write(iwn_dev *dev, uint32_t addr, uint32_t val) {
+void iwn_prph_write(iwn_dev *dev, uint32_t addr, uint32_t val) {
     iwn_write(dev, IWN_PRPH_WADDR, IWN_PRPH_DWORD | addr);
     __asm__ volatile("" ::: "memory");
     iwn_write(dev, IWN_PRPH_WDATA, val);
 }
 
-static void iwn_prph_setbits(iwn_dev *dev, uint32_t addr, uint32_t mask) {
+void iwn_prph_setbits(iwn_dev *dev, uint32_t addr, uint32_t mask) {
     iwn_prph_write(dev, addr, iwn_prph_read(dev, addr) | mask);
 }
 
-static void iwn_prph_clrbits(iwn_dev *dev, uint32_t addr, uint32_t mask) {
+void iwn_prph_clrbits(iwn_dev *dev, uint32_t addr, uint32_t mask) {
     iwn_prph_write(dev, addr, iwn_prph_read(dev, addr) & ~mask);
 }
 
 /* ---- NIC lock/unlock (required for peripheral register access) ---- */
 
-static int iwn_nic_lock(iwn_dev *dev) {
+int iwn_nic_lock(iwn_dev *dev) {
     iwn_setbits(dev, IWN_GP_CNTRL, IWN_GP_CNTRL_MAC_ACCESS_REQ);
 
     /* Poll until MAC_ACCESS_ENA=1 and SLEEP=0 */
@@ -73,7 +73,7 @@ static int iwn_nic_lock(iwn_dev *dev) {
     return -1;
 }
 
-static void iwn_nic_unlock(iwn_dev *dev) {
+void iwn_nic_unlock(iwn_dev *dev) {
     iwn_clrbits(dev, IWN_GP_CNTRL, IWN_GP_CNTRL_MAC_ACCESS_REQ);
 }
 
@@ -144,7 +144,7 @@ static void iwn_find_pcie_cap(iwn_dev *dev) {
 
 /* ---- APM init (power-on sequence) ---- */
 
-static int iwn_apm_init(iwn_dev *dev) {
+int iwn_apm_init(iwn_dev *dev) {
     /* GIO_CHICKEN workarounds */
     iwn_setbits(dev, IWN_GIO_CHICKEN,
                 IWN_GIO_CHICKEN_DIS_L0S_TIMER | IWN_GIO_CHICKEN_L1A_NO_L0S_RX);
@@ -197,7 +197,7 @@ static void iwn_apm_stop_master(iwn_dev *dev) {
     }
 }
 
-static void iwn_apm_stop(iwn_dev *dev) {
+void iwn_apm_stop(iwn_dev *dev) {
     iwn_apm_stop_master(dev);
 
     /* SW reset */
@@ -253,7 +253,7 @@ static int iwn_init_otprom(iwn_dev *dev) {
 
 /* ---- EEPROM word read ---- */
 
-static int iwn_read_prom_data(iwn_dev *dev, uint32_t addr, void *data, int count) {
+int iwn_read_prom_data(iwn_dev *dev, uint32_t addr, void *data, int count) {
     uint8_t *out = (uint8_t *)data;
     int has_otp = (dev->flags & IWN_FLAG_HAS_OTPROM);
 
@@ -301,7 +301,7 @@ static int iwn_read_prom_data(iwn_dev *dev, uint32_t addr, void *data, int count
 
 static const char hex_chars[] = "0123456789abcdef";
 
-static void print_hex8(uint8_t val) {
+void print_hex8(uint8_t val) {
     char buf[3];
     buf[0] = hex_chars[(val >> 4) & 0xf];
     buf[1] = hex_chars[(val >> 0) & 0xf];
@@ -309,7 +309,7 @@ static void print_hex8(uint8_t val) {
     efi_print_ascii(buf);
 }
 
-static void print_dec(uint32_t val) {
+void print_dec(uint32_t val) {
     if (val == 0) { efi_print_ascii("0"); return; }
     char buf[11];
     int i = 10;
@@ -325,6 +325,25 @@ static void print_mac(const uint8_t *mac) {
     for (int i = 0; i < 6; i++) {
         if (i > 0) efi_print_ascii(":");
         print_hex8(mac[i]);
+    }
+}
+
+/* ---- NIC config (radio/antenna config for 5000+ series) ---- */
+/* Reference: OpenBSD iwn5000_nic_config() */
+
+void iwn5000_nic_config(iwn_dev *dev) {
+    uint32_t val;
+
+    /* Set RADIO_SI and MAC_SI bits (required for 5000+ series) */
+    val = iwn_read(dev, IWN_HW_IF_CONFIG);
+    val |= IWN_HW_IF_CONFIG_RADIO_SI;
+    val |= IWN_HW_IF_CONFIG_MAC_SI;
+    iwn_write(dev, IWN_HW_IF_CONFIG, val);
+
+    /* Enable early power-off disable */
+    if (iwn_nic_lock(dev) == 0) {
+        iwn_prph_setbits(dev, IWN_APMG_PS, IWN_APMG_PS_EARLY_PWROFF_DIS);
+        iwn_nic_unlock(dev);
     }
 }
 

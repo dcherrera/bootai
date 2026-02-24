@@ -1,12 +1,12 @@
 /*
- * iwn_pci.c — PCI bus probe + attach for Intel Wireless N driver
+ * iwn_pci.c — PCI bus probe + attach + init for Intel Wireless N driver
  *
  * Phase 0: Walk EFI_PCI_IO_PROTOCOL handles, match against device ID table.
  * Phase 1: Save PCI IO handle, call iwn_attach() for MMIO/EEPROM access.
+ * Phase 2: Call iwn_init() for DMA + firmware loading.
  */
 
-#include "iwn.h"
-#include "if_iwnvar.h"
+#include "iwn_internal.h"
 
 /* PCI IO Protocol GUID (from UEFI spec) */
 EFI_GUID gEfiPciIoProtocolGuid = {
@@ -119,12 +119,26 @@ EFI_STATUS iwn_probe(void) {
     g_iwn.prom_base = 0;
 
     status = iwn_attach(&g_iwn);
-    if (status == EFI_SUCCESS) {
-        g_iwn_found = 1;
-        efi_print_ascii("  Intel WiFi ready.\r\n");
-    } else {
+    if (status != EFI_SUCCESS) {
         g_iwn_found = 0;
+        return status;
     }
 
-    return status;
+    /* Phase 2: DMA + firmware loading */
+    if (iwn_init(&g_iwn) != 0) {
+        g_iwn_found = 0;
+        efi_print_ascii("  iwn: init failed\r\n");
+        return EFI_DEVICE_ERROR;
+    }
+
+    g_iwn_found = 1;
+    efi_print_ascii("  Intel WiFi ready.\r\n");
+    return EFI_SUCCESS;
+}
+
+/* ---- Phase 2: DMA + firmware init wrapper ---- */
+
+int iwn_init(iwn_dev *dev) {
+    /* Parse firmware file, then run full hardware init */
+    return iwn_hw_init(dev);
 }

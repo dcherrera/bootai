@@ -1,0 +1,72 @@
+/*
+ * iwn_internal.h — Shared internal header for Intel Wireless N driver
+ *
+ * Exposes MMIO, peripheral register, NIC lock, APM, and print functions
+ * from iwn_hw.c for use by iwn_dma.c and iwn_fw.c.
+ *
+ * Not part of the public API — include only from iwn_*.c files.
+ */
+
+#pragma once
+
+#include "iwn.h"
+#include "if_iwnvar.h"
+
+/* ---- MMIO (BAR0 register access) ---- */
+
+uint32_t iwn_read(iwn_dev *dev, uint32_t reg);
+void iwn_write(iwn_dev *dev, uint32_t reg, uint32_t val);
+void iwn_write_1(iwn_dev *dev, uint32_t reg, uint8_t val);
+void iwn_setbits(iwn_dev *dev, uint32_t reg, uint32_t mask);
+void iwn_clrbits(iwn_dev *dev, uint32_t reg, uint32_t mask);
+
+/* ---- Peripheral registers (require NIC lock held) ---- */
+
+uint32_t iwn_prph_read(iwn_dev *dev, uint32_t addr);
+void iwn_prph_write(iwn_dev *dev, uint32_t addr, uint32_t val);
+void iwn_prph_setbits(iwn_dev *dev, uint32_t addr, uint32_t mask);
+void iwn_prph_clrbits(iwn_dev *dev, uint32_t addr, uint32_t mask);
+
+/* ---- NIC lock (10ms timeout) ---- */
+
+int iwn_nic_lock(iwn_dev *dev);
+void iwn_nic_unlock(iwn_dev *dev);
+
+/* ---- APM (power management) ---- */
+
+int iwn_apm_init(iwn_dev *dev);
+void iwn_apm_stop(iwn_dev *dev);
+
+/* ---- NIC config (write radio/antenna config to HW_IF_CONFIG) ---- */
+
+void iwn5000_nic_config(iwn_dev *dev);
+
+/* ---- EEPROM ---- */
+
+int iwn_read_prom_data(iwn_dev *dev, uint32_t addr, void *data, int count);
+
+/* ---- Print helpers ---- */
+
+void print_dec(uint32_t val);
+void print_hex8(uint8_t val);
+
+/* ---- DMA allocation (iwn_dma.c) ---- */
+
+int iwn_alloc_kw(iwn_dev *dev);
+int iwn_alloc_sched(iwn_dev *dev);
+int iwn_alloc_tx_ring(iwn_dev *dev, int qid);
+int iwn_alloc_rx_ring(iwn_dev *dev);
+void iwn_reset_tx_ring(iwn_dev *dev, int qid);
+void iwn_reset_rx_ring(iwn_dev *dev);
+void iwn_free_dma(iwn_dev *dev);
+
+/* ---- Firmware (iwn_fw.c) ---- */
+
+int iwn_fw_parse(iwn_dev *dev);
+int iwn5000_load_firmware(iwn_dev *dev, const uint8_t *text, uint32_t text_len,
+                          const uint8_t *data, uint32_t data_len);
+int iwn_poll_rx(iwn_dev *dev, uint8_t expected_type, int timeout_ms);
+int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len);
+void iwn5000_post_alive(iwn_dev *dev);
+void iwn_replay_calibration(iwn_dev *dev);
+int iwn_hw_init(iwn_dev *dev);
