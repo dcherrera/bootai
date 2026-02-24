@@ -280,6 +280,9 @@ void ba_http_serve(uint16_t port) {
             break;
         }
 
+        /* Poll mDNS responder (non-blocking) */
+        ba_mdns_poll();
+
         /* Try to accept a connection (500ms timeout) */
         tcp4_conn_t client;
         status = tcp4_accept(&listener, &client);

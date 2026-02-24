@@ -218,7 +218,7 @@ typedef struct {
 typedef struct EFI_UDP4_PROTOCOL {
     void *GetModeData;
     EFI_STATUS (EFIAPI *Configure)(struct EFI_UDP4_PROTOCOL *This, EFI_UDP4_CONFIG_DATA *UdpConfigData);
-    void *Groups;
+    EFI_STATUS (EFIAPI *Groups)(struct EFI_UDP4_PROTOCOL *This, BOOLEAN JoinFlag, EFI_IPv4_ADDRESS *MulticastAddress);
     void *Routes;
     EFI_STATUS (EFIAPI *Transmit)(struct EFI_UDP4_PROTOCOL *This, EFI_UDP4_COMPLETION_TOKEN *Token);
     EFI_STATUS (EFIAPI *Receive)(struct EFI_UDP4_PROTOCOL *This, EFI_UDP4_COMPLETION_TOKEN *Token);
@@ -598,6 +598,15 @@ void efi_wifi_disconnect(void);
 void efi_wifi_auto_connect(void);
 void efi_wifi_save(const char *ssid, const char *password);
 void efi_wifi_status(void);
+
+/* mDNS / Bonjour discovery */
+EFI_STATUS ba_mdns_init(void);
+void       ba_mdns_announce(void);
+void       ba_mdns_poll(void);
+void       ba_mdns_stop(void);
+
+/* Local IP retrieval */
+EFI_STATUS efi_get_local_ip(EFI_IPv4_ADDRESS *out_ip);
 
 /* Network helpers (used by drivers.c and wifi.c) */
 void connect_all_controllers(void);

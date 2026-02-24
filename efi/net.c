@@ -285,6 +285,51 @@ int efi_net_available(void) {
     return net_available;
 }
 
+EFI_STATUS efi_get_local_ip(EFI_IPv4_ADDRESS *out_ip) {
+    if (!ip4_config2) return EFI_NOT_READY;
+
+    /* Query size first */
+    UINTN data_size = 0;
+    EFI_STATUS status = ip4_config2->GetData(ip4_config2,
+        IP4_CONFIG2_DATA_TYPE_INTERFACEINFO, &data_size, 0);
+    if (status != EFI_BUFFER_TOO_SMALL || data_size == 0)
+        return EFI_NOT_READY;
+
+    /* Allocate and read interface info */
+    void *buf = 0;
+    status = gBS->AllocatePool(EfiBootServicesData, data_size, &buf);
+    if (status != EFI_SUCCESS) return status;
+
+    ba_memset(buf, 0, data_size);
+    status = ip4_config2->GetData(ip4_config2,
+        IP4_CONFIG2_DATA_TYPE_INTERFACEINFO, &data_size, buf);
+    if (status != EFI_SUCCESS) {
+        gBS->FreePool(buf);
+        return status;
+    }
+
+    /*
+     * EFI_IP4_CONFIG2_INTERFACE_INFO layout (UEFI spec):
+     *   CHAR16 Name[32]  — 64 bytes
+     *   uint8_t IfType   — 1 byte
+     *   uint32_t HwAddrSize — 4 bytes (often padded)
+     *   EFI_MAC_ADDRESS HwAddr — 32 bytes
+     *   EFI_IPv4_ADDRESS StationAddress — at offset ~104
+     *
+     * The StationAddress is after Name(64) + IfType(1) + pad(3) + HwAddrSize(4) + HwAddr(32) = 104
+     */
+    uint8_t *raw = (uint8_t *)buf;
+    ba_memcpy(out_ip, raw + 104, 4);
+    gBS->FreePool(buf);
+
+    /* Check for 0.0.0.0 (no IP assigned yet) */
+    if (out_ip->Addr[0] == 0 && out_ip->Addr[1] == 0 &&
+        out_ip->Addr[2] == 0 && out_ip->Addr[3] == 0)
+        return EFI_NOT_READY;
+
+    return EFI_SUCCESS;
+}
+
 /* ---- TCP4 connection management ---- */
 
 static EFI_STATUS tcp4_connect(EFI_IPv4_ADDRESS *host_ip, uint16_t port, tcp4_conn_t *conn) {

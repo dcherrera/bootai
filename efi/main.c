@@ -318,7 +318,7 @@ static void command_repl(void) {
 
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
-    efi_print_ascii("            wifi [scan|connect|disconnect|save], netinfo, tensor, exit\r\n");
+    efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, netinfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -414,7 +414,9 @@ static void command_repl(void) {
                     if (v > 0 && v < 65536) port = (uint16_t)v;
                 }
             }
+            if (ba_mdns_init() == EFI_SUCCESS) ba_mdns_announce();
             ba_http_serve(port);
+            ba_mdns_stop();
             continue;
         }
 
@@ -551,6 +553,26 @@ static void command_repl(void) {
                 if (yn[0] == 'y' || yn[0] == 'Y') {
                     efi_wifi_save(ssid, password);
                 }
+            }
+            continue;
+        }
+
+        /* mdns — manual mDNS test */
+        if (str_eq(line, "mdns")) {
+            if (!efi_net_available()) {
+                efi_print_ascii("  Network not available\r\n");
+                continue;
+            }
+            if (ba_mdns_init() == EFI_SUCCESS) {
+                ba_mdns_announce();
+                efi_print_ascii("  mDNS running. Press any key to stop.\r\n");
+                for (;;) {
+                    ba_mdns_poll();
+                    gBS->Stall(100000);
+                    EFI_INPUT_KEY k;
+                    if (efi_read_key(&k) == EFI_SUCCESS) break;
+                }
+                ba_mdns_stop();
             }
             continue;
         }

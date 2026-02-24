@@ -14,6 +14,8 @@ Plug in a USB drive, power on, and you're talking to a language model that can r
 
 - **URL fetching** — pull web pages via UEFI HTTP protocol
 
+- **Network discovery** — advertises `bootai.local` via mDNS/Bonjour, accessible from any device on the LAN
+
 - **Persistent settings** — saved in UEFI NVRAM across reboots
 
 - **Conversation history** — saved to disk
@@ -33,7 +35,7 @@ No kernel. No OS. The `.efi` binary stays in UEFI boot services mode, which give
 
 - **Filesystem** — Simple File System Protocol (FAT32)
 
-- **Networking** — TCP4, UDP4, HTTP, DHCP4
+- **Networking** — TCP4, UDP4, HTTP, DHCP4, mDNS
 
 - **Display** — Graphics Output Protocol
 

@@ -148,6 +148,88 @@ QEMU user-mode networking provides a DNS forwarder at `10.0.2.3`. This is hardco
 - UDP4 completion token uses a `Packet` union with `RxData`/`TxData` pointers (no separate IO token wrapper like TCP4)
 - Retry on `EFI_NO_MAPPING` during Configure (same DHCP race as TCP4)
 
+## mDNS / Bonjour Discovery (RFC 6762)
+
+BootAI advertises itself as `bootai.local` on the local network via multicast DNS. Any device on the same LAN can discover the HTTP API without knowing the IP.
+
+### How It Works
+
+```
+ba_mdns_init()      → Create UDP4 child on port 5353, join 224.0.0.251 multicast
+ba_mdns_announce()  → Send A-record response twice (RFC 6762 §8.3)
+ba_mdns_poll()      → Check for incoming queries, respond if bootai.local is asked
+ba_mdns_stop()      → Send goodbye (TTL=0), leave multicast, destroy child
+```
+
+### Integration
+
+mDNS is integrated into the `serve` command — init and announce before the HTTP server starts, poll every accept cycle (~500ms), stop on exit. Also available as a standalone `mdns` REPL command for testing.
+
+### Packet Format
+
+**Announcement/Response (40 bytes):**
+
+```
+Header (12 bytes):
+  ID=0, Flags=0x8400 (QR=1 response, AA=1 authoritative)
+  QDCOUNT=0, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+
+Answer:
+  NAME:    \x06bootai\x05local\x00
+  TYPE:    A (1)
+  CLASS:   IN (1) | cache-flush (0x8000)
+  TTL:     120 seconds (0 for goodbye)
+  RDLEN:   4
+  RDATA:   <our IPv4 address>
+```
+
+### Query Matching
+
+`mdns_is_our_query()` checks incoming packets:
+- QR=0 (query), QDCOUNT >= 1
+- QNAME matches `bootai.local` (case-insensitive label comparison)
+- QTYPE is A (1) or ANY (255)
+- QCLASS is IN (1) or ANY (255), ignoring unicast-response bit
+
+### UDP4 mDNS Lifecycle
+
+```
+LocateHandleBuffer(UDP4_SERVICE_BINDING)
+  → CreateChild(&child_handle)
+  → HandleProtocol(child_handle, &UDP4, &udp4)
+  → udp4->Configure(port=5353, AllowDuplicatePort=1, TTL=255)
+  → udp4->Groups(TRUE, 224.0.0.251)    // Join multicast
+  → [announce + poll loop]
+  → udp4->Groups(FALSE, 224.0.0.251)   // Leave multicast
+  → DestroyChild(child_handle)
+```
+
+### Local IP Retrieval
+
+`efi_get_local_ip()` reads the DHCP-assigned IP from `ip4_config2->GetData(INTERFACEINFO)`. The station address is at byte offset 104 in the `EFI_IP4_CONFIG2_INTERFACE_INFO` struct (after Name[32] + IfType + padding + HwAddrSize + HwAddr[32]).
+
+### Client Usage
+
+From any machine on the same network:
+
+```bash
+# macOS
+ping bootai.local
+curl http://bootai.local:8080/health
+dns-sd -Q bootai.local
+
+# Linux (avahi)
+avahi-resolve -n bootai.local
+curl http://bootai.local:8080/v1/models
+```
+
+### Limitations
+
+- **QEMU**: Does not work in QEMU user-mode networking (SLIRP doesn't forward multicast). Real hardware only.
+- **IPv4 only**: No AAAA records.
+- **Single hostname**: Only `bootai.local` is advertised. No service records (SRV/TXT) yet.
+- **No conflict detection**: If another device claims `bootai.local`, we don't rename.
+
 ## HTTP/1.0
 
 Raw TCP4, not the UEFI HTTP protocol. Simple and reliable.
