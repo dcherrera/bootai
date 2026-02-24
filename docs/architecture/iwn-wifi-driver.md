@@ -12,6 +12,8 @@ The driver exposes `EFI_SIMPLE_NETWORK_PROTOCOL` (SNP), which plugs into UEFI's 
 
 ## Target Hardware
 
+Primary development target:
+
 | Field | Value |
 |-------|-------|
 | Card | Intel Centrino Advanced-N 6200 (Dell E6510) |
@@ -19,6 +21,34 @@ The driver exposes `EFI_SIMPLE_NETWORK_PROTOCOL` (SNP), which plugs into UEFI's 
 | Chip family | Intel 6000 series ("Puma Peak") |
 | MAC type | SoftMAC (host handles 802.11 MAC) |
 | Firmware | `iwn-6000` (OpenBSD-renamed `iwlwifi-6000-4.ucode`) |
+
+### All Supported Cards
+
+The OpenBSD `iwn` driver supports the full Intel 4965/5000/6000 family. Once the driver is complete, all of these cards will work:
+
+| Card | PCI IDs | Firmware | Common In |
+|------|---------|----------|-----------|
+| Wireless WiFi Link 4965 | `4229`, `4230` | `iwn-4965` | 2007-2009 laptops |
+| WiFi Link 5100 | `4232`, `4237` | `iwn-5000` | ThinkPad T400/T500, Dell E6400 |
+| WiFi Link 5300 | `4235`, `4236` | `iwn-5000` | ThinkPad W500, Dell Precision |
+| WiFi Link 5350 | `423a`, `423b` | `iwn-5000` | MacBook Pro 2008-2009 |
+| WiFi Link 5150 | `423c`, `423d` | `iwn-5150` | ThinkPad X200/X301 |
+| WiFi Link 1000 | `0083`, `0084` | `iwn-1000` | Budget 2009-2010 laptops |
+| Centrino Ultimate-N 6300 | `422b`, `4238` | `iwn-6000` | ThinkPad T410/W510, Dell E6410 |
+| **Centrino Advanced-N 6200** | **`422c`**, **`4239`** | **`iwn-6000`** | **Dell E6510**, ThinkPad T410 |
+| Centrino Advanced-N 6250 | `0087`, `0089` | `iwn-6050` | ThinkPad X201, Dell E6410 |
+| Centrino Advanced-N 6205 | `0082`, `0085` | `iwn-6005` | ThinkPad T420/T520, Dell E6420 |
+| Centrino Advanced-N 6030 | `0090`, `0091` | `iwn-6030` | HP EliteBook 8460p |
+| Centrino Advanced-N 6235 | `088e`, `088f` | `iwn-6235` | ThinkPad T430/X230, Dell E6430 |
+| WiFi Link 1030 | `008a`, `008b` | `iwn-1000` | Budget 2010-2011 laptops |
+| Centrino Wireless-N 2230 | `0887`, `0888` | `iwn-2030` | ThinkPad Edge, Dell Inspiron |
+| Centrino Wireless-N 2200 | `0890`, `0891` | `iwn-2000` | Budget 2012-2013 laptops |
+| Centrino Wireless-N 135 | `0892`, `0893` | `iwn-135` | Budget ultrabooks |
+| Centrino Wireless-N 105 | `0894`, `0895` | `iwn-105` | Budget 2012 laptops |
+| Centrino Wireless-N 130 | `0896`, `0897` | `iwn-130` | Budget 2011 laptops |
+| Centrino Wireless-N 100 | `08ae`, `08af` | `iwn-100` | Netbooks, budget laptops |
+
+All PCI IDs are vendor `8086` (Intel). These cards were shipped in millions of laptops from ~2007-2013. Any laptop from that era with Intel WiFi likely has one of these.
 
 ## File Layout
 
