@@ -15,7 +15,7 @@ CFLAGS = -O2 -msse4.2 \
 SHIM_CFLAGS = -I shim
 
 # Phase 1: EFI layer only (console + input + memory)
-EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c efi/mdns.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c
+EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c efi/mdns.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c iwn/iwn_crypto.c
 
 # Phase 3: UEFI libc shim (malloc/printf via UEFI Boot Services)
 LIBC_SRC  = efi/uefi_libc.c
@@ -50,7 +50,7 @@ OVMF_CODE ?= ovmf-code.fd
 OVMF_VARS ?= ovmf-vars.fd
 
 # Targets
-.PHONY: phase1 phase3 phase4 efi run clean usb img
+.PHONY: phase1 phase3 phase4 efi run clean usb img test-iwn-crypto
 
 # Model files (source paths)
 MODEL_BTW ?= ../models/base/SmolLM2-135M-Instruct/model.btw
@@ -186,6 +186,9 @@ export-vocab:
 		--model $(MODEL) \
 		--vocab-only \
 		--output esp/rwkvos/model.btw
+
+test-iwn-crypto: iwn/iwn_crypto.c iwn/test_crypto.c
+	cc -std=c11 -Wall -Wextra -O2 -o test_crypto iwn/test_crypto.c iwn/iwn_crypto.c && ./test_crypto && rm -f test_crypto
 
 clean:
 	rm -f $(ALL_OBJ) $(PHASE1_OBJ) $(PHASE3_OBJ) $(PHASE4_OBJ) \

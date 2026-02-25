@@ -63,13 +63,16 @@ bootai/iwn/
 ├── iwn_hw.c           # MMIO primitives, NIC lock, APM init/stop, EEPROM read, iwn_attach()
 ├── iwn_dma.c          # DMA memory allocation, TX/RX ring setup, scheduler table
 ├── iwn_fw.c           # Firmware parse/upload, hw_init sequence, calibration, host commands (big + small)
-└── iwn_scan.c         # Radio config, scan command, beacon parsing, result display
+├── iwn_scan.c         # Radio config, scan command, beacon parsing, result display
+├── iwn_crypto.h       # Crypto API: SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384
+├── iwn_crypto.c       # Self-contained crypto implementation (~490 lines, no libc)
+└── test_crypto.c      # Host-testable: 13 standard test vectors (FIPS, RFC, IEEE)
 ```
 
 Future phases will add:
 
 ```
-├── iwn_crypto.c       # WPA2-PSK (PBKDF2, HMAC-SHA1, AES-128, 4-way handshake)
+├── iwn_wpa.c          # WPA2-PSK 4-way EAPOL handshake (uses iwn_crypto + RNG)
 └── iwn_snp.c          # EFI_SIMPLE_NETWORK_PROTOCOL wrapper
 ```
 
@@ -476,11 +479,140 @@ Results are stored in `dev->scan_results[]` (max 32 entries), sorted by RSSI des
 | Scan silent, no error | Scan command content wrong | Compare probe body byte-for-byte with OpenBSD |
 | `rx[192]/rx[193]` streaming | Radio is working — this is good | Beacons from nearby APs after RXON |
 
-### Phase 4: Association + WPA2
+### Phase 4a: Crypto Primitives (done)
 
-- Implement RXON state machine (INIT → SCAN → AUTH → ASSOC → RUN)
-- WPA2-PSK crypto: SHA-1, HMAC-SHA1, PBKDF2, AES-128, PRF-384
-- 4-way EAPOL handshake
+Self-contained WPA2-PSK cryptographic building blocks. No UEFI dependencies — compiles and tests on the host, cross-compiles into the EFI binary unchanged.
+
+**Files**: `iwn_crypto.h` (API), `iwn_crypto.c` (implementation), `test_crypto.c` (verification)
+
+#### Primitives Implemented
+
+| Primitive | Standard | Purpose in WPA2 |
+|-----------|----------|-----------------|
+| SHA-1 | FIPS 180-4 | Foundation for HMAC and PBKDF2 |
+| HMAC-SHA1 | RFC 2104 | PRF building block, EAPOL MIC |
+| PBKDF2-SHA1 | RFC 2898 | Derive PMK from passphrase + SSID (4096 iterations) |
+| AES-128 | FIPS 197 | Block cipher for key unwrap and CCMP |
+| AES Key Unwrap | RFC 3394 | Unwrap GTK from EAPOL message 3 |
+| PRF-384 | IEEE 802.11i | Derive PTK (KCK + KEK + TK) from PMK + nonces + addresses |
+
+#### Design: Self-Contained Module
+
+The crypto module has zero external dependencies beyond `<stdint.h>` and `<stddef.h>`:
+
+- **Own memory ops**: Static `crypto_memcpy`, `crypto_memset`, `crypto_memcmp` — byte loops, no libc
+- **Own endian helpers**: `be32_load`, `be32_store`, `be64_store` — SHA-1 and AES use big-endian
+- **No UEFI headers**: Compiles identically with `cc` (host) and `x86_64-elf-gcc` (cross)
+- **No RNG**: Random number generation needs UEFI (`EFI_RNG_PROTOCOL`) or x86 (`RDTSC`), deferred to `iwn_wpa.c` in Phase 4c
+
+#### SHA-1 (FIPS 180-4)
+
+Streaming interface (`init`/`update`/`final`) required by HMAC, which feeds SHA-1 in two phases: ipad block then data, opad block then inner hash.
+
+- `sha1_transform(state, block)`: 80 rounds with W[16..79] expansion via ROTL1
+- Initial hash: `H0=0x67452301, H1=0xEFCDAB89, H2=0x98BADCFE, H3=0x10325476, H4=0xC3D2E1F0`
+- Round constants: `K[0..19]=0x5A827999, K[20..39]=0x6ED9EBA1, K[40..59]=0x8F1BBCDC, K[60..79]=0xCA62C1D6`
+- Padding: append `0x80`, zero-pad to 56 mod 64, append bit count as big-endian 64-bit
+
+#### HMAC-SHA1 (RFC 2104)
+
+```
+HMAC(K, text) = SHA1((K ^ opad) || SHA1((K ^ ipad) || text))
+```
+
+- ipad = 0x36, opad = 0x5C
+- Keys longer than 64 bytes are hashed to 20 bytes first
+
+#### PBKDF2-SHA1 (RFC 2898)
+
+Derives the 32-byte PMK from a WiFi passphrase and SSID:
+
+```
+PMK = PBKDF2(passphrase, SSID, 4096, 32)
+```
+
+- Block counter is 1-based, appended as big-endian uint32 to salt
+- T is initialized from U1 (not zeros), then XORed with U2..U_c
+- Two PBKDF2 blocks needed for 32-byte output (20 + 12 bytes)
+
+#### AES-128 (FIPS 197)
+
+Full encrypt and decrypt with precomputed key schedule:
+
+- **Key schedule**: 4 initial words expanded to 44 via `sub_word(rot_word(w)) ^ rcon`
+- **Context struct**: `iwn_aes_ctx` holds the 44-word expanded key, computed once in `iwn_aes128_init`
+- **State layout**: Column-major `state[r + 4*c]` per FIPS 197
+- **Encrypt**: AddRoundKey → 9× (SubBytes, ShiftRows, MixColumns, AddRoundKey) → SubBytes, ShiftRows, AddRoundKey
+- **Decrypt**: AddRoundKey(rk10) → 9× (InvShiftRows, InvSubBytes, AddRoundKey, InvMixColumns) → InvShiftRows, InvSubBytes, AddRoundKey(rk0)
+- **MixColumns**: Implemented via `xtime(a) = (a << 1) ^ ((a >> 7) * 0x1b)`
+
+Static S-box (256 bytes), inverse S-box (256 bytes), and Rcon[10] are compile-time constants.
+
+#### AES Key Unwrap (RFC 3394 Section 2.2.2)
+
+Used to unwrap the Group Temporal Key (GTK) from EAPOL message 3. The AP encrypts the GTK with the KEK (from PTK), and the station unwraps it.
+
+- Default IV: `0xA6 × 8` (integrity check value)
+- 6 rounds over n 64-bit data blocks, decrementing counter XORed into A
+- Returns -1 if integrity check fails (wrong KEK or corrupted data)
+
+#### PRF-384 (IEEE 802.11i Section 8.5.1.1)
+
+Derives the 48-byte Pairwise Transient Key (PTK) from the PMK:
+
+```
+PTK = PRF-384(PMK, "Pairwise key expansion" || 0x00 || min(AA,SPA) || max(AA,SPA) || min(ANonce,SNonce) || max(ANonce,SNonce))
+```
+
+The 48-byte PTK splits into:
+- KCK (bytes 0-15): Key Confirmation Key — HMAC-SHA1 MIC on EAPOL frames
+- KEK (bytes 16-31): Key Encryption Key — AES unwrap of GTK
+- TK (bytes 32-47): Temporal Key — AES-CCMP data encryption
+
+Implementation: 3 iterations of HMAC-SHA1 (3 × 20 = 60 bytes), truncated to 48.
+
+#### Test Vectors
+
+13 tests from published standards, all passing:
+
+| # | Test | Standard | What It Verifies |
+|---|------|----------|-----------------|
+| 1 | `sha1("abc")` | FIPS 180-4 | Basic single-block hash |
+| 2 | `sha1("")` | FIPS 180-4 | Empty input edge case |
+| 3 | `sha1(56 bytes)` | FIPS 180-4 | Two-block padding (56 bytes forces extra block) |
+| 4 | `hmac_sha1(0x0b×20, "Hi There")` | RFC 2202 Case 1 | Short key, short data |
+| 5 | `hmac_sha1("Jefe", "what do ya want...")` | RFC 2202 Case 2 | ASCII key and data |
+| 6 | `hmac_sha1(0xAA×20, 0xDD×50)` | RFC 2202 Case 3 | Repeated-byte key and long data |
+| 7 | `pbkdf2("password", "IEEE", 4096)` | IEEE 802.11i | Standard WiFi PMK derivation |
+| 8 | `pbkdf2("ThisIsAPassword", "ThisIsASSID", 4096)` | IEEE 802.11i | Longer passphrase and SSID |
+| 9 | AES-128 encrypt | FIPS 197 App B | Known key/plaintext/ciphertext triplet |
+| 10 | AES-128 roundtrip | FIPS 197 | Encrypt then decrypt returns original |
+| 11 | AES-128 encrypt | NIST SP 800-38A F.1.1 | ECB mode test vector |
+| 12 | AES Key Unwrap | RFC 3394 Section 4.1 | 128-bit KEK, 128-bit key data |
+| 13 | PRF-384 | Computed | Consistency check against manual HMAC-SHA1 |
+
+Build and run: `make test-iwn-crypto` (uses host `cc`, not cross-compiler)
+
+#### Common Implementation Gotchas
+
+| Bug | Prevention |
+|-----|-----------|
+| SHA-1 length in bytes not bits | Store `total_len * 8` as big-endian 64-bit in padding |
+| SHA-1 padding when buf_len == 56 | Need extra block — 0x80 fills last byte before length field |
+| HMAC key > 64 bytes not hashed | Check `key_len > 64` before zero-padding |
+| PBKDF2 T initialized to zeros | Copy U1 into T first, then XOR U2..U_c |
+| PBKDF2 off-by-one iterations | Loop `j = 1` to `iterations - 1` (U1 already done) |
+| AES state column-major | `state[r + 4*c]`, NOT `state[r*4 + c]` |
+| AES final round includes MixColumns | Round 10 skips MixColumns (encrypt) / InvMixColumns (decrypt) |
+| AES decrypt round key order | Start with rk[40..43], end with rk[0..3] |
+| PRF label includes null | `0x00` is a separator between label and data, not a string terminator |
+| AES unwrap direction | Must use `iwn_aes128_decrypt`, not encrypt |
+
+### Phase 4b-c: Association + WPA2 Handshake (planned)
+
+- RXON state machine (INIT → SCAN → AUTH → ASSOC → RUN)
+- 4-way EAPOL handshake using crypto primitives from Phase 4a
+- RNG via UEFI `EFI_RNG_PROTOCOL` or `RDTSC` fallback (in `iwn_wpa.c`)
 - Install temporal key for hardware CCMP
 
 ### Phase 5: SNP + Integration
@@ -517,3 +649,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-24 | Phase 2 calibration fix: add WiMAX coex command before calibration (required by 6000 series), fix RX ring buffer leak in `iwn_poll_rx`, fix calibration data length (`-4` not `-8`). Calibration now completes on Dell E6510 (1 result, 508 bytes). |
 | 2026-02-24 | Phase 3 initial: big-command path, radio config (4 commands), scan command, beacon parsing, RSSI calculation, security detection, result display |
 | 2026-02-24 | Phase 3 debugging: 10 bugs found on real hardware. Synchronous command waits (iwn_wait_cmd), simple BT coex for 6000 series, FH_INT clearing, 8-command config sequence (added LINK_QUALITY + TXPOWER_DBM + CRITICAL_TEMP), 802.11 probe frame header, CCK 1Mbps TX rate, IWN_FILTER_BEACON. See [debug log](../research/iwn-phase3-debug-log.md) |
+| 2026-02-25 | Phase 4a implemented: WPA2-PSK crypto primitives — SHA-1, HMAC-SHA1, PBKDF2-SHA1, AES-128, AES Key Unwrap (RFC 3394), PRF-384. Self-contained module (~490 lines), 13/13 test vectors passing (FIPS, RFC, IEEE). No UEFI dependencies. |
