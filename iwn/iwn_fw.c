@@ -405,33 +405,22 @@ int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len) {
         desc->segs[0].addr = IWN_LOADDR(cmd_paddr);
         desc->segs[0].len = (uint16_t)(IWN_HIADDR(cmd_paddr) | (totlen << 4));
     } else {
-        /* Big command — 2 segments: cmd header from ring, payload from DMA buf */
+        /* Big command — write directly into the ring's cmd buffer.
+         * The ring's DMA memory is known-good (works for small cmds).
+         * We have 256 × 140 bytes = 35 KB of contiguous DMA memory.
+         * Write 4-byte header + payload starting at the current slot. */
+        uint8_t *ring_buf = (uint8_t *)ring->cmd.vaddr +
+                            idx * sizeof(struct iwn_tx_cmd);
+        /* cmd header already written at ring_buf[0..3] */
+        iwn_memcpy(ring_buf + 4, payload, len);
 
-        /* Lazily allocate 4KB DMA buffer for big commands */
-        if (!dev->cmd_dma.vaddr) {
-            uint64_t addr = 0xFFFFFFFF;
-            EFI_STATUS s = gBS->AllocatePages(1, EfiLoaderData, 1, &addr);
-            if (s != EFI_SUCCESS) {
-                efi_print_ascii("  iwn: DMA alloc failed (cmd_dma)\r\n");
-                return -1;
-            }
-            dev->cmd_dma.paddr = addr;
-            dev->cmd_dma.vaddr = (void *)(uintptr_t)addr;
-            dev->cmd_dma.size = 4096;
-        }
+        uint16_t totlen = (uint16_t)(4 + len);
+        uint64_t buf_paddr = ring->cmd.paddr +
+                             idx * sizeof(struct iwn_tx_cmd);
 
-        /* Copy payload to DMA buffer */
-        iwn_memcpy(dev->cmd_dma.vaddr, payload, len);
-
-        /* Segment 0: 4-byte cmd header (code, flags, idx, qid) */
-        desc->nsegs = 2;
-        desc->segs[0].addr = IWN_LOADDR(cmd_paddr);
-        desc->segs[0].len = (uint16_t)(IWN_HIADDR(cmd_paddr) | (4 << 4));
-
-        /* Segment 1: payload from DMA buffer */
-        uint64_t dma_paddr = dev->cmd_dma.paddr;
-        desc->segs[1].addr = IWN_LOADDR(dma_paddr);
-        desc->segs[1].len = (uint16_t)(IWN_HIADDR(dma_paddr) | (len << 4));
+        desc->nsegs = 1;
+        desc->segs[0].addr = IWN_LOADDR(buf_paddr);
+        desc->segs[0].len = (uint16_t)(IWN_HIADDR(buf_paddr) | (totlen << 4));
     }
 
     /* Update scheduler byte count table */
@@ -826,7 +815,33 @@ int iwn_hw_init(iwn_dev *dev) {
         iwn_nic_unlock(dev);
     }
 
-    /* 18. Replay saved calibration results to runtime ucode */
+    /* Let scheduler settle before sending commands */
+    gBS->Stall(2000);  /* 2 ms */
+
+    /* 18. WiMAX coex + crystal calib + replay saved calibration to runtime FW.
+     * Same commands as init firmware post-alive, but replays saved results
+     * instead of querying fresh calibration. Per OpenBSD iwn5000_post_alive(). */
+
+    /* WiMAX coexistence (required before any radio commands) */
+    {
+        struct iwn5000_wimax_coex rt_wimax;
+        iwn_memset(&rt_wimax, 0, sizeof(rt_wimax));
+        iwn_cmd(dev, IWN5000_CMD_WIMAX_COEX, &rt_wimax, sizeof(rt_wimax));
+    }
+
+    /* Crystal calibration from EEPROM (also sent to runtime firmware) */
+    {
+        struct iwn5000_phy_calib_crystal rt_crystal;
+        iwn_memset(&rt_crystal, 0, sizeof(rt_crystal));
+        rt_crystal.code = IWN5000_PHY_CALIB_CRYSTAL;
+        rt_crystal.ngroups = 1;
+        rt_crystal.isvalid = 1;
+        rt_crystal.cap_pin[0] = (uint8_t)(dev->eeprom_crystal & 0xff);
+        rt_crystal.cap_pin[1] = (uint8_t)((dev->eeprom_crystal >> 16) & 0xff);
+        iwn_cmd(dev, IWN_CMD_PHY_CALIB, &rt_crystal, sizeof(rt_crystal));
+    }
+
+    /* Replay saved calibration results from init firmware */
     iwn_replay_calibration(dev);
 
     dev->fw_loaded = 1;

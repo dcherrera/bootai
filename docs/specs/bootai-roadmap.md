@@ -152,7 +152,7 @@ The driver has its own internal phases:
 | 0 | PCI probe — enumerate bus, match device IDs | COMPLETE |
 | 1 | MMIO + EEPROM — power on, read MAC/domain/RF config | COMPLETE |
 | 2 | DMA + Firmware — allocate rings, load firmware, get UC_READY | COMPLETE |
-| 3 | Scanning — RXON config, CMD_SCAN, parse beacon results | PLANNED |
+| 3 | Scanning — RXON config, CMD_SCAN, parse beacon results | COMPLETE |
 | 4 | Association + WPA2 — EAPOL handshake, CCMP keys | PLANNED |
 | 5 | SNP integration — EFI_SIMPLE_NETWORK_PROTOCOL wrapper | PLANNED |
 
@@ -160,7 +160,9 @@ The driver has its own internal phases:
 
 **IWN Phase 2** (2026-02-24): DMA memory allocation below 4GB (~2.5MB total), firmware parsing (legacy v2 format), FH DMA upload via service channel 9, TX/RX ring setup, full hardware init sequence with post-alive calibration. 9 bugs found and fixed during real-hardware testing.
 
-**Files**: `bootai/iwn/` — 8 source files (~1,500 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c)
+**IWN Phase 3** (2026-02-24): 8-command radio config sequence (BT_COEX, TX_ANT, RXON, ADD_NODE, LINK_QUALITY, TXPOWER, CRITICAL_TEMP, POWER) all succeed on Dell E6510. Radio receives beacons. Scan command built with proper 802.11 probe request frame. 10 bugs found and fixed during real-hardware debugging. See [IWN Phase 3 Debug Log](../research/iwn-phase3-debug-log.md).
+
+**Files**: `bootai/iwn/` — 9 source files (~2,300 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c, iwn_scan.c)
 
 **Firmware**: `iwlwifi-6000-4.ucode` (454KB, legacy v2 format) renamed to `iwn-6000`, placed in `\drivers\` on the EFI partition.
 

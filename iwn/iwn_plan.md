@@ -9,7 +9,7 @@ Port OpenBSD's `iwn` driver to UEFI for Intel 6200 WiFi on the Dell E6510.
 | 0 | Setup & Headers | Register headers, build system, PCI probe | **DONE** |
 | 1 | MMIO & EEPROM | Read hardware registers, dump EEPROM/MAC address | **DONE** |
 | 2 | DMA & Firmware | Allocate DMA rings, load firmware, get `UC_READY` | **DONE** |
-| 3 | Scan | Send scan command, parse results, print SSIDs | Pending |
+| 3 | Scan | Send scan command, parse results, print SSIDs | **DONE** |
 | 4 | Associate (Open) | Connect to an open network (no encryption) | Pending |
 | 5 | Crypto | AES-128, SHA-1, HMAC, PBKDF2, PRF | Pending |
 | 6 | WPA2-PSK | 4-way handshake, key install, encrypted data | Pending |
@@ -214,7 +214,7 @@ Boot → `iwn` → prints "Init firmware alive!" + "Runtime firmware alive!" + "
 ```
 
 - Both init and runtime firmware alive — Phase 2 goal achieved
-- Calibration timeout is non-blocking (needed for Phase 3+ radio quality, not for Phase 2)
+- Calibration timeout was resolved in Phase 3 (missing WiMAX coex command before calibration)
 - Total DMA allocation: ~2.5 MB below 4GB
 - Firmware file: `iwlwifi-6000-4.ucode` (454,608 bytes, legacy v2, API 4)
 
@@ -259,39 +259,99 @@ bootai/iwn/
 ### Tasks
 
 - [x] `iwn_cmd()` — host command sending via TX queue 4 (implemented in Phase 2)
-- [ ] Debug calibration timeout (deferred from Phase 2 — may resolve itself once commands are flowing)
-- [ ] Send initial configuration commands:
-  - `IWN_CMD_RXON` (0x10) — set MAC address, channel, filter flags
-  - `IWN_CMD_ADD_NODE` (0x18) — add broadcast node
-  - `IWN_CMD_SET_LED` (0x48)
-  - `IWN_CMD_SET_POWER_MODE` (0x77)
-  - `IWN_CMD_BT_COEX` (0x9B)
-  - `IWN5000_CMD_TX_ANT_CONFIG` (0x98)
-- [ ] Implement `iwn_scan()`:
-  - Build `IWN_CMD_SCAN` (0x80) with channel list (2.4 GHz: channels 1-11)
-  - Include probe request template in scan command
-  - Send command
-- [ ] Implement scan result parsing:
-  - Poll RX ring for `IWN_RX_DONE` notifications
-  - Parse beacon/probe response frames:
-    - Extract SSID from information elements (IE tag 0)
-    - Extract RSSI from `iwn_rx_stat`
-    - Extract security type (RSN IE tag 48 → WPA2, WPA IE → WPA)
-  - Handle `IWN_SCAN_DONE` notification — scan complete
-- [ ] Store scan results in a simple array (max 32 networks)
-- [ ] Print results: `SSID [signal dBm] [WPA2/Open]`
-- [ ] Wire to existing `wifi scan` REPL command
+- [x] Debug calibration timeout — resolved: missing WiMAX coex command before calibration
+- [x] Implement `iwn_wait_cmd()` — synchronous command wait (poll RX ring for response)
+- [x] Send 8 pre-scan configuration commands (matching OpenBSD `iwn_config()` exactly):
+  - `IWN_CMD_BT_COEX` (155) — simple Bluetooth coexistence (12-byte `iwn_bluetooth` struct for 6000 series)
+  - `IWN5000_CMD_TX_ANT_CONFIG` (152) — TX antenna chain mask
+  - `IWN_CMD_RXON` (16) — STA mode, 2.4 GHz, channel 1, broadcast BSSID, HT masks
+  - `IWN_CMD_ADD_NODE` (24) — broadcast node (ID 15)
+  - `IWN_CMD_LINK_QUALITY` (78) — CCK 1Mbps rate table for broadcast node
+  - `IWN_CMD_TXPOWER_DBM` (149) — 16 dBm TX power
+  - `IWN_CMD_SET_CRITICAL_TEMP` (164) — 110°C safety threshold
+  - `IWN_CMD_SET_POWER_MODE` (119) — CAM (continuously awake)
+- [x] Implement big command support for scan (>136 bytes via ring buffer DMA)
+- [x] Implement `iwn_send_scan()`:
+  - Build `IWN_CMD_SCAN` (128) with channel list (2.4 GHz: channels 1-11)
+  - Proper 802.11 probe request frame header (24 bytes) + SSID IE + rates IEs
+  - CCK 1Mbps TX rate with `IWN_RFLAG_CCK | IWN_RFLAG_ANT(B)` for 2.4 GHz
+  - Scan header with `IWN_FILTER_BEACON`, quiet_time=10ms, crc_threshold=NEVER
+  - ~938 bytes total, sent async via big-command path
+- [x] Implement scan result parsing:
+  - Poll RX ring for `IWN_START_SCAN` (130), `IWN_RX_PHY` (192), `IWN_MPDU_RX_DONE` (193), `IWN_STOP_SCAN` (132)
+  - Parse beacon/probe response frames (802.11 management frame TLV walk)
+  - Extract SSID (tag 0), channel (tag 3), WPA2 (tag 48), WPA (tag 221/OUI)
+  - RSSI: max of 3 antenna chains, subtract IWN_RSSI_TO_DBM (44)
+  - Clear both IWN_INT and IWN_FH_INT every iteration for continued DMA
+- [x] Store scan results in `dev->scan_results[]` (max 32 networks, deduplicated by BSSID)
+- [x] Print results sorted by RSSI: SSID, channel, RSSI, security type
+- [x] Wire to REPL command: `iwn scan`
 
 ### Test on Hardware
 
-Boot → `wifi scan` → should list nearby WiFi networks with names and signal strength.
+Boot → `iwn` → `iwn scan` → lists nearby WiFi networks.
+
+### Results (2026-02-24)
+
+```
+> iwn scan
+  INT before scan: 0x8c000001
+  Configuring radio...
+  BT_COEX ok
+  TX_ANT ok
+  RXON: flags=0x40008005 chain=0x2806 sz=50
+  RXON ok
+  ADD_NODE ok
+  rx[192]  rx[193]  rx[192]  rx[193]  rx[192]  rx[193]  LINKQ ok
+  rx[192]  TXPOW ok
+  rx[192]  rx[193]  rx[192]  rx[193]  CTEMP ok
+  rx[192]  rx[193]  POWER ok
+  SCAN cmd: len=938
+  rx[128]  Scanning ch 1  rx[131] 2  rx[131] 3  rx[131] 4  rx[131] 5  rx[131] 6
+  rx[131] 7  rx[131] 8  rx[131] 9  rx[131] 10  rx[131] 11  rx[131]
+  Scan complete: 11 channels, 7 networks found
+
+  #  SSID                              CH  RSSI  Security
+  1  Herrera                            11  -32   WPA2
+  2  Herrera                             1  -69   WPA2
+  3  (hidden)                            1  -69   WPA2
+  4  (hidden)                            1  -69   WPA2
+  5  (hidden)                           11  -84   WPA2
+  6  (hidden)                            6  -84   WPA2
+  7  STARLINK                            6  -85   Open
+  8  (hidden)                            6  -85   WPA2
+  9  DIRECT-e6-HP M283 LaserJet          1  -86   WPA2
+```
+
+- All 11 channels scanned, 9 networks found
+- Beacons (rx[192]/rx[193]) stream during config waits — radio is active
+- rx[128] = scan command acknowledged, rx[131] = per-channel scan complete
+- RSSI values are proper negative dBm (-32 strong to -86 weak)
+
+### Bugs Encountered (10 total)
+
+See [IWN Phase 3 Debug Log](../docs/research/iwn-phase3-debug-log.md) for full details.
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | Fire-and-forget commands → SW_ERR | `iwn_wait_cmd()` polls for response |
+| 2 | BT_COEX_PRIOTABLE (cmd 204) crashes 6000 FW | Remove — 6005/6050 only |
+| 3 | Advanced btcoex struct (~80B) crashes 6000 FW | Use simple `iwn_bluetooth` (12B) |
+| 4 | FH_INT not cleared → DMA stalls | Clear `IWN_FH_INT` (0x010) in all loops |
+| 5 | Missing LINK_QUALITY cmd | Add cmd 78 (CCK 1Mbps rate table) |
+| 6 | Missing TXPOWER_DBM cmd | Add cmd 149 (16 dBm) |
+| 7 | Missing CRITICAL_TEMP cmd | Add cmd 164 (110°C) |
+| 8 | Missing 802.11 probe frame header | Add 24-byte MAC header + SSID IE |
+| 9 | Wrong TX rate (OFDM 6Mbps) | CCK 1Mbps: `plcp=10, rflags=CCK\|ANT(B)` |
+| 10 | Missing IWN_FILTER_BEACON | Add to scan header filter |
+| 11 | RSSI wrong data offset | Cast through `iwn_rx_stat.phybuf` |
+| 12 | RSSI missing -44 offset | Formula: `max(rssi) - agc - 44` |
 
 ### Files
 
 ```
 bootai/iwn/
-├── iwn_cmd.c           ← Firmware command send/receive
-└── iwn_scan.c          ← Scan logic, result parsing
+└── iwn_scan.c          ← Radio config, scan command, beacon parsing, result display (~786 lines)
 ```
 
 ---
@@ -565,11 +625,12 @@ test-iwn-crypto: iwn/iwn_crypto.c iwn/test_crypto.c
 |------|--------|------------|
 | ~~Firmware won't load (DMA timing)~~ | ~~Blocks Phase 2+~~ | ~~Resolved: 9 bugs fixed, both init+runtime firmware alive~~ |
 | ~~EEPROM read fails on E6510~~ | ~~Blocks Phase 1~~ | ~~Resolved: OTP path works, MAC/domain/RF read successfully~~ |
-| Scan returns no results | Blocks Phase 3 | Check antenna config, TX power, regulatory domain |
+| ~~Scan returns no results~~ | ~~Blocks Phase 3~~ | ~~Resolved: 10 bugs fixed. Scan works — 7 networks found on Dell E6510~~ |
 | WPA2 handshake timing | Blocks Phase 6 | AP typically retries; add timeout + retry logic |
 | SNP binding fails | Blocks Phase 7 | May need `InstallMultipleProtocolInterfaces` with device path |
 | ~~Not enough memory for DMA~~ | ~~Blocks Phase 2~~ | ~~Resolved: ~2.5MB allocated below 4GB, no issues~~ |
-| Calibration timeout | Degrades Phase 3+ | 5 fixes applied, still times out. May need debug prints to trace command flow. Radio may work without it (degraded signal). |
+| ~~Calibration timeout~~ | ~~Degrades Phase 3+~~ | ~~Resolved: missing WiMAX coex command before calibration~~ |
+| ~~RSSI calculation off~~ | ~~Minor Phase 3~~ | ~~Resolved: wrong data offset + missing IWN_RSSI_TO_DBM. Formula: max(rssi) - agc - 44~~ |
 | Dell E6510 firmware quirks | Any phase | Test each phase on hardware, not just QEMU |
 
 ## Dependencies

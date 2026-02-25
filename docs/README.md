@@ -18,6 +18,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 ## Research
 
 - [Phase 2 Debug Log](research/phase2-debug-log.md) — Networking bring-up: bugs found, fixes applied
+- [IWN Phase 3 Debug Log](research/iwn-phase3-debug-log.md) — WiFi scanning bring-up: 10 bugs found on Dell E6510 (BT coex, FH_INT, missing commands, probe frame)
 
 ## Adding Documentation
 

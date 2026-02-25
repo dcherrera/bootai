@@ -266,27 +266,44 @@ After all sections uploaded:
 12. Release CPU → poll for UC_READY (init ucode alive)
 13. Clear RFKILL (3× IWN_UCODE_GP1_CLR)
 14. Activate TX scheduler (SCHED_DRAM_ADDR, queue 4 active, TXFACT)
-15. Send crystal calibration (PHY_CALIB) via TX ring 4
-16. Poll for CALIBRATION_DONE, save CALIBRATION_RESULT entries
-17. Power cycle (APM stop → APM init → NIC config)
-18. Reset rings, re-program hardware
-19. Upload RUNTIME firmware, release CPU → poll for UC_READY
-20. Clear RFKILL, activate scheduler, replay calibration results
-21. Intel WiFi ready!
+15. Send WiMAX coex (cmd 90, all zeros — required before calibration)
+16. Send crystal calibration (PHY_CALIB, cmd 176) via TX ring 4
+17. Send CALIB_CONFIG (cmd 101) — triggers firmware calibration
+18. Poll for CALIBRATION_DONE (103), save CALIBRATION_RESULT (102) entries
+19. Power cycle (APM stop → APM init → NIC config)
+20. Reset rings, re-program hardware
+21. Upload RUNTIME firmware, release CPU → poll for UC_READY
+22. Clear RFKILL, activate scheduler
+23. Send WiMAX coex + crystal calibration + replay saved calibration to runtime FW
+24. Intel WiFi ready!
 ```
 
 #### Calibration Flow
 
-After init firmware is alive, the driver sends a crystal calibration command derived from EEPROM data:
+After init firmware is alive, the driver sends calibration commands and collects results. The command sequence is critical — **WiMAX coexistence must be sent first**, otherwise the 6000 series firmware acknowledges the calibration commands but never actually runs calibration.
 
-```c
-struct iwn5000_phy_calib_crystal crystal_cmd;
-crystal_cmd.code = IWN5000_PHY_CALIB_CRYSTAL;  /* type 15 */
-crystal_cmd.cap_pin[0] = eeprom_crystal & 0xff;
-crystal_cmd.cap_pin[1] = (eeprom_crystal >> 16) & 0xff;
-```
+**Init firmware calibration sequence:**
+
+| # | Command | Code | Purpose |
+|---|---------|------|---------|
+| 1 | WiMAX coex | 90 | Disable WiMAX coexistence (all zeros). **Required** — without this, firmware stalls after acking calibration commands |
+| 2 | PHY_CALIB (crystal) | 176 | Crystal frequency calibration from EEPROM cap_pin values |
+| 3 | CALIB_CONFIG | 101 | Trigger full calibration sequence (enable=start=send=apply=flags=0xFFFFFFFF) |
 
 The firmware responds with `CALIBRATION_RESULT` (type 102) notifications containing calibration data, followed by `CALIBRATION_DONE` (type 103). The driver saves all calibration results and replays them to the runtime firmware after the power cycle.
+
+**Observed on Dell E6510 (6000 series):** 1 calibration result (508 bytes). The 6000 series produces LO + TX_IQ + BASE_BAND calibration data (may arrive as 1 combined or 3 separate results depending on firmware version).
+
+**Runtime firmware calibration:** After runtime firmware boots, the driver replays saved calibration results AND must also send WiMAX coex + crystal calibration to the runtime firmware before RXON.
+
+#### Calibration Bugs Found and Fixed
+
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| Missing WiMAX coex command | Init firmware acked calibration cmds but never ran calibration (5s timeout) | Send `IWN5000_CMD_WIMAX_COEX` (all zeros) before crystal calib |
+| `iwn_poll_rx` early return | Returned on `expected_type` match without advancing `rxq.cur` or updating `IWN_FH_RX_WPTR` — leaked RX buffer slots | Advance cur + update WPTR before returning 0 |
+| Calibration data length | `- sizeof(struct iwn_rx_desc)` (8) truncated data by 4 bytes | Changed to `- 4` per OpenBSD reference |
+| Unchecked cmd return values | Crystal calib + CALIB_CONFIG failures were silent | Check `iwn_cmd()` return, print error, abort early |
 
 #### Key Lessons Learned
 
@@ -314,56 +331,76 @@ First RF activity on real hardware. Configures the radio, sends a scan command a
 
 REPL commands: `iwn` (init) → `iwn scan`
 
+See [IWN Phase 3 Debug Log](../research/iwn-phase3-debug-log.md) for the full debugging narrative with 10 bugs found and fixed during hardware testing.
+
+#### Synchronous Command Waits
+
+UEFI has no interrupts — all RX ring processing is polling-based. The firmware can't handle overlapping commands, so each config command must wait for its response before sending the next:
+
+```c
+iwn_cmd(dev, CMD_CODE, payload, len);     // enqueue on TX ring 4
+iwn_wait_cmd(dev, CMD_CODE, "NAME", 200); // poll RX ring for matching response
+```
+
+`iwn_wait_cmd()` drains all notifications (logging unexpected types) until it finds `desc->type == cmd_code`. On each iteration it clears both `IWN_INT` and `IWN_FH_INT` registers to keep DMA flowing — the Flow Handler stalls if `IWN_FH_INT` (offset 0x010) is not cleared.
+
 #### Big Command Support
 
-The scan command is ~900 bytes, but `iwn_tx_cmd.data[]` is only 136 bytes. The driver now supports big commands via 2-segment TX descriptors:
-
-```
-Small command (≤136 bytes):     Big command (>136 bytes):
-┌──────────────┐                ┌──────────────┐    ┌──────────────┐
-│ Segment 0    │                │ Segment 0    │    │ Segment 1    │
-│ cmd header + │                │ cmd header   │    │ payload      │
-│ payload      │                │ (4 bytes)    │    │ (from DMA    │
-│ (from ring)  │                │ (from ring)  │    │  buffer)     │
-└──────────────┘                └──────────────┘    └──────────────┘
-desc->nsegs = 1                 desc->nsegs = 2
-```
-
-Segment 0 points to the 4-byte command header (code, flags, idx, qid) in the ring's `cmd` slot. Segment 1 points to the payload in a lazily-allocated 4 KB DMA page (`dev->cmd_dma`). The scheduler byte count covers both segments: `(4 + len + 3) / 4`.
+The scan command is ~930 bytes, but `iwn_tx_cmd.data[]` is only 136 bytes. For big commands, the payload is written directly into the TX ring's cmd buffer (known-good DMA memory below 4 GB) and referenced via a single-segment TX descriptor.
 
 #### Pre-Scan Radio Configuration
 
-Four commands sent before the scan, all using the small-command (≤136 byte) path:
+Eight commands must be sent before the scan, all synchronous. Order matches OpenBSD's `iwn_config()` + `iwn_add_broadcast_node()`:
 
 | # | Command | Code | Size | Purpose |
 |---|---------|------|------|---------|
-| 1 | RXON | 16 | ~50 B | Configure radio: STA mode, channel 1, 2.4 GHz, broadcast BSSID, RX chain config |
-| 2 | TX_ANT_CONFIG | 152 | 4 B | Set TX antenna chain mask |
-| 3 | ADD_NODE | 24 | ~92 B | Add broadcast node (ID 15, MAC FF:FF:FF:FF:FF:FF) |
-| 4 | BT_COEX | 155 | ~65 B | Disable Bluetooth coexistence |
+| 1 | BT_COEX | 155 | 12 B | Simple Bluetooth coexistence (required before RXON) |
+| 2 | TX_ANT_CONFIG | 152 | 4 B | TX antenna chain mask |
+| 3 | RXON | 16 | 50 B | Radio on: STA mode, channel 1, 2.4 GHz, HT masks |
+| 4 | ADD_NODE | 24 | 92 B | Broadcast node (ID 15, MAC FF:FF:FF:FF:FF:FF) |
+| 5 | LINK_QUALITY | 78 | 136 B | TX rate table for broadcast node (CCK 1Mbps × 16 retries) |
+| 6 | TXPOWER_DBM | 149 | 12 B | TX power: 16 dBm (required for firmware to transmit) |
+| 7 | SET_CRITICAL_TEMP | 164 | 8 B | Safety threshold: 110°C |
+| 8 | SET_POWER_MODE | 119 | 16 B | CAM (continuously awake mode) |
 
-RXON flags: `IWN_RXON_24GHZ | IWN_RXON_AUTO | IWN_RXON_SHSLOT`
-Filter: `IWN_FILTER_MULTICAST`
-RX chain: `DRIVER_FORCE | VALID(chains) | FORCE_SEL(chains) | IDLE_COUNT(2) | MIMO_COUNT(2)`
+**BT_COEX**: Plain 6000 series uses the simple `iwn_bluetooth` struct (12 bytes). The advanced `iwn6000_btcoex_config` (~80 bytes) and `BT_COEX_PRIOTABLE` (cmd 204) / `BT_COEX_PROT` (cmd 205) are for 6005/6050 only — the 6000 firmware crashes on these.
+
+**RXON config**:
+- Flags: `IWN_RXON_TSF | IWN_RXON_CTS_TO_SELF | IWN_RXON_AUTO | IWN_RXON_24GHZ`
+- Filter: `IWN_FILTER_MULTICAST`
+- RX chain: `VALID(chains) | IDLE_COUNT(2) | MIMO_COUNT(2)` (firmware manages chain selection)
+- HT masks: `ht_single_mask = ht_dual_mask = ht_triple_mask = 0xff`
+- MAC address and WLAP set from EEPROM, BSSID all-zeros (unassociated)
+
+**LINK_QUALITY**: All 16 retry entries set to CCK 1Mbps (`plcp=10, rflags=CCK|ANT(B)`). Without this, firmware doesn't know what rate to use for probe requests.
+
+**TXPOWER_DBM**: `global_limit = 32` (16 dBm × 2), `flags = NO_CLOSED`, `srv_limit = AUTO`. Without this, firmware cannot transmit.
 
 #### Scan Command Layout
 
-The scan command (code 128, `IWN_CMD_SCAN`) is a variable-length buffer built in `iwn_send_scan()`:
+The scan command (code 128, `IWN_CMD_SCAN`) is built in `iwn_send_scan()`:
 
 ```
 Offset   Size        Content
-0        32 B        iwn_scan_hdr — nchan=11, rxchain, flags, filter, crc_threshold=0xffff
-32       44 B        iwn_cmd_data — TX params for probe requests (6 Mbps OFDM, auto-seq)
-76       680 B       20 × iwn_scan_essid — all zeroed (broadcast/wildcard scan)
-756      16 B        Probe body — Supported Rates IE (8 rates) + Extended Rates IE (4 rates)
-772      132 B       11 × iwn_scan_chan — channels 1-11, active scan, 30ms/110ms dwell
+0        28 B        iwn_scan_hdr — nchan=11, quiet_time=10, quiet_threshold=1,
+                     crc_threshold=0xffff, rxchain=DRIVER_FORCE|VALID|FORCE_SEL|FORCE_MIMO,
+                     flags=24GHZ|AUTO, filter=MULTICAST|BEACON
+28       56 B        iwn_cmd_data — TX params: CCK 1Mbps, auto-seq, broadcast ID 15,
+                     tx->len = 42 (full probe frame size)
+84       680 B       20 × iwn_scan_essid — all zeroed (broadcast scan)
+764      42 B        Probe request frame body:
+                       [24 B] 802.11 MAC header (FC=probe_req, DA=bcast, SA=MAC, BSSID=bcast)
+                       [2 B]  SSID IE (tag=0, len=0)
+                       [10 B] Supported Rates IE (1/2/5.5/11/6/9/12/18 Mbps)
+                       [6 B]  Extended Rates IE (24/36/48/54 Mbps)
+806      132 B       11 × iwn_scan_chan — channels 1-11, active scan, 30ms/120ms dwell
                      ─────────
-Total    ~904 B      Sent via big-command path
+Total    ~938 B      Sent via big-command path (async, no response expected)
 ```
 
-Channel parameters: `IWN_CHAN_ACTIVE | IWN_CHAN_NPBREQS(2)`, `rf_gain=0x28`, `dsp_gain=0x50`.
+The scan is asynchronous — results come as RX notifications (`START_SCAN` 130, `RX_PHY` 192, `MPDU_RX_DONE` 193, `STOP_SCAN` 132).
 
-The `crc_threshold` is set to `IWN_GOOD_CRC_TH_NEVER` (0xffff) to work around a firmware bug where `CRC_TH_DISABLED` (0) triggers a sysassert on radar channels.
+Channel parameters: `IWN_CHAN_ACTIVE`, `rf_gain=0x28`, `dsp_gain=0x6e`. The `crc_threshold` is set to `IWN_GOOD_CRC_TH_NEVER` (0xffff) to work around a firmware sysassert bug on zero threshold.
 
 #### RX Polling and Beacon Parsing
 
@@ -375,7 +412,10 @@ After sending the scan command, `iwn_poll_scan_results()` polls the RX ring for 
 | `IWN_RX_PHY` | 192 | Cache RSSI: max of 3 antenna chains, subtract 44 dBm offset |
 | `IWN_MPDU_RX_DONE` | 193 | Parse beacon frame from `iwn_rx_mpdu` → `iwn_parse_beacon()` |
 | `IWN_STOP_SCAN` | 132 | Scan complete — print summary, return |
-| Other | — | Ignored (stats, calibration remnants, etc.) |
+| `REPLY_ERROR` | 2 | Firmware rejected command — print error code |
+| Other | — | Log notification type |
+
+Both `IWN_INT` and `IWN_FH_INT` are cleared every iteration to keep DMA flowing.
 
 **RSSI calculation**: Each `IWN_RX_PHY` notification contains per-chain RSSI values in `iwn5000_rx_phystat.rssi[3]`. The driver takes the maximum across chains and subtracts `IWN_RSSI_TO_DBM` (44) to convert to dBm. If no PHY notification precedes an MPDU, RSSI defaults to -100.
 
@@ -391,38 +431,50 @@ After sending the scan command, `iwn_poll_scan_results()` polls the RX ring for 
 
 Results are stored in `dev->scan_results[]` (max 32 entries), sorted by RSSI descending for display.
 
-#### Expected Output
+#### Hardware Test Results (Dell E6510)
 
 ```
 > iwn scan
   Configuring radio...
-  Scanning ch 1 2 3 4 5 6 7 8 9 10 11
-  Scan complete: 11 channels, 5 networks found
+  BT_COEX ok
+  TX_ANT ok
+  RXON ok
+  ADD_NODE ok
+  rx[192] rx[193] rx[192] rx[193] rx[192] rx[193]  LINKQ ok
+  rx[192] TXPOW ok
+  rx[192] rx[193] rx[192] rx[193]  CTEMP ok
+  rx[192] rx[193]  POWER ok
+  SCAN cmd: len=938
+  rx[128]  Scanning ch 1  rx[131] 2  rx[131] 3 ... 10  rx[131] 11  rx[131]
+  Scan complete: 11 channels, 9 networks found
 
   #  SSID                              CH  RSSI  Security
-  1  HomeNetwork                        6  -42   WPA2
-  2  CoffeeShop                         1  -68   Open
-  3  Neighbor5G                         11  -75   WPA2
-  4  (hidden)                            3  -80   WPA2
-  5  ATT-XXXX                            9  -82   WPA+WPA2
+  1  Herrera                            11  -32   WPA2
+  2  Herrera                             1  -69   WPA2
+  3  (hidden)                            1  -69   WPA2
+  4  (hidden)                            1  -69   WPA2
+  5  (hidden)                           11  -84   WPA2
+  6  (hidden)                            6  -84   WPA2
+  7  STARLINK                            6  -85   Open
+  8  (hidden)                            6  -85   WPA2
+  9  DIRECT-e6-HP M283 LaserJet          1  -86   WPA2
 ```
+
+- All 11 channels scanned, 9 networks found
+- Beacons (`rx[192]`/`rx[193]`) stream after RXON — radio is active
+- `rx[128]` = scan command ack, `rx[131]` = per-channel scan complete
+- RSSI: proper negative dBm (-32 strong to -86 weak)
+- RSSI formula: `max(chain_rssi) - agc - IWN_RSSI_TO_DBM` via `iwn_rx_stat.phybuf`
 
 #### Debug Guide
 
-If scanning doesn't work on first try:
-
-| Symptom | Likely Cause | Check |
-|---------|-------------|-------|
-| No `IWN_START_SCAN` (130) | RXON rejected or scan cmd malformed | Check `IWN_INT` for `SW_ERR` after RXON |
-| `IWN_START_SCAN` but no `IWN_MPDU_RX_DONE` (193) | Radio not receiving | Check antenna config, RF/DSP gain values |
-| `IWN_STOP_SCAN` with `nchan=0` | Firmware aborted scan | Check channel list validity |
-| RSSI all -100 | PHY notifications missing | Firmware may not send `IWN_RX_PHY` on this API version |
-| No scan results but frames received | Frame parsing issue | Check frame control, BSSID extraction offset |
-
-**Incremental testing** if full scan fails:
-1. Send only RXON → poll for any RX notification
-2. Send RXON + scan → check for `IWN_START_SCAN`
-3. Full scan with frame parsing
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| SW_ERR after any command | Wrong struct size or unsupported command | Compare struct size with OpenBSD exactly |
+| No notifications during poll | FH_INT not cleared | Ensure `iwn_write(dev, IWN_FH_INT, 0xffffffff)` in every loop |
+| Config ok but scan silent | Missing commands (TXPOWER, LINK_QUALITY) | Send all 8 commands per OpenBSD sequence |
+| Scan silent, no error | Scan command content wrong | Compare probe body byte-for-byte with OpenBSD |
+| `rx[192]/rx[193]` streaming | Radio is working — this is good | Beacons from nearby APs after RXON |
 
 ### Phase 4: Association + WPA2
 
@@ -462,4 +514,6 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-23 | Phase 1 implemented: MMIO, APM, OTP, EEPROM read — MAC/domain/RF confirmed on Dell E6510 |
 | 2026-02-24 | Phase 2 implemented: DMA rings, firmware parse (legacy v2), FH DMA upload, hw_init sequence |
 | 2026-02-24 | Phase 2 bug fixes: 9 bugs found and fixed (wrong DMA channel, missing TXBUF_STATUS, NIC lock, DMA enable, shadow regs, VMAIN, nic_config, RFKILL, scheduler timing) |
-| 2026-02-24 | Phase 3 implemented: big-command path (2-segment TX descriptors), radio config (RXON + node + antenna + BT coex), scan command (~900 bytes, 11 channels), beacon/probe response parsing, RSSI calculation, security detection (WPA/WPA2), sorted result display |
+| 2026-02-24 | Phase 2 calibration fix: add WiMAX coex command before calibration (required by 6000 series), fix RX ring buffer leak in `iwn_poll_rx`, fix calibration data length (`-4` not `-8`). Calibration now completes on Dell E6510 (1 result, 508 bytes). |
+| 2026-02-24 | Phase 3 initial: big-command path, radio config (4 commands), scan command, beacon parsing, RSSI calculation, security detection, result display |
+| 2026-02-24 | Phase 3 debugging: 10 bugs found on real hardware. Synchronous command waits (iwn_wait_cmd), simple BT coex for 6000 series, FH_INT clearing, 8-command config sequence (added LINK_QUALITY + TXPOWER_DBM + CRITICAL_TEMP), 802.11 probe frame header, CCK 1Mbps TX rate, IWN_FILTER_BEACON. See [debug log](../research/iwn-phase3-debug-log.md) |

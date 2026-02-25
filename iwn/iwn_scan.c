@@ -32,57 +32,169 @@ static void print_signed_dec(int val) {
     print_dec((uint32_t)val);
 }
 
+/* ---- Drain stale RX notifications ---- */
+
+static void iwn_drain_rx(iwn_dev *dev) {
+    struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
+    uint32_t hw_idx = stat->closed_count & 0x0fff;
+    int drained = 0;
+
+    efi_print_ascii("  Drain:");
+    while ((uint32_t)dev->rxq.cur != hw_idx) {
+        void *buf = dev->rxq.buf[dev->rxq.cur].vaddr;
+        struct iwn_rx_desc *desc = (struct iwn_rx_desc *)buf;
+        efi_print_ascii(" t");
+        print_dec((uint32_t)desc->type);
+        dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
+        drained++;
+    }
+
+    if (drained > 0) {
+        iwn_write(dev, IWN_FH_RX_WPTR,
+            ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) %
+             IWN_RX_RING_COUNT) & ~7);
+    }
+    efi_print_ascii(" (");
+    print_dec((uint32_t)drained);
+    efi_print_ascii(" total)\r\n");
+
+    /* Check if firmware already crashed during runtime init */
+    uint32_t intr = iwn_read(dev, IWN_INT);
+    efi_print_ascii("  INT before scan: 0x");
+    print_hex8((uint8_t)(intr >> 24));
+    print_hex8((uint8_t)(intr >> 16));
+    print_hex8((uint8_t)(intr >> 8));
+    print_hex8((uint8_t)intr);
+    if (intr & IWN_INT_SW_ERR)
+        efi_print_ascii(" ** SW_ERR already set!");
+    if (intr & IWN_INT_HW_ERR)
+        efi_print_ascii(" ** HW_ERR already set!");
+    efi_print_ascii("\r\n");
+    iwn_write(dev, IWN_INT, intr);  /* clear */
+    iwn_write(dev, IWN_FH_INT, 0xffffffff);  /* clear FH too */
+}
+
+/* ---- Wait for command response on RX ring ---- */
+/*
+ * Poll RX ring for a response to a sent command (matching type == cmd code).
+ * Also handles type-28 TX_DONE notifications. Returns 0 on success, -1 on
+ * timeout or firmware error. Drains all notifications up to the response.
+ *
+ * OpenBSD's iwn_cmd() with async=0 sleeps until the interrupt handler
+ * processes the TX_DONE. We approximate this by polling.
+ */
+static int iwn_wait_cmd(iwn_dev *dev, uint8_t cmd_code, const char *cmd_name,
+                        int timeout_ms) {
+    struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
+
+    for (int t = 0; t < timeout_ms; t++) {
+        uint32_t hw_idx = stat->closed_count & 0x0fff;
+
+        while ((uint32_t)dev->rxq.cur != hw_idx) {
+            void *buf = dev->rxq.buf[dev->rxq.cur].vaddr;
+            struct iwn_rx_desc *desc = (struct iwn_rx_desc *)buf;
+
+            if (desc->type == cmd_code) {
+                /* Got our command response */
+                dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
+                iwn_write(dev, IWN_FH_RX_WPTR,
+                    ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) %
+                     IWN_RX_RING_COUNT) & ~7);
+                return 0;
+            }
+
+            /* Log other notification types */
+            if (desc->type != 0) {
+                efi_print_ascii("  rx[");
+                print_dec((uint32_t)desc->type);
+                efi_print_ascii("] ");
+            }
+
+            dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
+        }
+
+        /* Update WPTR and clear interrupt status so FH continues DMA */
+        iwn_write(dev, IWN_FH_RX_WPTR,
+            ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) %
+             IWN_RX_RING_COUNT) & ~7);
+        iwn_write(dev, IWN_INT, 0xffffffff);
+        iwn_write(dev, IWN_FH_INT, 0xffffffff);
+
+        gBS->Stall(1000);  /* 1 ms */
+    }
+
+    /* Timeout — check if firmware crashed */
+    uint32_t intr = iwn_read(dev, IWN_INT);
+    efi_print_ascii("  ");
+    efi_print_ascii(cmd_name);
+    efi_print_ascii(": timeout (INT=0x");
+    print_hex8((uint8_t)(intr >> 24));
+    print_hex8((uint8_t)(intr >> 16));
+    print_hex8((uint8_t)(intr >> 8));
+    print_hex8((uint8_t)intr);
+    efi_print_ascii(")\r\n");
+    return -1;
+}
+
 /* ---- Pre-scan radio configuration ---- */
 
 static int iwn_config_radio(iwn_dev *dev) {
-    /*
-     * Clear any stale interrupt flags before configuring radio.
-     * The calibration timeout during init may have set SW_ERR, and
-     * the runtime firmware boot could have set flags too. Without
-     * clearing, we'd read a stale SW_ERR after RXON.
-     */
+    /* Clear stale interrupt flags */
     iwn_write(dev, IWN_INT, 0xffffffff);
 
-    /* 1. Disable Bluetooth coexistence (must be before RXON) */
-    struct iwn6000_btcoex_config btcoex;
-    iwn_memset(&btcoex, 0, sizeof(btcoex));
-    btcoex.flags = IWN_BT_COEX6000_MODE_DISABLED;
+    /* 1. Simple Bluetooth coexistence for 6000 series (must be before RXON)
+     * Reference: OpenBSD iwn_send_btcoex() — simple struct for plain 6000.
+     * Advanced btcoex (iwn6000_btcoex_config + PRIOTABLE + PROT) is for
+     * 6005/6050 only — the 6000 firmware crashes on those. */
+    {
+        struct iwn_bluetooth bt;
+        iwn_memset(&bt, 0, sizeof(bt));
+        bt.flags = IWN_BT_COEX_CHAN_ANN | IWN_BT_COEX_BT_PRIO;
+        bt.lead_time = IWN_BT_LEAD_TIME_DEF;
+        bt.max_kill = IWN_BT_MAX_KILL_DEF;
 
-    if (iwn_cmd(dev, IWN_CMD_BT_COEX, &btcoex, sizeof(btcoex)) != 0) {
-        efi_print_ascii("  iwn: BT_COEX failed\r\n");
-        return -1;
+        if (iwn_cmd(dev, IWN_CMD_BT_COEX, &bt, sizeof(bt)) != 0) {
+            efi_print_ascii("  iwn: BT_COEX send failed\r\n");
+            return -1;
+        }
+        if (iwn_wait_cmd(dev, IWN_CMD_BT_COEX, "BT_COEX", 200) != 0)
+            return -1;
+        efi_print_ascii("  BT_COEX ok\r\n");
     }
 
     /* 2. TX antenna configuration */
     uint32_t ant = dev->txchainmask;
     if (iwn_cmd(dev, IWN5000_CMD_TX_ANT_CONFIG, &ant, sizeof(ant)) != 0) {
-        efi_print_ascii("  iwn: TX_ANT_CONFIG failed\r\n");
+        efi_print_ascii("  iwn: TX_ANT_CONFIG send failed\r\n");
         return -1;
     }
+    if (iwn_wait_cmd(dev, IWN5000_CMD_TX_ANT_CONFIG, "TX_ANT", 200) != 0)
+        return -1;
+    efi_print_ascii("  TX_ANT ok\r\n");
 
-    /* 3. RXON — configure radio for station mode, 2.4 GHz */
+    /* 3. RXON — configure radio for station mode, 2.4 GHz
+     * Reference: OpenBSD iwn_config() for unassociated STA state */
     struct iwn_rxon rxon;
     iwn_memset(&rxon, 0, sizeof(rxon));
 
-    /* MAC addresses — myaddr and wlap must both be set (per OpenBSD) */
+    /* MAC addresses — myaddr and wlap must both be set */
     iwn_memcpy(rxon.myaddr, dev->mac_addr, 6);
     iwn_memcpy(rxon.wlap, dev->mac_addr, 6);
 
-    /* Broadcast BSSID (unassociated scan) */
-    iwn_memset(rxon.bssid, 0xff, 6);
+    /* BSSID left as all-zeros for unassociated state.
+     * Firmware rejects multicast BSSID (LSB=1 check). */
 
     rxon.mode = IWN_MODE_STA;
     rxon.chan = 1;
-    rxon.flags = htole32(IWN_RXON_24GHZ | IWN_RXON_AUTO | IWN_RXON_SHSLOT);
+    rxon.flags = htole32(IWN_RXON_TSF | IWN_RXON_CTS_TO_SELF |
+                         IWN_RXON_AUTO | IWN_RXON_24GHZ);
     rxon.filter = htole32(IWN_FILTER_MULTICAST);
 
-    /* RX chain configuration from device capabilities */
+    /* RX chain: STA mode — let firmware manage chain selection.
+     * Only DRIVER_FORCE + FORCE_SEL is for monitor mode (per OpenBSD). */
     uint8_t chains = dev->rxchainmask;
     rxon.rxchain = htole16(
-        IWN_RXCHAIN_DRIVER_FORCE |
         IWN_RXCHAIN_VALID(chains) |
-        IWN_RXCHAIN_FORCE_SEL(chains) |
-        IWN_RXCHAIN_FORCE_MIMO_SEL(chains) |
         IWN_RXCHAIN_IDLE_COUNT(2) |
         IWN_RXCHAIN_MIMO_COUNT(2));
 
@@ -94,44 +206,121 @@ static int iwn_config_radio(iwn_dev *dev) {
     rxon.ht_dual_mask = 0xff;
     rxon.ht_triple_mask = 0xff;
 
-    /* Clear interrupts again right before RXON for clean error check */
-    iwn_write(dev, IWN_INT, 0xffffffff);
+    efi_print_ascii("  RXON: flags=0x");
+    {
+        uint32_t f = rxon.flags;
+        print_hex8((uint8_t)(f >> 24));
+        print_hex8((uint8_t)(f >> 16));
+        print_hex8((uint8_t)(f >> 8));
+        print_hex8((uint8_t)f);
+    }
+    efi_print_ascii(" chain=0x");
+    {
+        uint16_t c = rxon.rxchain;
+        print_hex8((uint8_t)(c >> 8));
+        print_hex8((uint8_t)c);
+    }
+    efi_print_ascii(" sz=");
+    print_dec((uint32_t)IWN5000_RXONSZ);
+    efi_print_ascii("\r\n");
 
     if (iwn_cmd(dev, IWN_CMD_RXON, &rxon, IWN5000_RXONSZ) != 0) {
-        efi_print_ascii("  iwn: RXON cmd send failed\r\n");
+        efi_print_ascii("  iwn: RXON send failed\r\n");
         return -1;
     }
+    if (iwn_wait_cmd(dev, IWN_CMD_RXON, "RXON", 200) != 0)
+        return -1;
+    efi_print_ascii("  RXON ok\r\n");
 
-    /* Wait for firmware to process RXON, then check for errors */
-    gBS->Stall(5000);  /* 5 ms */
-
-    uint32_t intr = iwn_read(dev, IWN_INT);
-    iwn_write(dev, IWN_INT, intr);  /* clear what we read */
-    if (intr & IWN_INT_SW_ERR) {
-        /*
-         * SW_ERR is common when calibration data is missing (calibration
-         * timeout during init). OpenBSD never checks IWN_INT after RXON —
-         * the error is non-fatal. Continue scanning; if the radio is truly
-         * broken, the scan will simply time out with no results.
-         */
-        efi_print_ascii("  iwn: SW_ERR after RXON (0x");
-        print_hex8((uint8_t)(intr >> 24));
-        print_hex8((uint8_t)(intr >> 16));
-        print_hex8((uint8_t)(intr >> 8));
-        print_hex8((uint8_t)intr);
-        efi_print_ascii(") — continuing anyway\r\n");
-    }
-
-    /* 4. Add broadcast node */
+    /* 4. Add broadcast node (must be before LINK_QUALITY) */
     struct iwn_node_info node;
     iwn_memset(&node, 0, sizeof(node));
     node.id = IWN5000_ID_BROADCAST;
     iwn_memset(node.macaddr, 0xff, 6);
 
     if (iwn_cmd(dev, IWN_CMD_ADD_NODE, &node, sizeof(node)) != 0) {
-        efi_print_ascii("  iwn: ADD_NODE failed\r\n");
+        efi_print_ascii("  iwn: ADD_NODE send failed\r\n");
         return -1;
     }
+    if (iwn_wait_cmd(dev, IWN_CMD_ADD_NODE, "ADD_NODE", 200) != 0)
+        return -1;
+    efi_print_ascii("  ADD_NODE ok\r\n");
+
+    /* 5. Link quality for broadcast node — tells firmware what TX rate
+     * to use for probe requests. Without this, scan can't transmit.
+     * Reference: OpenBSD iwn_add_broadcast_node() */
+    {
+        struct iwn_cmd_link_quality linkq;
+        iwn_memset(&linkq, 0, sizeof(linkq));
+        linkq.id = IWN5000_ID_BROADCAST;
+        linkq.antmsk_1stream = (uint8_t)IWN_LSB(dev->txchainmask);
+        linkq.antmsk_2stream = IWN_ANT_AB;
+        linkq.ampdu_max = IWN_AMPDU_MAX_NO_AGG;
+        linkq.ampdu_threshold = 3;
+        linkq.ampdu_limit = htole16(4000);
+
+        /* CCK 1 Mbps for all 16 retry entries (2.4 GHz) */
+        uint8_t txant = (uint8_t)IWN_LSB(dev->txchainmask);
+        for (int i = 0; i < IWN_MAX_TX_RETRIES; i++) {
+            linkq.retry[i].plcp = 10;  /* CCK 1 Mbps */
+            linkq.retry[i].rflags = IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant);
+        }
+
+        if (iwn_cmd(dev, IWN_CMD_LINK_QUALITY, &linkq, sizeof(linkq)) != 0) {
+            efi_print_ascii("  iwn: LINK_QUALITY send failed\r\n");
+            return -1;
+        }
+        if (iwn_wait_cmd(dev, IWN_CMD_LINK_QUALITY, "LINKQ", 200) != 0)
+            return -1;
+        efi_print_ascii("  LINKQ ok\r\n");
+    }
+
+    /* 6. TX power — firmware can't transmit without this.
+     * Reference: OpenBSD iwn5000_set_txpower() */
+    {
+        struct iwn5000_cmd_txpower txpow;
+        iwn_memset(&txpow, 0, sizeof(txpow));
+        txpow.global_limit = 2 * IWN5000_TXPOWER_MAX_DBM;  /* 32 = 16 dBm */
+        txpow.flags = IWN5000_TXPOWER_NO_CLOSED;
+        txpow.srv_limit = IWN5000_TXPOWER_AUTO;
+
+        if (iwn_cmd(dev, IWN_CMD_TXPOWER_DBM, &txpow, sizeof(txpow)) != 0) {
+            efi_print_ascii("  iwn: TXPOWER send failed\r\n");
+            return -1;
+        }
+        if (iwn_wait_cmd(dev, IWN_CMD_TXPOWER_DBM, "TXPOW", 200) != 0)
+            return -1;
+        efi_print_ascii("  TXPOW ok\r\n");
+    }
+
+    /* 7. Critical temperature threshold
+     * Reference: OpenBSD iwn_set_critical_temp() */
+    {
+        iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_CTEMP_STOP_RF);
+
+        struct iwn_critical_temp crit;
+        iwn_memset(&crit, 0, sizeof(crit));
+        crit.tempR = htole32(110);  /* 110 degrees C */
+
+        if (iwn_cmd(dev, IWN_CMD_SET_CRITICAL_TEMP, &crit, sizeof(crit)) != 0) {
+            efi_print_ascii("  iwn: CRIT_TEMP send failed\r\n");
+            return -1;
+        }
+        if (iwn_wait_cmd(dev, IWN_CMD_SET_CRITICAL_TEMP, "CTEMP", 200) != 0)
+            return -1;
+        efi_print_ascii("  CTEMP ok\r\n");
+    }
+
+    /* 8. Set power mode to CAM (last, per OpenBSD ordering) */
+    struct iwn_pmgt_cmd pmgt;
+    iwn_memset(&pmgt, 0, sizeof(pmgt));  /* all zeros = CAM, no power save */
+    if (iwn_cmd(dev, IWN_CMD_SET_POWER_MODE, &pmgt, sizeof(pmgt)) != 0) {
+        efi_print_ascii("  iwn: POWER send failed\r\n");
+        return -1;
+    }
+    if (iwn_wait_cmd(dev, IWN_CMD_SET_POWER_MODE, "POWER", 200) != 0)
+        return -1;
+    efi_print_ascii("  POWER ok\r\n");
 
     return 0;
 }
@@ -155,24 +344,22 @@ static int iwn_send_scan(iwn_dev *dev) {
     /* ---- Scan header ---- */
     struct iwn_scan_hdr *hdr = (struct iwn_scan_hdr *)ptr;
     hdr->nchan = 11;  /* 2.4 GHz channels 1-11 */
-    hdr->quiet_time = 0;
-    hdr->quiet_threshold = 0;
+    hdr->quiet_time = htole16(10);       /* move to next chan if no frames in 10ms */
+    hdr->quiet_threshold = htole16(1);   /* min 1 packet before quiet_time starts */
     hdr->crc_threshold = IWN_GOOD_CRC_TH_NEVER;
 
-    /* RX chain for scan — same as RXON */
+    /* RX chain for scan — force all available antennas (per OpenBSD) */
     uint8_t chains = dev->rxchainmask;
     hdr->rxchain = htole16(
         IWN_RXCHAIN_DRIVER_FORCE |
         IWN_RXCHAIN_VALID(chains) |
         IWN_RXCHAIN_FORCE_SEL(chains) |
-        IWN_RXCHAIN_FORCE_MIMO_SEL(chains) |
-        IWN_RXCHAIN_IDLE_COUNT(2) |
-        IWN_RXCHAIN_MIMO_COUNT(2));
+        IWN_RXCHAIN_FORCE_MIMO_SEL(chains));
 
     hdr->max_out = 0;
     hdr->pause_scan = 0;
     hdr->flags = htole32(IWN_RXON_24GHZ | IWN_RXON_AUTO);
-    hdr->filter = htole32(IWN_FILTER_MULTICAST);
+    hdr->filter = htole32(IWN_FILTER_MULTICAST | IWN_FILTER_BEACON);
 
     ptr += sizeof(struct iwn_scan_hdr);
 
@@ -183,17 +370,39 @@ static int iwn_send_scan(iwn_dev *dev) {
     tx->id = IWN5000_ID_BROADCAST;
     tx->lifetime = htole32(IWN_LIFETIME_INFINITE);
 
-    /* 6 Mbps OFDM (rate index 4 in iwn_rates) */
-    tx->plcp = iwn_rates[IWN_RIDX_OFDM6].plcp;
-    tx->rflags = IWN_RFLAG_ANT(dev->txchainmask);
+    /* CCK 1 Mbps for 2.4 GHz probe requests (per OpenBSD) */
+    uint8_t txant = (uint8_t)IWN_LSB(dev->txchainmask);
+    tx->plcp = iwn_rates[IWN_RIDX_CCK1].plcp;   /* 10 */
+    tx->rflags = IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant);
 
     ptr += sizeof(struct iwn_cmd_data);
 
     /* ---- 20 x ESSID entries (all zeroed = broadcast scan) ---- */
     ptr += 20 * sizeof(struct iwn_scan_essid);
 
-    /* ---- Probe request body — Supported Rates IE ---- */
-    uint8_t *probe_body = ptr;
+    /* ---- Probe request frame body (802.11 header + IEs) ---- */
+    /* The firmware expects a complete 802.11 probe request frame here.
+     * Reference: OpenBSD iwn_scan() builds ieee80211_frame + IEs. */
+    uint8_t *wh = ptr;  /* start of 802.11 frame */
+
+    /* 802.11 frame header (24 bytes) */
+    *ptr++ = 0x40; /* FC0: type=0 (mgmt), subtype=4 (probe request) */
+    *ptr++ = 0x00; /* FC1: to_ds=0, from_ds=0 */
+    *ptr++ = 0x00; *ptr++ = 0x00;  /* Duration (filled by HW) */
+    /* DA: broadcast */
+    *ptr++ = 0xff; *ptr++ = 0xff; *ptr++ = 0xff;
+    *ptr++ = 0xff; *ptr++ = 0xff; *ptr++ = 0xff;
+    /* SA: our MAC address */
+    iwn_memcpy(ptr, dev->mac_addr, 6); ptr += 6;
+    /* BSSID: broadcast */
+    *ptr++ = 0xff; *ptr++ = 0xff; *ptr++ = 0xff;
+    *ptr++ = 0xff; *ptr++ = 0xff; *ptr++ = 0xff;
+    /* Sequence control (filled by HW) */
+    *ptr++ = 0x00; *ptr++ = 0x00;
+
+    /* SSID IE: empty for broadcast scan */
+    *ptr++ = 0;   /* tag: SSID */
+    *ptr++ = 0;   /* length: 0 (broadcast) */
 
     /* Supported Rates IE (tag 1): 8 rates */
     *ptr++ = 1;   /* tag: Supported Rates */
@@ -215,19 +424,19 @@ static int iwn_send_scan(iwn_dev *dev) {
     *ptr++ = 0x60; /* 48 Mbps */
     *ptr++ = 0x6c; /* 54 Mbps */
 
-    uint16_t probe_len = (uint16_t)(ptr - probe_body);
-    tx->len = htole16(probe_len);
+    /* tx->len = entire probe frame (802.11 header + IEs) */
+    tx->len = htole16((uint16_t)(ptr - wh));
 
     /* ---- Channel list: 2.4 GHz channels 1-11 ---- */
     for (int ch = 1; ch <= 11; ch++) {
         struct iwn_scan_chan *chan = (struct iwn_scan_chan *)ptr;
         iwn_memset(chan, 0, sizeof(*chan));
-        chan->flags = htole32(IWN_CHAN_ACTIVE | IWN_CHAN_NPBREQS(2));
+        chan->flags = htole32(IWN_CHAN_ACTIVE);
         chan->chan = htole16((uint16_t)ch);
         chan->rf_gain = 0x28;
-        chan->dsp_gain = 0x50;
+        chan->dsp_gain = 0x6e;
         chan->active = htole16(30);   /* 30 ms active dwell */
-        chan->passive = htole16(110); /* 110 ms passive dwell */
+        chan->passive = htole16(120); /* 120 ms passive dwell (> active) */
         ptr += sizeof(struct iwn_scan_chan);
     }
 
@@ -235,7 +444,13 @@ static int iwn_send_scan(iwn_dev *dev) {
     uint32_t total_len = (uint32_t)(ptr - buf);
     hdr->len = htole16((uint16_t)total_len);
 
-    /* Send scan command (big command path — ~900 bytes > 136 limit) */
+    /* Send scan command (big command path — ~900 bytes > 136 limit).
+     * Scan is async — no command response. Results come as START_SCAN (130),
+     * RX_PHY (192), MPDU_RX_DONE (193), STOP_SCAN (132) notifications. */
+    efi_print_ascii("  SCAN cmd: len=");
+    print_dec(total_len);
+    efi_print_ascii("\r\n");
+
     if (iwn_cmd(dev, IWN_CMD_SCAN, buf, total_len) != 0) {
         efi_print_ascii("  iwn: SCAN command failed\r\n");
         return -1;
@@ -369,18 +584,22 @@ static int iwn_poll_scan_results(iwn_dev *dev, int timeout_ms) {
             }
 
             case IWN_RX_PHY: {
-                /* Cache RSSI from PHY notification — used by next MPDU */
+                /* Cache RSSI from PHY notification — used by next MPDU.
+                 * The IWN_RX_PHY data is an iwn_rx_stat, with the
+                 * iwn5000_rx_phystat embedded at phybuf offset.
+                 * RSSI formula for 5000+: max(chain_rssi) - agc
+                 * (IWN_RSSI_TO_DBM is for 4965 only) */
+                struct iwn_rx_stat *rxs = (struct iwn_rx_stat *)data;
                 struct iwn5000_rx_phystat *phy =
-                    (struct iwn5000_rx_phystat *)data;
-                /* Take max RSSI from available chains, subtract offset */
-                int8_t best = -100;
+                    (struct iwn5000_rx_phystat *)rxs->phybuf;
+                uint8_t agc = (uint8_t)((letoh32(phy->agc) >> 9) & 0x7f);
+                int best = -100;
                 for (int c = 0; c < 3; c++) {
-                    int8_t r = (int8_t)(letoh16(phy->rssi[c]) & 0xff);
-                    r -= IWN_RSSI_TO_DBM;
+                    int r = (int)(letoh16(phy->rssi[c]) & 0xff);
                     if (r > best)
                         best = r;
                 }
-                cached_rssi = best;
+                cached_rssi = (int8_t)(best - (int)agc - IWN_RSSI_TO_DBM);
                 break;
             }
 
@@ -414,8 +633,33 @@ static int iwn_poll_scan_results(iwn_dev *dev, int timeout_ms) {
                 return 0;
             }
 
+            case 2: {
+                /* REPLY_ERROR — firmware rejected a command */
+                uint32_t etype = *(uint32_t *)data;
+                uint8_t ecmd = data[4];
+                uint32_t einfo;
+                iwn_memcpy(&einfo, data + 8, 4);
+                efi_print_ascii("\r\n  FW_ERR(scan): cmd=");
+                print_dec((uint32_t)ecmd);
+                efi_print_ascii(" err=0x");
+                print_hex8((uint8_t)(etype >> 24));
+                print_hex8((uint8_t)(etype >> 16));
+                print_hex8((uint8_t)(etype >> 8));
+                print_hex8((uint8_t)etype);
+                efi_print_ascii(" info=0x");
+                print_hex8((uint8_t)(einfo >> 24));
+                print_hex8((uint8_t)(einfo >> 16));
+                print_hex8((uint8_t)(einfo >> 8));
+                print_hex8((uint8_t)einfo);
+                efi_print_ascii("\r\n");
+                break;
+            }
+
             default:
-                /* Ignore: stats, calibration, etc. */
+                /* Log notification type during scan */
+                efi_print_ascii("  rx[");
+                print_dec((uint32_t)desc->type);
+                efi_print_ascii("] ");
                 break;
             }
 
@@ -426,10 +670,24 @@ static int iwn_poll_scan_results(iwn_dev *dev, int timeout_ms) {
                  IWN_RX_RING_COUNT) & ~7);
         }
 
+        /* Clear interrupt status so FH continues DMA */
+        iwn_write(dev, IWN_INT, 0xffffffff);
+        iwn_write(dev, IWN_FH_INT, 0xffffffff);
+
         gBS->Stall(1000);  /* 1 ms */
     }
 
-    efi_print_ascii("\r\n  Scan timeout\r\n");
+    /* Check firmware state on timeout */
+    {
+        uint32_t intr = iwn_read(dev, IWN_INT);
+        efi_print_ascii("\r\n  Scan timeout (INT=0x");
+        print_hex8((uint8_t)(intr >> 24));
+        print_hex8((uint8_t)(intr >> 16));
+        print_hex8((uint8_t)(intr >> 8));
+        print_hex8((uint8_t)intr);
+        efi_print_ascii(")\r\n");
+        iwn_write(dev, IWN_INT, intr);
+    }
     return -1;
 }
 
@@ -513,6 +771,12 @@ int iwn_scan(iwn_dev *dev) {
 
     /* Reset scan results */
     dev->n_scan_results = 0;
+
+    /* Drain stale RX notifications from firmware init */
+    iwn_drain_rx(dev);
+
+    /* Clear any stale interrupt flags */
+    iwn_write(dev, IWN_INT, 0xffffffff);
 
     /* Configure radio for scanning */
     efi_print_ascii("  Configuring radio...\r\n");
