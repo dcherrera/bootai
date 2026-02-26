@@ -319,7 +319,8 @@ static void command_repl(void) {
 
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
-    efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo, tensor, exit\r\n");
+    efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
+    efi_print_ascii("            netdiag, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -618,6 +619,12 @@ static void command_repl(void) {
         /* iwn ping — ARP ping to test data path (Phase 4d) */
         if (str_eq(line, "iwn ping")) {
             iwn_ping_cmd();
+            continue;
+        }
+
+        /* netdiag — enumerate network protocols */
+        if (str_eq(line, "netdiag")) {
+            efi_net_diag();
             continue;
         }
 

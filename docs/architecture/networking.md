@@ -17,7 +17,18 @@ IP4Config2 (DHCP)                         ← Automatic IP configuration
     ↓
 ConnectController                         ← Driver chain binding
     ↓
-VirtioNetDxe → MnpDxe → ArpDxe → Ip4Dxe → Tcp4Dxe / Udp4Dxe
+MnpDxe → ArpDxe → Ip4Dxe → Tcp4Dxe / Udp4Dxe
+    ↓
+EFI_SIMPLE_NETWORK_PROTOCOL (SNP)
+    ↓
+┌────────────────┬──────────────────┐
+│ QEMU/wired     │ Dell E6510 WiFi  │
+│ VirtioNetDxe   │ IWN SNP wrapper  │
+│ (built into    │ (iwn_snp.c)      │
+│  firmware)     │      ↓           │
+│                │ iwn driver       │
+│                │ (802.11 + CCMP)  │
+└────────────────┴──────────────────┘
 ```
 
 ## DHCP
@@ -283,6 +294,48 @@ python3 -m http.server 8888    # Run on host
 # In BootAI REPL:
 fetch http://10.0.2.2:8888/    # Reaches host via QEMU gateway
 ```
+
+## Real Hardware vs QEMU: IP Stack Gap
+
+### The Problem
+
+QEMU/OVMF includes the full EDK2 IP stack DXE drivers (MnpDxe, ArpDxe, Ip4Dxe, Tcp4Dxe, Udp4Dxe, Dhcp4Dxe) built into the firmware. When `ConnectController` is called on an SNP handle, MnpDxe detects it and automatically creates the MNP → ARP → IP4 → TCP4/UDP4 protocol chain.
+
+Real hardware firmware (e.g. Dell E6510) may **not** include these drivers because:
+- The firmware was designed for wired Ethernet NICs with vendor-specific driver stacks
+- WiFi was typically handled by the OS, not UEFI
+- The IP stack DXE drivers are optional EDK2 components
+
+This means that after `iwn_snp_install()` creates a valid SNP handle on the Dell, `efi_net_init()` finds no `IP4Config2` protocol because there's no MnpDxe to bridge SNP to IP.
+
+### Diagnostics: `netdiag` Command
+
+The `netdiag` REPL command (implemented in `efi/net_diag.c`) enumerates 8 key network protocol handles to diagnose exactly which layer is missing:
+
+```
+SNP, MNP SB, ARP SB, IP4 SB, IP4Config2, DHCP4 SB, TCP4 SB, UDP4 SB
+```
+
+Run before and after `iwn connect` to see what protocols the firmware creates in response to SNP appearing.
+
+### `connect_all_controllers` Guard
+
+`efi_net_init()` originally called `connect_all_controllers()` twice unconditionally. This is correct for wired Ethernet (the NIC needs driver binding), but harmful for IWN WiFi because:
+
+1. IWN already called `ConnectController(snp_handle)` during SNP install
+2. Broad controller enumeration hits the PCI WiFi device, potentially re-triggering driver binding that conflicts with IWN's direct hardware access
+
+The fix: skip `connect_all_controllers()` when `iwn_snp_is_installed()` returns true.
+
+### Resolution Strategy
+
+| Phase | Approach | Code Changes |
+|-------|----------|-------------|
+| 1 | `netdiag` to identify which protocols are missing | Done (~100 LOC) |
+| 2 | Bundle EDK2 DXE drivers on USB `\drivers\` | Zero (driver loader exists) |
+| 3 | Custom ARP/DHCP/IP/UDP/TCP on raw SNP | ~1800 LOC (fallback only) |
+
+Phase 2 is expected to work because `efi/drivers.c` already loads all `.efi` files from `\drivers\` and calls `connect_all_controllers()`. The loaded MnpDxe finds the IWN SNP handle and builds the IP stack.
 
 ## Known Limitations
 

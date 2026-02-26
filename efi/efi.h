@@ -778,4 +778,16 @@ void connect_all_controllers(void);
 /* Phase 5: SNP install after WiFi connect */
 int iwn_snp_install(void);
 
+/* IWN SNP status (1 if SNP installed, 0 otherwise) */
+int iwn_snp_is_installed(void);
+
+/* Network diagnostics — enumerate protocol handles */
+void efi_net_diag(void);
+
+/* Diagnostic GUIDs (MNP, ARP, IP4, DHCP4 ServiceBinding) */
+extern EFI_GUID gEfiMnpServiceBindingGuid;
+extern EFI_GUID gEfiArpServiceBindingGuid;
+extern EFI_GUID gEfiIp4ServiceBindingGuid;
+extern EFI_GUID gEfiDhcp4ServiceBindingGuid;
+
 #endif /* BOOTAI_EFI_H */

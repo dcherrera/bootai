@@ -345,3 +345,5 @@ int iwn_snp_install(void) {
     snp_installed = 1;
     return 0;
 }
+
+int iwn_snp_is_installed(void) { return snp_installed; }

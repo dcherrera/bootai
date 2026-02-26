@@ -40,6 +40,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | Build commands | `../Makefile` |
 | UEFI types | `../efi/efi.h` |
 | Network stack | `../efi/net.c` |
+| Network diagnostics | `../efi/net_diag.c` |
 | mDNS responder | `../efi/mdns.c` |
 | WiFi management | `../efi/wifi.c` |
 | Driver loader | `../efi/drivers.c` |

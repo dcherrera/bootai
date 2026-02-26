@@ -203,9 +203,14 @@ EFI_STATUS efi_net_init(void) {
 
     if (!gBS) return EFI_NOT_READY;
 
-    /* Connect all controllers so network stack binds to NIC */
-    connect_all_controllers();
-    connect_all_controllers();
+    /* Connect all controllers so network stack binds to NIC.
+     * Skip if IWN SNP is already installed — iwn_snp_install() already
+     * called ConnectController on the SNP handle. Broad connect here
+     * could re-trigger driver enumeration on the PCI WiFi device. */
+    if (!iwn_snp_is_installed()) {
+        connect_all_controllers();
+        connect_all_controllers();
+    }
 
     /* Locate IP4Config2 for DHCP — try LocateHandleBuffer first */
     {

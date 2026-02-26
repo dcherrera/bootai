@@ -1250,6 +1250,99 @@ EFI_GUID gEfiDevicePathProtocolGuid = {
 | MCastIpToMac mapping | IPv4 `224.x.y.z` → MAC `01:00:5E:(x & 0x7F):y:z` — mask bit 0 of second octet |
 | SNP installed before keys ready | Only install after `iwn_connect()` succeeds — not during `iwn_probe()` |
 
+### Phase 5b: Network Stack Diagnostics (done)
+
+After SNP install, the UEFI IP stack (MnpDxe → ArpDxe → Ip4Dxe → Tcp4Dxe) must bind to the SNP handle for DHCP and TCP/UDP to work. On QEMU/OVMF this happens automatically because the IP stack DXE drivers are built into the firmware. On Dell E6510, these drivers may be absent — the firmware was designed for wired Ethernet NICs with their own driver stack.
+
+**Problem**: `efi_net_init()` finds no `IP4Config2` protocol after IWN SNP install. No DHCP, no TCP, no UDP — networking is "unavailable" despite WiFi working at the radio level.
+
+**Secondary issue**: `efi_net_init()` called `connect_all_controllers()` twice on ALL handles unconditionally, potentially re-triggering driver enumeration on the PCI WiFi device after IWN had already installed SNP and called `ConnectController` on the SNP handle.
+
+**Files**: `efi/net_diag.c` (new, ~100 lines), changes to `efi/net.c`, `iwn/iwn_snp.c`, `efi/efi.h`, `efi/main.c`
+
+#### `netdiag` Command
+
+The `netdiag` REPL command enumerates 8 UEFI network protocol handles and prints counts:
+
+```
+> netdiag
+  Network protocol handles:
+  SNP            : 1
+  MNP SB         : none
+  ARP SB         : none
+  IP4 SB         : none
+  IP4Config2     : none
+  DHCP4 SB       : none
+  TCP4 SB        : none
+  UDP4 SB        : none
+  IWN SNP installed: yes
+  Local IP: not assigned
+```
+
+Uses `LocateHandleBuffer(SEARCH_BY_PROTOCOL, &guid)` for each protocol. The expected workflow:
+
+1. Boot Dell → `netdiag` → baseline (SNP=0, everything=0)
+2. `iwn pass <pw>` → `iwn connect <SSID>` → WiFi connects, SNP installed
+3. `netdiag` → see what appeared after SNP install
+4. Read `bootai.log` from USB for full output
+
+#### `connect_all_controllers` Guard
+
+In `efi_net_init()`, the two `connect_all_controllers()` calls are now guarded:
+
+```c
+if (!iwn_snp_is_installed()) {
+    connect_all_controllers();
+    connect_all_controllers();
+}
+```
+
+When IWN SNP is already installed, `iwn_snp_install()` has already called `ConnectController(snp_handle)` on the specific SNP handle. Broad controller enumeration is unnecessary and could interfere with the IWN PCI device binding.
+
+The `iwn_snp_is_installed()` getter exposes the existing `static int snp_installed` flag from `iwn_snp.c`.
+
+#### New Protocol GUIDs
+
+Four new ServiceBinding GUIDs defined in `efi/net_diag.c`:
+
+| Protocol | GUID | Purpose |
+|----------|------|---------|
+| MNP SB | `{F36FF770-A7E1-42CF-9ED2-56F0F271F44E}` | Managed Network Protocol — bridges SNP to ARP/IP |
+| ARP SB | `{F44C00EE-1F2C-4A00-AA09-1C9F7E44E038}` | Address Resolution Protocol |
+| IP4 SB | `{C51711E7-B4BF-404A-BFB8-0A048EF1FFE4}` | IPv4 stack |
+| DHCP4 SB | `{9D9A39D8-BD42-4A73-A4D5-8EE94BE11380}` | DHCP client |
+
+#### Three-Phase Diagnostic Strategy
+
+| Phase | What | Code Changes | When |
+|-------|------|-------------|------|
+| **1. Diagnostics + Fix** | `netdiag` command + `connect_all_controllers` guard | ~100 LOC new, ~10 lines modified | **Done** |
+| **2. Bundle DXE Drivers** | Extract 6 EDK2 `.efi` files onto USB `\drivers\` | Zero code changes | If Dell lacks IP stack |
+| **3. Custom Network Stack** | ARP/DHCP/IP/UDP/TCP on raw SNP | ~1800 LOC new | Only if DXE drivers fail to load |
+
+**Phase 2** requires zero code changes because `efi/drivers.c` already loads all `.efi` files from `\drivers\` alphabetically and calls `connect_all_controllers()`. The required drivers are:
+
+```
+\drivers\01-MnpDxe.efi
+\drivers\02-ArpDxe.efi
+\drivers\03-Dhcp4Dxe.efi
+\drivers\04-Ip4Dxe.efi
+\drivers\05-Udp4Dxe.efi
+\drivers\06-Tcp4Dxe.efi
+```
+
+Extracted from the OVMF build. After `iwn_snp_install()` + driver load, MnpDxe finds SNP and cascades: MNP → ARP → IP4 → TCP4/UDP4.
+
+**Phase 3** is the fallback if Dell firmware rejects `LoadImage` for the EDK2 drivers. Custom ARP/DHCP/IP/UDP/TCP directly on raw SNP — ~1800 LOC. Only build this if Phase 2 fails.
+
+#### Expected `netdiag` Outcomes
+
+| After `iwn connect` | Meaning | Next Step |
+|---------------------|---------|-----------|
+| MNP/IP4/TCP4 appear | Dell **HAS** IP stack drivers. The `connect_all_controllers` guard may have been the only issue. | Try `efi_net_init()` — should work |
+| Only SNP appears | Dell **LACKS** IP stack drivers | Phase 2: bundle EDK2 DXE drivers on USB |
+| Nothing appears | SNP install itself failed | Debug SNP handle + device path |
+
 ## Key Design Decisions
 
 ### Why OpenBSD over Linux?
@@ -1282,3 +1375,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-25 | Phase 4c implemented: WPA2-PSK EAPOL 4-way handshake. PMK derivation (PBKDF2, 4096 rounds), EAPOL data frame TX/RX (LLC/SNAP 0x888E, node id=0), SNonce generation (RDTSC+SHA-1), PTK derivation (PRF-384), M2/M4 construction with HMAC-SHA1 MIC, M3 verification + AES-unwrap GTK extraction, pairwise+group key installation via ADD_NODE with CCMP flags. `iwn_eapol.c` (~420 lines). |
 | 2026-02-25 | Phase 4d implemented: Data frame TX/RX. `iwn_tx_raw()` canonical ring 0 submit (OFDM 24 Mbps, CCMP security field). `iwn_encap_tx()` Ethernet-to-802.11 encapsulation with LLC/SNAP, Protected bit, broadcast/unicast node selection. `iwn_rx_poll()` non-blocking HW drain with 802.11-to-Ethernet decapsulation, QoS data handling (26-byte header), deauth detection. 16-slot software RX buffer (24 KB). `iwn ping` ARP smoke test command. `iwn_data.c` (~280 lines). |
 | 2026-02-26 | Phase 5 implemented: SNP integration. `iwn_snp.c` (~280 lines) wraps IWN as `EFI_SIMPLE_NETWORK_PROTOCOL`. 14 SNP functions backed by `iwn_encap_tx()`/`iwn_rx_dequeue()`. TX buffer recycling ring (8 slots). MAC Address Device Path for driver binding. Auto DHCP via `efi_net_init()` after connect. Added SNP types + typed `InstallProtocolInterface` to `efi.h` (~80 lines). GUIDs in `net.c`. |
+| 2026-02-26 | Phase 5b: Network stack diagnostics. `efi/net_diag.c` (~100 lines) enumerates 8 UEFI network protocol handles (SNP, MNP, ARP, IP4, IP4Config2, DHCP4, TCP4, UDP4). `netdiag` REPL command. Guard `connect_all_controllers` behind `iwn_snp_is_installed()` to prevent double driver enumeration. `iwn_snp_is_installed()` getter. 4 new ServiceBinding GUIDs (MNP, ARP, IP4, DHCP4). Three-phase strategy: diagnostics → bundle DXE drivers → custom network stack. |
