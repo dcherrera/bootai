@@ -82,9 +82,22 @@ void iwn5000_post_alive(iwn_dev *dev);
 void iwn_replay_calibration(iwn_dev *dev);
 int iwn_hw_init(iwn_dev *dev);
 
+/* ---- Command wait (iwn_scan.c, shared with iwn_assoc.c) ---- */
+
+int iwn_wait_cmd(iwn_dev *dev, uint8_t cmd_code, const char *cmd_name,
+                 int timeout_ms);
+
 /* ---- Scan (iwn_scan.c) ---- */
 
 int iwn_scan(iwn_dev *dev);
+
+/* ---- Association (iwn_assoc.c) ---- */
+
+int iwn_connect(iwn_dev *dev, const char *ssid);
+
+/* ---- EAPOL (iwn_eapol.c) ---- */
+
+int iwn_eapol_handshake(iwn_dev *dev);
 
 /* ---- Global device state (iwn_pci.c) ---- */
 

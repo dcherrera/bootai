@@ -11,8 +11,8 @@ Port OpenBSD's `iwn` driver to UEFI for Intel 6200 WiFi on the Dell E6510.
 | 2 | DMA & Firmware | Allocate DMA rings, load firmware, get `UC_READY` | **DONE** |
 | 3 | Scan | Send scan command, parse results, print SSIDs | **DONE** |
 | 4a | Crypto Primitives | SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384 | **DONE** |
-| 4b | Auth + Association | RXON state machine, 802.11 auth/assoc frames | Pending |
-| 4c | WPA2 Handshake | PMK derivation, EAPOL 4-way, key install | Pending |
+| 4b | Auth + Association | RXON state machine, 802.11 auth/assoc frames | **CODE COMPLETE** |
+| 4c | WPA2 Handshake | PMK derivation, EAPOL 4-way, key install | **CODE COMPLETE** |
 | 4d | Data Frame TX/RX | 802.11 data encap/decap, TX ring 0 | Pending |
 | 5 | SNP Integration | Wrap as EFI_SIMPLE_NETWORK_PROTOCOL, DHCP, full stack | Pending |
 | 6 | Polish | Error handling, reconnect, wifi.c UI integration | Pending |
@@ -515,7 +515,7 @@ STA ─────────────────────────�
 
 #### Tasks
 
-- [ ] Add state fields to `iwn_dev` in `if_iwnvar.h`:
+- [x] Add state fields to `iwn_dev` in `if_iwnvar.h`:
   - `uint8_t state` — `IWN_STATE_INIT/SCAN/AUTH/ASSOC/RUN`
   - `uint8_t target_bssid[6]` — AP we're connecting to
   - `uint8_t target_channel` — AP's channel
@@ -524,10 +524,10 @@ STA ─────────────────────────�
   - `uint16_t beacon_interval` — from scan results (typically 100 TU)
   - `struct iwn_rxon rxon` — saved RXON config (updated per state)
   - `uint8_t pmk[32]` — pre-shared key material (for Phase 4c)
-- [ ] Store beacon_interval during scan (update `iwn_parse_beacon` in `iwn_scan.c`):
+- [x] Store beacon_interval during scan (update `iwn_parse_beacon` in `iwn_scan.c`):
   - Beacon fixed fields: bytes 24-31 = timestamp, 32-33 = beacon interval, 34-35 = capability
   - Save `beacon_interval` in `iwn_scan_result`
-- [ ] Implement `iwn_auth()` — configure radio for BSS mode:
+- [x] Implement `iwn_auth()` — configure radio for BSS mode:
   - Update saved RXON: set `bssid` = target AP, `chan` = target channel, `mode` = `IWN_MODE_STA`
   - Clear `IWN_FILTER_BSS` (not associated yet), `associd` = 0
   - Keep flags: `IWN_RXON_TSF | IWN_RXON_CTS_TO_SELF | IWN_RXON_AUTO | IWN_RXON_24GHZ`
@@ -536,7 +536,7 @@ STA ─────────────────────────�
   - Send `IWN_CMD_ADD_NODE` (code 24) — broadcast node (id=15, MAC FF:FF:FF:FF:FF:FF)
   - Send `IWN_CMD_LINK_QUALITY` (code 78) — CCK 1Mbps rate table for broadcast
   - All commands synchronous via `iwn_wait_cmd()`
-- [ ] Implement management frame TX via TX ring 0:
+- [x] Implement management frame TX via TX ring 0:
   - `iwn_tx_mgmt(dev, frame, frame_len)` — submit 802.11 management frame
   - Build `iwn_cmd_data` TX descriptor: `flags = IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ`
   - Rate: CCK 1Mbps (`plcp=10, rflags=IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant)`)
@@ -544,7 +544,7 @@ STA ─────────────────────────�
   - `security = 0` (management frames are never encrypted in basic WPA2)
   - Submit on TX ring 0 (data queue, not command queue 4)
   - **Note:** TX ring 0 descriptors + commands were allocated in Phase 2 but ring not activated. Need to activate queue 0 in scheduler (SCHED_QUEUE_STATUS, TXFACT bit 0).
-- [ ] Build Authentication Request frame (30 bytes):
+- [x] Build Authentication Request frame (30 bytes):
   ```
   802.11 Header (24 bytes):
     FC = 0x00B0 (mgmt, subtype=11 authentication)
@@ -558,11 +558,11 @@ STA ─────────────────────────�
     Auth Seq Number = 0x0001
     Status Code = 0x0000
   ```
-- [ ] Parse Authentication Response (RX ring, `IWN_MPDU_RX_DONE` type 193):
+- [x] Parse Authentication Response (RX ring, `IWN_MPDU_RX_DONE` type 193):
   - Check FC subtype == 11 (authentication)
   - Check auth seq == 2 (response) and status == 0 (success)
   - Status != 0 → print reason, abort
-- [ ] Build Association Request frame (~80-120 bytes):
+- [x] Build Association Request frame (~80-120 bytes):
   ```
   802.11 Header (24 bytes):
     FC = 0x0000 (mgmt, subtype=0 association request)
@@ -583,12 +583,12 @@ STA ─────────────────────────�
   ```
   - The RSN IE tells the AP we support WPA2-PSK with CCMP
   - Same RSN IE must be replayed in EAPOL msg 2 (save a copy)
-- [ ] Parse Association Response:
+- [x] Parse Association Response:
   - Check FC subtype == 1 (association response)
   - Extract status code (bytes 24-25). Status 0 = success.
   - Extract AID (bytes 26-27, mask with 0x3FFF)
   - Status != 0 → print reason code, abort (common: 17 = AP full, 12 = wrong SSID)
-- [ ] Implement `iwn_run()` — post-association firmware config:
+- [x] Implement `iwn_run()` — post-association firmware config:
   - Update saved RXON: `associd = AID | 0xC000`, add `IWN_FILTER_BSS`
   - Add `IWN_RXON_SHSLOT | IWN_RXON_SHPREAMBLE` if AP supports them
   - Send `IWN_CMD_RXON_ASSOC` (code 17, `struct iwn_rxon_assoc`) — fast-path update
@@ -597,7 +597,7 @@ STA ─────────────────────────�
     - Descending retry chain: OFDM 54→48→36→24→18→12→9→6, then CCK 11→5.5→2→1
     - `antmsk_1stream = IWN_LSB(txchainmask)`, `ampdu_max = NO_AGG`
   - Set state = `IWN_STATE_RUN`
-- [ ] Wire to REPL: `iwn connect <SSID>` (or by scan result number)
+- [x] Wire to REPL: `iwn connect <SSID>` (or by scan result number)
   - Select target from `dev->scan_results[]`
   - If WPA2: prompt for password (store for Phase 4c)
   - Run auth + association sequence
@@ -692,17 +692,17 @@ Bit  12:   Encrypted Key Data (1 in msg 3)
 
 #### Tasks
 
-- [ ] Implement PSK derivation:
+- [x] Implement PSK derivation:
   - `iwn_derive_pmk(password, ssid, ssid_len, pmk_out)`
   - `PMK = PBKDF2-SHA1(password, SSID, 4096, 32)`
   - Compute once on `iwn connect`, cache in `dev->pmk[32]`
   - ~1-2 seconds on E6510 (Westmere i5, 4096 iterations of HMAC-SHA1)
-- [ ] Implement EAPOL frame detection in RX path:
+- [x] Implement EAPOL frame detection in RX path:
   - EAPOL arrives as 802.11 data frame with LLC/SNAP EtherType `0x888E`
   - 802.11 header (24 bytes) + LLC/SNAP (8 bytes) + EAPOL frame
   - Data frames have FC type=2 (data), check `from_ds=1` (AP→STA)
   - Register EAPOL handler in `iwn_poll_rx` for `IWN_MPDU_RX_DONE` type 193
-- [ ] Implement 4-way handshake state machine in `iwn_wpa.c`:
+- [x] Implement 4-way handshake state machine (in `iwn_eapol.c`):
   - **Message 1 received** (Key ACK=1, Key MIC=0):
     - Extract ANonce (32 bytes) from `eapol_key.nonce`
     - Save replay counter
@@ -735,7 +735,7 @@ Bit  12:   Encrypted Key Data (1 in msg 3)
     - Replay counter = same as msg 3, nonce = zeros, no key data
     - Compute and insert MIC
     - Send via TX ring 0
-- [ ] Install CCMP keys via `IWN_CMD_ADD_NODE`:
+- [x] Install CCMP keys via `IWN_CMD_ADD_NODE`:
   - **PTK (unicast)**: Update AP node (id=0):
     - `node.control = IWN_NODE_UPDATE`
     - `node.flags = IWN_FLAG_SET_KEY`
@@ -745,11 +745,11 @@ Bit  12:   Encrypted Key Data (1 in msg 3)
     - Same as above but add `IWN_KFLAG_GROUP` and use `IWN_KFLAG_KID(key_id)`
     - `memcpy(node.key, GTK, 16)`
   - After key install, firmware automatically handles CCMP encrypt/decrypt for all data frames
-- [ ] Handle handshake timeout:
+- [x] Handle handshake timeout:
   - AP sends msg 1 within ~1 second of association
   - If no msg 1 after 3 seconds, retry association
   - If msg 3 doesn't arrive within 1 second of msg 2, AP will retry msg 1 (restart)
-- [ ] EAPOL frame TX helper:
+- [x] EAPOL frame TX helper:
   - EAPOL frames are 802.11 data frames (FC type=2, subtype=0)
   - LLC/SNAP header with EtherType `0x888E`
   - `security = 0` (EAPOL frames are sent unencrypted, even after key install)
@@ -774,7 +774,7 @@ Connected to Herrera (WPA2)
 
 ```
 bootai/iwn/
-└── iwn_wpa.c           ← PMK derivation, EAPOL parsing, 4-way handshake, key install
+└── iwn_eapol.c         ← PMK derivation, EAPOL parsing, 4-way handshake, key install (~420 lines)
 ```
 
 ---
@@ -975,10 +975,10 @@ Full end-to-end: Boot USB → auto-connect WiFi → `serve` → chat from Mac vi
 IWN sources are listed directly in `EFI_SRC` (no separate variable):
 
 ```makefile
-EFI_SRC = ... iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c iwn/iwn_crypto.c
+EFI_SRC = ... iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c iwn/iwn_crypto.c iwn/iwn_assoc.c iwn/iwn_eapol.c
 ```
 
-Future phases will append: `iwn/iwn_assoc.c iwn/iwn_wpa.c iwn/iwn_data.c iwn/iwn_snp.c`
+Future phases will append: `iwn/iwn_data.c iwn/iwn_snp.c`
 
 ### Crypto test target (host-runnable, Phase 4a — done)
 

@@ -153,7 +153,9 @@ The driver has its own internal phases:
 | 1 | MMIO + EEPROM — power on, read MAC/domain/RF config | COMPLETE |
 | 2 | DMA + Firmware — allocate rings, load firmware, get UC_READY | COMPLETE |
 | 3 | Scanning — RXON config, CMD_SCAN, parse beacon results | COMPLETE |
-| 4 | Association + WPA2 — EAPOL handshake, CCMP keys | PLANNED |
+| 4a | Crypto — SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384 | COMPLETE |
+| 4b | Association — Open System auth, assoc request/response, post-assoc config | CODE COMPLETE |
+| 4c | WPA2 EAPOL — 4-way handshake, PTK/GTK derivation, CCMP key install | CODE COMPLETE |
 | 5 | SNP integration — EFI_SIMPLE_NETWORK_PROTOCOL wrapper | PLANNED |
 
 **IWN Phase 0-1** (2026-02-23): PCI bus enumeration finds Intel 6200, enables MMIO + bus master, reads EEPROM (MAC, RF config, calibration data, regulatory domain). Confirmed on Dell E6510 hardware.
@@ -162,7 +164,13 @@ The driver has its own internal phases:
 
 **IWN Phase 3** (2026-02-24): 8-command radio config sequence (BT_COEX, TX_ANT, RXON, ADD_NODE, LINK_QUALITY, TXPOWER, CRITICAL_TEMP, POWER) all succeed on Dell E6510. Radio receives beacons. Scan command built with proper 802.11 probe request frame. 10 bugs found and fixed during real-hardware debugging. See [IWN Phase 3 Debug Log](../research/iwn-phase3-debug-log.md).
 
-**Files**: `bootai/iwn/` — 9 source files (~2,300 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c, iwn_scan.c)
+**IWN Phase 4a** (2026-02-25): Self-contained WPA2-PSK crypto module — SHA-1, HMAC-SHA1, PBKDF2-SHA1, AES-128, AES Key Unwrap (RFC 3394), PRF-384. 13/13 test vectors passing. No UEFI dependencies.
+
+**IWN Phase 4b** (2026-02-25): 802.11 Open System auth + association. RXON state machine, management frame TX/RX, RSN IE, post-assoc AP node + rate table. REPL: `iwn pass <pw>` → `iwn connect <SSID>`.
+
+**IWN Phase 4c** (2026-02-25): WPA2-PSK EAPOL 4-way handshake. PBKDF2 PMK derivation, EAPOL data frame TX/RX (LLC/SNAP), SNonce gen (RDTSC+SHA-1), PTK derivation (PRF-384), M2/M4 with HMAC-SHA1 MIC, M3 AES-unwrap GTK extraction, pairwise+group CCMP key installation.
+
+**Files**: `bootai/iwn/` — 12 source files (~4,000 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c, iwn_scan.c, iwn_assoc.c, iwn_eapol.c, iwn_crypto.h, iwn_crypto.c, test_crypto.c)
 
 **Firmware**: `iwlwifi-6000-4.ucode` (454KB, legacy v2 format) renamed to `iwn-6000`, placed in `\drivers\` on the EFI partition.
 
@@ -172,7 +180,7 @@ The driver has its own internal phases:
 
 - mDNS discovery (5d) — quality-of-life, not a blocker
 - Streaming mode (`stream: true`) for chat completions (chunked transfer encoding + SSE)
-- IWN Phase 3-5: scanning, association, WPA2, SNP integration
+- IWN Phase 5: SNP integration (EFI_SIMPLE_NETWORK_PROTOCOL wrapper for existing IP4/TCP4/UDP4 stack)
 
 ## Phase 6: Tool Use (SCAFFOLDED)
 

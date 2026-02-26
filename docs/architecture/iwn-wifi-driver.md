@@ -54,16 +54,18 @@ All PCI IDs are vendor `8086` (Intel). These cards were shipped in millions of l
 
 ```
 bootai/iwn/
-├── iwn.h              # Public API (iwn_probe, iwn_init, iwn_attach, iwn_scan_cmd)
-├── iwn_internal.h     # Shared internal header (MMIO, prph, lock, DMA, FW, scan functions)
+├── iwn.h              # Public API (iwn_probe, iwn_init, iwn_attach, iwn_scan_cmd, iwn_connect_cmd)
+├── iwn_internal.h     # Shared internal header (MMIO, prph, lock, DMA, FW, scan, assoc, EAPOL)
 ├── iwn_shim.h         # UEFI shim: OpenBSD types → stdint, byte-order no-ops, bus_space stubs
 ├── if_iwnreg.h        # Hardware registers (from OpenBSD, with additions)
-├── if_iwnvar.h        # iwn_dev struct, DMA ring structs, scan results, device ID table, flags
+├── if_iwnvar.h        # iwn_dev struct, DMA ring structs, scan results, assoc/EAPOL state, device IDs
 ├── iwn_pci.c          # PCI enumeration, device matching, iwn_init() entry point
 ├── iwn_hw.c           # MMIO primitives, NIC lock, APM init/stop, EEPROM read, iwn_attach()
 ├── iwn_dma.c          # DMA memory allocation, TX/RX ring setup, scheduler table
 ├── iwn_fw.c           # Firmware parse/upload, hw_init sequence, calibration, host commands (big + small)
 ├── iwn_scan.c         # Radio config, scan command, beacon parsing, result display
+├── iwn_assoc.c        # 802.11 Open System auth + association + post-assoc config (~700 lines)
+├── iwn_eapol.c        # WPA2-PSK EAPOL 4-way handshake (~420 lines)
 ├── iwn_crypto.h       # Crypto API: SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384
 ├── iwn_crypto.c       # Self-contained crypto implementation (~490 lines, no libc)
 └── test_crypto.c      # Host-testable: 13 standard test vectors (FIPS, RFC, IEEE)
@@ -72,7 +74,6 @@ bootai/iwn/
 Future phases will add:
 
 ```
-├── iwn_wpa.c          # WPA2-PSK 4-way EAPOL handshake (uses iwn_crypto + RNG)
 └── iwn_snp.c          # EFI_SIMPLE_NETWORK_PROTOCOL wrapper
 ```
 
@@ -608,12 +609,306 @@ Build and run: `make test-iwn-crypto` (uses host `cc`, not cross-compiler)
 | PRF label includes null | `0x00` is a separator between label and data, not a string terminator |
 | AES unwrap direction | Must use `iwn_aes128_decrypt`, not encrypt |
 
-### Phase 4b-c: Association + WPA2 Handshake (planned)
+### Phase 4b: Authentication + Association (code complete, untested on hardware)
 
-- RXON state machine (INIT → SCAN → AUTH → ASSOC → RUN)
-- 4-way EAPOL handshake using crypto primitives from Phase 4a
-- RNG via UEFI `EFI_RNG_PROTOCOL` or `RDTSC` fallback (in `iwn_wpa.c`)
-- Install temporal key for hardware CCMP
+Open System authentication followed by 802.11 association. After this, the firmware is configured for the target AP and the AP starts the EAPOL handshake (for WPA2 networks).
+
+**File**: `iwn_assoc.c` (~700 lines)
+
+REPL command: `iwn pass <password>` → `iwn connect <SSID>`
+
+#### Connection State Machine
+
+```
+iwn_connect(dev, ssid)
+  ├── Find SSID in scan results
+  ├── Check password for WPA2 (fail early if not set)
+  │
+  ├── iwn_auth(dev)                          [INIT → AUTH]
+  │   ├── RXON — station mode, target BSSID + channel
+  │   ├── TIMING — beacon interval from scan
+  │   ├── ADD_NODE — broadcast node (id=15)
+  │   ├── LINK_QUALITY — broadcast CCK 1Mbps
+  │   ├── TX Auth Request (Open System, seq=1)
+  │   └── Poll for Auth Response (seq=2, status=0)
+  │
+  ├── iwn_associate(dev)                     [AUTH → ASSOC]
+  │   ├── TX Association Request
+  │   │   ├── Capability Info (ESS, short preamble/slot)
+  │   │   ├── SSID IE, Supported Rates IE, Extended Rates IE
+  │   │   └── RSN IE (WPA2 only: CCMP + PSK)
+  │   └── Poll for Association Response (AID)
+  │
+  ├── iwn_run(dev)                           [ASSOC → RUN]
+  │   ├── RXON — associated (with AID + BSS filter)
+  │   ├── ADD_NODE — AP node (id=0, AP MAC)
+  │   └── LINK_QUALITY — AP full rate table (OFDM 54→6, CCK 11→1)
+  │
+  └── iwn_eapol_handshake(dev)               [WPA2 only]
+```
+
+#### TX Frame Mechanism
+
+Management frames are sent on TX ring 0 via `iwn_tx_frame()`:
+
+- Builds `iwn_cmd_data` TX params: `IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ`
+- Uses `IWN5000_ID_BROADCAST` (id=15) as target node
+- CCK 1 Mbps for reliability on management frames
+- Frame copied into ring cmd buffer, referenced via single-segment TX descriptor
+- Scheduler byte count table updated, hardware kicked via `IWN_HBUS_TARG_WRPTR`
+
+#### RX Polling for Management Frames
+
+`iwn_poll_mgmt()` polls the RX ring for management frames matching a specific subtype:
+
+- Checks `IWN_MPDU_RX_DONE` notifications, filters by FC type=0 (management)
+- Silently consumes `IWN_TX_DONE` completions
+- Logs unexpected notification types for debugging
+- Clears `IWN_INT` and `IWN_FH_INT` every iteration to keep DMA flowing
+
+#### Association Request RSN IE
+
+For WPA2 networks, the association request includes an RSN Information Element:
+
+```
+RSN IE (tag=48, 22 bytes):
+├── Version: 1
+├── Group Cipher: 00:0F:AC:04 (CCMP)
+├── Pairwise Cipher Count: 1
+├── Pairwise Cipher: 00:0F:AC:04 (CCMP)
+├── AKM Count: 1
+├── AKM: 00:0F:AC:02 (PSK)
+└── RSN Capabilities: 0x0000
+```
+
+The RSN IE is saved in `dev->rsn_ie[]` for replay in the EAPOL Message 2.
+
+#### Post-Association Configuration
+
+After the AP sends an Association Response with AID, `iwn_run()` re-configures the firmware:
+
+1. **RXON (associated)**: Same as auth RXON but adds `IWN_FILTER_BSS`, `IWN_RXON_SHPREAMBLE`, `IWN_RXON_SHSLOT`, and sets `associd = AID | 0xC000`
+2. **ADD_NODE (AP, id=0)**: Creates the AP BSS node with the AP's MAC address — used for all data frame TX
+3. **LINK_QUALITY (AP)**: Full descending rate table — OFDM 54/48/36/24/18/12/9/6 Mbps then CCK 11/5.5/2/1 Mbps. Firmware handles rate adaptation within this table
+
+### Phase 4c: EAPOL 4-Way Handshake (code complete, untested on hardware)
+
+WPA2-PSK EAPOL 4-way handshake. After association, the AP sends EAPOL Message 1. We respond with Messages 2 and 4, derive the PTK, decrypt the GTK from Message 3, and install both keys into the firmware for CCMP-encrypted data frames.
+
+**File**: `iwn_eapol.c` (~420 lines)
+
+#### Handshake Flow
+
+```
+iwn_eapol_handshake(dev)
+  ├── Step 1: PMK = PBKDF2-SHA1(password, SSID, 4096, 32)
+  │           (~0.5s on x86, status message printed)
+  │
+  ├── Step 2: Poll RX for EAPOL M1 (5s timeout)
+  │   ├── Data frame (type=2) with LLC/SNAP ethertype 0x888E
+  │   ├── Validate: descriptor=0x02, ACK set, MIC not set
+  │   └── Extract ANonce (32 bytes) + replay counter (8 bytes)
+  │
+  ├── Step 3: Generate SNonce + derive PTK
+  │   ├── SNonce = SHA-1(RDTSC || MAC || counter)  (32 bytes)
+  │   ├── PTK = PRF-384(PMK, "Pairwise key expansion",
+  │   │                  min(AA,SPA) || max(AA,SPA) ||
+  │   │                  min(ANonce,SNonce) || max(ANonce,SNonce))
+  │   └── Split: KCK=PTK[0:16], KEK=PTK[16:32], TK=PTK[32:48]
+  │
+  ├── Step 4: TX EAPOL M2
+  │   ├── Key Info: 0x010A (VERSION=2, PAIRWISE, MIC)
+  │   ├── Replay counter echoed from M1
+  │   ├── Key data: RSN IE from association
+  │   └── MIC = HMAC-SHA1(KCK, eapol_frame)[0:16]
+  │
+  ├── Step 5: Poll RX for EAPOL M3 (5s timeout)
+  │   ├── Verify MIC: HMAC-SHA1(KCK, frame_with_zeroed_mic)
+  │   ├── Decrypt key data: AES-unwrap(KEK, encrypted_data)
+  │   ├── Parse KDE TLVs to find GTK KDE (OUI 00:0F:AC type 0x01)
+  │   └── Extract GTK (16 bytes) + key index (bits 0-1)
+  │
+  ├── Step 6: TX EAPOL M4
+  │   ├── Key Info: 0x030A (VERSION=2, PAIRWISE, MIC, SECURE)
+  │   ├── Replay counter echoed from M3
+  │   └── No key data, no nonce
+  │
+  └── Step 7: Install keys into firmware
+      ├── ADD_NODE(id=0, update, TK, CCMP, key_id=0)    → pairwise
+      └── ADD_NODE(id=15, update, GTK, CCMP, GROUP)      → group
+```
+
+#### EAPOL Frame Encapsulation
+
+EAPOL travels inside 802.11 **data** frames (type=2), not management frames:
+
+```
+802.11 Data Header (24 bytes)
+├── FC: 0x0801 (type=2 data, subtype=0, ToDS=1)
+├── Duration: 0x0000
+├── Addr1 (RA/BSSID): AP MAC
+├── Addr2 (TA/SA): our MAC
+├── Addr3 (DA): AP MAC
+├── SeqCtrl: 0x0000 (firmware fills)
+│
+LLC/SNAP Header (8 bytes)
+├── DSAP: 0xAA, SSAP: 0xAA, Control: 0x03
+├── OUI: 00:00:00
+├── EtherType: 0x888E (802.1X Authentication)
+│
+EAPOL Header (4 bytes)
+├── Version: 0x01 (802.1X-2001)
+├── Type: 0x03 (EAPOL-Key)
+├── Body Length: (big-endian)
+│
+EAPOL-Key Body (95+ bytes)
+├── [0]     Descriptor Type: 0x02 (RSN/WPA2)
+├── [1-2]   Key Info (big-endian, see table below)
+├── [3-4]   Key Length: 0x0010 (16 for CCMP)
+├── [5-12]  Replay Counter (big-endian, 8 bytes)
+├── [13-44] Key Nonce (32 bytes)
+├── [45-60] Key IV (16 bytes, zeroed for AES)
+├── [61-68] Key RSC (8 bytes)
+├── [69-76] Reserved (8 bytes)
+├── [77-92] Key MIC (16 bytes)
+├── [93-94] Key Data Length (big-endian)
+└── [95+]   Key Data (variable)
+```
+
+#### Key Info Bit Field
+
+| Bit(s) | Name | M1 | M2 | M3 | M4 |
+|--------|------|-----|-----|-----|-----|
+| 0-2 | Version | 2 | 2 | 2 | 2 |
+| 3 | Pairwise | 1 | 1 | 1 | 1 |
+| 6 | Install | 0 | 0 | 1 | 0 |
+| 7 | ACK | 1 | 0 | 1 | 0 |
+| 8 | MIC | 0 | 1 | 1 | 1 |
+| 9 | Secure | 0 | 0 | 1 | 1 |
+| 12 | Encrypted | 0 | 0 | 1 | 0 |
+
+Typical values: M1=0x008A, M2=0x010A, M3=0x13CA, M4=0x030A
+
+#### Data Frame TX vs Management TX
+
+EAPOL data frames use a different TX path than management frames:
+
+| | Management (iwn_tx_frame) | EAPOL Data (iwn_tx_eapol) |
+|---|---|---|
+| Frame type | Type=0 (management) | Type=2 (data) |
+| FC flags | None | ToDS=1 |
+| Node ID | `IWN5000_ID_BROADCAST` (15) | `IWN_ID_BSS` (0, AP node) |
+| Encapsulation | Raw 802.11 | 802.11 + LLC/SNAP + EAPOL hdr |
+| Security | None | None (EAPOL is pre-key) |
+| Rate | CCK 1 Mbps | CCK 1 Mbps |
+
+Both use TX ring 0 with `IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ`.
+
+#### SNonce Generation
+
+The Dell E6510 (Nehalem) lacks `RDRAND`. The SNonce is generated using:
+
+1. Read TSC via `__builtin_ia32_rdtsc()` (available in freestanding mode)
+2. Concatenate: TSC bytes (8) + MAC address (6) + counter (4) + TSC again (4)
+3. Hash with `iwn_sha1()` → first 20 bytes of SNonce
+4. Second round with different counter + TSC → remaining 12 bytes
+
+The SNonce does not need to be cryptographically random — the PMK and ANonce provide actual security. The SNonce only needs to be unique per handshake.
+
+#### Key Installation
+
+After Message 4 is sent, the PTK Temporal Key (TK) and GTK are installed into the firmware via `IWN_CMD_ADD_NODE` with update flags:
+
+**Pairwise key (TK)** — installed on AP BSS node (id=0):
+```c
+node.id = IWN_ID_BSS;           // 0
+node.control = IWN_NODE_UPDATE;
+node.flags = IWN_FLAG_SET_KEY;
+node.kflags = IWN_KFLAG_CCMP | IWN_KFLAG_KID(0);
+node.key = TK;                  // PTK[32:48]
+node.tsc = 0;
+```
+
+**Group key (GTK)** — installed on broadcast node (id=15):
+```c
+node.id = IWN5000_ID_BROADCAST; // 15
+node.control = IWN_NODE_UPDATE;
+node.flags = IWN_FLAG_SET_KEY;
+node.kflags = IWN_KFLAG_CCMP | IWN_KFLAG_KID(gtk_kid) | IWN_KFLAG_GROUP;
+node.key = GTK;
+node.tsc = RSC_from_M3;         // replay counter for group frames
+```
+
+After key installation, the firmware handles CCMP encryption/decryption of all data frames automatically.
+
+#### EAPOL RX Polling
+
+`iwn_poll_eapol()` polls the RX ring for 802.11 data frames containing EAPOL:
+
+1. Check `IWN_MPDU_RX_DONE` notification
+2. Parse FC: must be type=2 (data), subtype=0 or 8 (QoS data)
+3. Check LLC/SNAP at byte 24: must match `AA AA 03 00 00 00 88 8E`
+4. Extract EAPOL frame (header + body) after LLC/SNAP
+5. Also detects deauth frames (type=0, subtype=12) — AP deauthing means failure
+
+#### Device State Fields
+
+Phase 4b-c add these fields to `iwn_dev`:
+
+```c
+/* Phase 4: Association state */
+uint8_t  state;              /* IWN_STATE_* (INIT→SCAN→AUTH→ASSOC→RUN) */
+uint8_t  target_bssid[6];
+char     target_ssid[33];
+uint8_t  target_ssid_len;
+uint8_t  target_channel;
+uint16_t target_beacon_interval;
+uint8_t  target_security;    /* from scan result */
+uint16_t assoc_id;           /* AID from assoc response */
+char     password[64];       /* WPA2 passphrase */
+uint8_t  rsn_ie[32];         /* saved RSN IE for EAPOL replay */
+uint8_t  rsn_ie_len;
+
+/* Phase 4c: EAPOL state */
+uint8_t  ptk[48];            /* Pairwise Transient Key (KCK+KEK+TK) */
+uint8_t  gtk[16];            /* Group Temporal Key */
+uint8_t  gtk_kid;            /* GTK key index (0-3) */
+uint8_t  keys_installed;     /* 1 after PTK+GTK installed */
+```
+
+#### M3 Key Data Parsing
+
+The AP's Message 3 key data is AES-wrapped and may contain multiple KDE (Key Data Encapsulation) entries:
+
+```
+Encrypted Key Data (AES-unwrap removes 8-byte IV prefix):
+├── KDE: RSN IE (tag=0x30)           — AP's RSN capabilities
+├── KDE: GTK (tag=0xDD)             — Group Temporal Key
+│   ├── OUI: 00:0F:AC
+│   ├── Data Type: 0x01
+│   ├── Key ID + TX flag (1 byte)
+│   ├── Reserved (1 byte)
+│   └── GTK (16 bytes)
+└── Optional: padding
+```
+
+The parser walks TLV entries looking for tag=0xDD with OUI 00:0F:AC and data type 0x01 to find the GTK.
+
+#### Common Gotchas
+
+| Bug | Prevention |
+|-----|-----------|
+| Data frame FC byte order | FC for data+ToDS: byte[0]=0x08, byte[1]=0x01 |
+| LLC/SNAP missing | Data frame body MUST start with AA AA 03 00 00 00 88 8E |
+| Key Info big-endian | All EAPOL-Key multi-byte fields are big-endian |
+| MIC computed over wrong range | MIC covers EAPOL header + body (not 802.11 header) |
+| MIC field not zeroed before compute | Must zero 16 MIC bytes, compute HMAC, then write MIC |
+| PRF data ordering | Must use min/max of MAC addresses AND nonces (lexicographic) |
+| Wrong node ID for data TX | Data frames use id=0 (AP BSS), not id=15 (broadcast) |
+| AES-unwrap output size | Wrapped data includes 8-byte IV; plain is 8 bytes shorter |
+| M3 key data isn't just GTK | Must walk TLV to find GTK KDE (may also contain RSN IE) |
+| Replay counter not echoed | M2 echoes M1's counter; M4 echoes M3's counter |
+| WPA2 without password | Must check `password[0]` before starting connect — fail early |
 
 ### Phase 5: SNP + Integration
 
@@ -650,3 +945,5 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-24 | Phase 3 initial: big-command path, radio config (4 commands), scan command, beacon parsing, RSSI calculation, security detection, result display |
 | 2026-02-24 | Phase 3 debugging: 10 bugs found on real hardware. Synchronous command waits (iwn_wait_cmd), simple BT coex for 6000 series, FH_INT clearing, 8-command config sequence (added LINK_QUALITY + TXPOWER_DBM + CRITICAL_TEMP), 802.11 probe frame header, CCK 1Mbps TX rate, IWN_FILTER_BEACON. See [debug log](../research/iwn-phase3-debug-log.md) |
 | 2026-02-25 | Phase 4a implemented: WPA2-PSK crypto primitives — SHA-1, HMAC-SHA1, PBKDF2-SHA1, AES-128, AES Key Unwrap (RFC 3394), PRF-384. Self-contained module (~490 lines), 13/13 test vectors passing (FIPS, RFC, IEEE). No UEFI dependencies. |
+| 2026-02-25 | Phase 4b implemented: 802.11 Open System authentication + association. RXON state machine (INIT→AUTH→ASSOC→RUN), TX/RX management frames on ring 0, RSN IE for WPA2, post-assoc AP node (id=0) + full rate table. Password check before connect. `iwn_assoc.c` (~700 lines). |
+| 2026-02-25 | Phase 4c implemented: WPA2-PSK EAPOL 4-way handshake. PMK derivation (PBKDF2, 4096 rounds), EAPOL data frame TX/RX (LLC/SNAP 0x888E, node id=0), SNonce generation (RDTSC+SHA-1), PTK derivation (PRF-384), M2/M4 construction with HMAC-SHA1 MIC, M3 verification + AES-unwrap GTK extraction, pairwise+group key installation via ADD_NODE with CCMP flags. `iwn_eapol.c` (~420 lines). |

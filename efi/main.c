@@ -590,6 +590,30 @@ static void command_repl(void) {
             continue;
         }
 
+        /* iwn connect <SSID> — connect to a WiFi network (Phase 4b) */
+        if (str_starts_with(line, "iwn connect ")) {
+            const char *ssid = line + 12;
+            while (*ssid == ' ') ssid++;
+            if (*ssid) {
+                iwn_connect_cmd(ssid);
+            } else {
+                efi_print_ascii("  Usage: iwn connect <SSID>\r\n");
+            }
+            continue;
+        }
+
+        /* iwn pass <password> — set WPA2 password (Phase 4b) */
+        if (str_starts_with(line, "iwn pass ")) {
+            const char *pw = line + 9;
+            while (*pw == ' ') pw++;
+            if (*pw) {
+                iwn_set_password(pw);
+            } else {
+                efi_print_ascii("  Usage: iwn pass <password>\r\n");
+            }
+            continue;
+        }
+
         /* tensor — run tensor self-test */
         if (str_eq(line, "tensor")) {
             tensor_self_test();

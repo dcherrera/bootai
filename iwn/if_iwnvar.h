@@ -76,6 +76,7 @@ typedef struct {
     int8_t   rssi;           /* dBm */
     uint8_t  channel;
     uint8_t  security;       /* 0=open, 1=WPA, 2=WPA2, 3=WPA+WPA2 */
+    uint16_t beacon_interval; /* TU from beacon frame */
 } iwn_scan_result;
 
 #define IWN_MAX_SCAN_RESULTS 32
@@ -118,7 +119,33 @@ typedef struct iwn_dev {
     iwn_scan_result  scan_results[IWN_MAX_SCAN_RESULTS];
     int              n_scan_results;
     iwn_dma_info     cmd_dma;               /* DMA buffer for big commands (4KB) */
+
+    /* Phase 4: Association state */
+    uint8_t  state;              /* IWN_STATE_* */
+    uint8_t  target_bssid[6];
+    char     target_ssid[33];
+    uint8_t  target_ssid_len;
+    uint8_t  target_channel;
+    uint16_t target_beacon_interval;
+    uint8_t  target_security;    /* from scan result */
+    uint16_t assoc_id;           /* AID from assoc response */
+    char     password[64];       /* WPA2 passphrase (for Phase 4c) */
+    uint8_t  rsn_ie[32];         /* saved RSN IE for EAPOL replay */
+    uint8_t  rsn_ie_len;
+
+    /* Phase 4c: EAPOL state */
+    uint8_t  ptk[48];            /* Pairwise Transient Key (KCK+KEK+TK) */
+    uint8_t  gtk[16];            /* Group Temporal Key */
+    uint8_t  gtk_kid;            /* GTK key index (0-3) */
+    uint8_t  keys_installed;     /* 1 after PTK+GTK installed */
 } iwn_dev;
+
+/* ---- Connection state machine ---- */
+#define IWN_STATE_INIT   0
+#define IWN_STATE_SCAN   1
+#define IWN_STATE_AUTH   2
+#define IWN_STATE_ASSOC  3
+#define IWN_STATE_RUN    4
 
 /* ---- Device identification table ---- */
 struct iwn_ident {

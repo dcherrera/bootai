@@ -24,3 +24,7 @@ int iwn_init(iwn_dev *dev);
 
 /* Phase 3: WiFi scanning — scan for nearby networks */
 void iwn_scan_cmd(void);
+
+/* Phase 4: Association — connect to a network */
+void iwn_connect_cmd(const char *ssid);
+void iwn_set_password(const char *password);

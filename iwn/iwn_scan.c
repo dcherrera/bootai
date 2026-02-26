@@ -83,8 +83,8 @@ static void iwn_drain_rx(iwn_dev *dev) {
  * OpenBSD's iwn_cmd() with async=0 sleeps until the interrupt handler
  * processes the TX_DONE. We approximate this by polling.
  */
-static int iwn_wait_cmd(iwn_dev *dev, uint8_t cmd_code, const char *cmd_name,
-                        int timeout_ms) {
+int iwn_wait_cmd(iwn_dev *dev, uint8_t cmd_code, const char *cmd_name,
+                 int timeout_ms) {
     struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
 
     for (int t = 0; t < timeout_ms; t++) {
@@ -510,6 +510,9 @@ static void iwn_parse_beacon(iwn_dev *dev, const uint8_t *frame,
     iwn_memcpy(res->bssid, bssid, 6);
     res->rssi = rssi;
     res->security = 0;  /* assume open */
+
+    /* Beacon interval: frame bytes 32-33, little-endian TU */
+    res->beacon_interval = (uint16_t)frame[32] | ((uint16_t)frame[33] << 8);
 
     /* Walk Information Elements (TLV) */
     const uint8_t *ie = frame + 36;

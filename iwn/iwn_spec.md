@@ -78,78 +78,92 @@ We expose these 11 SNP functions:
 | `Receive` | Receive an Ethernet frame (802.11 → 802.3 decap inside) |
 | `GetStatus` | Check interrupt status, TX completion |
 
-### Driver Internal Architecture
+### Driver Internal Architecture (Actual)
 
 ```
-iwn_snp.c          — SNP protocol wrapper (Transmit/Receive/GetStatus)
-iwn_driver.c       — Core driver (init, scan, associate, TX/RX rings)
-iwn_fw.c           — Firmware loading (parse TLV, DMA upload)
-iwn_cmd.c          — Firmware command interface (RXON, scan, add_node)
-iwn_crypto.c       — WPA2-PSK: PBKDF2, HMAC-SHA1, AES-128, 4-way handshake
-iwn_shim.c         — UEFI shims for OpenBSD bus_dma, bus_space, timeout APIs
-if_iwnreg.h        — Hardware registers (copied from OpenBSD, verbatim)
-if_iwnvar.h        — Driver structs (copied from OpenBSD, modified)
+iwn.h              — Public API (probe, init, attach, scan, connect, password)
+iwn_internal.h     — Shared internal header (MMIO, prph, lock, DMA, FW, scan, assoc, EAPOL)
+iwn_shim.h         — UEFI shim: OpenBSD types → stdint, byte-order no-ops
+if_iwnreg.h        — Hardware registers (from OpenBSD, with additions)
+if_iwnvar.h        — Driver structs (iwn_dev, DMA rings, scan results, assoc/EAPOL state)
+iwn_pci.c          — PCI enumeration, device matching, iwn_init() entry point
+iwn_hw.c           — MMIO primitives, NIC lock, APM init/stop, EEPROM read
+iwn_dma.c          — DMA memory allocation, TX/RX ring setup, scheduler table
+iwn_fw.c           — Firmware parse/upload, hw_init, calibration, host commands
+iwn_scan.c         — Radio config, scan command, beacon parsing, result display
+iwn_assoc.c        — 802.11 Open System auth + association + post-assoc config
+iwn_eapol.c        — WPA2-PSK EAPOL 4-way handshake
+iwn_crypto.h       — Crypto API header
+iwn_crypto.c       — SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384
+test_crypto.c      — Host-testable: 13 standard test vectors
+iwn_snp.c          — (planned) SNP protocol wrapper
 ```
 
 ## Functional Requirements
 
-### FR1: PCI Discovery
+### FR1: PCI Discovery ✓ DONE (Phase 0)
 - Enumerate PCI devices using `EFI_PCI_IO_PROTOCOL`
-- Match Intel WiFi by vendor `0x8086`, device `0x422C` or `0x4239`
-- Map BAR0 for MMIO register access
+- Match Intel WiFi by vendor `0x8086` against full device ID table (~38 cards)
+- Enable MEMORY + BUS_MASTER PCI attributes for BAR0 MMIO access
+- REPL command: `iwn`
 
-### FR2: Firmware Loading
+### FR2: Firmware Loading ✓ DONE (Phase 2)
 - Load `iwn-6000` firmware from EFI System Partition (`\drivers\iwn-6000`)
-- Parse TLV header: signature `IWL\n` (`0x0a4c5749`), extract text/data/init sections
-- Upload via DMA engine in 128KB chunks
+- Parse legacy v2 header (not TLV — the 6200 uses legacy format)
+- Upload via FH DMA service channel 9 in 128KB chunks
 - Wait for `IWN_UC_READY` notification
+- Full init→calibration→power cycle→runtime firmware boot sequence
 
-### FR3: DMA Ring Management
-- Allocate physically contiguous DMA buffers via `AllocatePages()`
-- TX rings: 20 queues, 256 entries each (only queues 0-4 needed for basic operation)
+### FR3: DMA Ring Management ✓ DONE (Phase 2)
+- Allocate physically contiguous DMA buffers via `AllocatePages()` below 4GB
+- TX rings: queues 0 (data) and 4 (command) allocated, 256 entries each
 - RX ring: 64 entries, pre-allocated 4KB buffers
-- Command queue: TX queue 4 for host→firmware commands
+- Scheduler byte count table for TX queue management
+- ~2.5 MB total DMA memory
 
-### FR4: WiFi Scanning
-- Send `IWN_CMD_SCAN` (0x80) for 2.4 GHz channels
-- Firmware autonomously scans, sends probe requests
-- Collect scan results from `IWN_RX_DONE` notifications
-- Present available networks (SSID, RSSI, security)
+### FR4: WiFi Scanning ✓ DONE (Phase 3)
+- 8-command radio config sequence before scan
+- Send `IWN_CMD_SCAN` (code 128) for 2.4 GHz channels 1-11
+- Firmware scans, sends probe requests at CCK 1Mbps
+- Parse beacons/probe responses: SSID, BSSID, RSSI, channel, WPA/WPA2 security
+- REPL command: `iwn scan`
 
-### FR5: Association
-- State machine: INIT → SCAN → AUTH → ASSOC → RUN
-- `IWN_CMD_RXON` (0x10) to configure channel, BSSID, security
-- `IWN_CMD_TIMING` (0x14) for beacon interval
-- `IWN_CMD_ADD_NODE` (0x18) to add AP to station table
-- `IWN_CMD_LINK_QUALITY` (0x4E) for rate selection
+### FR5: Association — CODE COMPLETE, UNTESTED (Phase 4b)
+- State machine: INIT → AUTH → ASSOC → RUN
+- `IWN_CMD_RXON` for channel + BSSID, `IWN_CMD_TIMING` for beacon interval
+- Open System authentication (TX auth request, poll auth response)
+- Association request with RSN IE for WPA2 (CCMP + PSK)
+- Post-assoc: RXON with AID, ADD_NODE for AP (id=0), full rate table
+- REPL commands: `iwn pass <password>`, `iwn connect <SSID>`
 
-### FR6: WPA2-PSK Authentication
-- Derive PMK from passphrase + SSID via PBKDF2-SHA1 (4096 iterations)
-- 4-way EAPOL handshake:
-  - Msg 1: AP → STA (ANonce)
-  - Msg 2: STA → AP (SNonce + MIC)
-  - Msg 3: AP → STA (GTK + MIC)
-  - Msg 4: STA → AP (confirmation)
-- Derive PTK via PRF-384 (HMAC-SHA1 based)
-- Install temporal key via `IWN_CMD_ADD_NODE` with `IWN_CIPHER_CCMP`
+### FR6: WPA2-PSK Authentication — CRYPTO DONE, EAPOL UNTESTED (Phase 4a + 4c)
+- Crypto primitives (Phase 4a, ~490 lines): SHA-1, HMAC-SHA1, PBKDF2-SHA1, AES-128, AES Key Unwrap, PRF-384. 13/13 test vectors passing.
+- EAPOL 4-way handshake (Phase 4c, ~420 lines):
+  - PMK = PBKDF2-SHA1(password, SSID, 4096, 32)
+  - Msg 1: AP → STA (ANonce) — poll RX for data frame with LLC/SNAP 0x888E
+  - Msg 2: STA → AP (SNonce + RSN IE + MIC) — SNonce from RDTSC+SHA-1
+  - Msg 3: AP → STA (encrypted GTK + MIC) — verify MIC, AES-unwrap, parse GTK KDE
+  - Msg 4: STA → AP (MIC confirmation)
+- PTK = PRF-384(PMK, addresses, nonces) → KCK + KEK + TK
+- Install TK on AP node (id=0, CCMP) and GTK on broadcast node (id=15, CCMP+GROUP)
 - Hardware handles per-frame CCMP encrypt/decrypt after key install
 
-### FR7: Data TX/RX
+### FR7: Data TX/RX — PLANNED (Phase 5)
 - **TX**: Receive Ethernet frame from SNP → add 802.11 header → submit to TX ring → firmware encrypts (CCMP) and transmits
 - **RX**: Firmware receives and decrypts → DMA to RX ring → strip 802.11 header → deliver Ethernet frame via SNP Receive
 - Polling-based (no interrupts): read `CSR_INT` register periodically
 
-### FR8: SNP Integration
+### FR8: SNP Integration — PLANNED (Phase 5)
 - Install `EFI_SIMPLE_NETWORK_PROTOCOL` on a new handle
 - UEFI's `ConnectController` will bind IP4/TCP4/UDP4 on top
 - After SNP + DHCP, all existing BootAI networking works
 
-### FR9: User Interface
-- `wifi scan` — show available networks (already exists in wifi.c)
-- `wifi connect <SSID>` — prompt for password, associate + WPA2 handshake
-- `wifi disconnect` — deassociate
-- `wifi save` — persist credentials to `wifi.conf`
-- Bridge to existing `efi/wifi.c` UI code
+### FR9: User Interface — PARTIAL
+- `iwn` — probe + init + firmware load ✓
+- `iwn scan` — show available networks ✓
+- `iwn pass <password>` — set WPA2 passphrase ✓
+- `iwn connect <SSID>` — associate + WPA2 handshake ✓
+- Bridge to `wifi` commands via SNP — PLANNED (Phase 5)
 
 ## Non-Requirements (Explicit Scope Limits)
 
@@ -162,18 +176,21 @@ if_iwnvar.h        — Driver structs (copied from OpenBSD, modified)
 - **No IPv6** — existing stack is IPv4 only
 - **Polling only** — no interrupt handler, poll CSR_INT in main loop
 
-## Crypto Primitives Required
+## Crypto Primitives — IMPLEMENTED
 
-| Algorithm | Use | Lines (est.) |
-|-----------|-----|-------------|
-| SHA-1 | PBKDF2, HMAC, PRF | ~300 |
-| HMAC-SHA1 | Key derivation, MIC | ~100 |
-| PBKDF2-SHA1 | PSK → PMK (4096 iters) | ~100 |
-| AES-128 | Key wrap, EAPOL-Key decryption | ~500 |
-| PRF-384 | PMK + nonces → PTK | ~50 |
-| **Total** | | **~1,050** |
+| Algorithm | Standard | Lines (actual) | File |
+|-----------|----------|---------------|------|
+| SHA-1 | FIPS 180-4 | ~100 | `iwn_crypto.c` |
+| HMAC-SHA1 | RFC 2104 | ~40 | `iwn_crypto.c` |
+| PBKDF2-SHA1 | RFC 2898 | ~40 | `iwn_crypto.c` |
+| AES-128 (encrypt + decrypt) | FIPS 197 | ~240 | `iwn_crypto.c` |
+| AES Key Unwrap | RFC 3394 | ~50 | `iwn_crypto.c` |
+| PRF-384 | IEEE 802.11i | ~30 | `iwn_crypto.c` |
+| **Total** | | **~490** | |
 
-Note: Per-frame CCMP encryption is handled by the Intel 6200 firmware/hardware. We only need crypto for the WPA2 handshake.
+Plus 13 test vectors in `test_crypto.c` (~300 lines). Build: `make test-iwn-crypto`.
+
+Per-frame CCMP encryption is handled by the Intel 6200 firmware/hardware. We only need crypto for the WPA2 handshake.
 
 ## Files on USB Drive
 
@@ -187,12 +204,12 @@ BOOTAI/
 
 ## Success Criteria
 
-1. `wifi scan` shows local networks with SSID and signal strength
-2. `wifi connect MyNetwork` associates and completes WPA2 handshake
-3. DHCP assigns an IP address automatically
-4. `serve` starts HTTP server + mDNS on the WiFi interface
-5. From a Mac on the same network: `curl http://bootai.local:8080/health` returns `{"status":"ok"}`
-6. `chat` over the HTTP API works end-to-end (prompt → inference → response)
+1. ✓ `iwn scan` shows local networks with SSID, channel, RSSI, and security type — verified on Dell E6510
+2. `iwn connect <SSID>` authenticates, associates, and completes WPA2 EAPOL handshake — code complete, **untested on hardware**
+3. CCMP keys installed — AP does not deauth (connection stays alive) — **untested on hardware**
+4. DHCP assigns an IP address automatically — requires Phase 5 (SNP)
+5. `serve` starts HTTP server on the WiFi interface — requires Phase 5 (SNP)
+6. `curl http://bootai.local:8080/health` returns `{"status":"ok"}` — requires Phase 5 (SNP)
 
 ## Performance Targets
 
