@@ -72,10 +72,8 @@ bootai/iwn/
 └── test_crypto.c      # Host-testable: 13 standard test vectors (FIPS, RFC, IEEE)
 ```
 
-Future phases will add:
-
 ```
-└── iwn_snp.c          # EFI_SIMPLE_NETWORK_PROTOCOL wrapper
+├── iwn_snp.c          # EFI_SIMPLE_NETWORK_PROTOCOL wrapper (~280 lines)
 ```
 
 ## UEFI Integration
@@ -1068,12 +1066,189 @@ After Phase 4c installs CCMP keys via `IWN_CMD_ADD_NODE`, the firmware handles a
 | ARP payload size | ARP is 28 bytes (not including Ethernet header) |
 | EAPOL after handshake | Skip ethertype 0x888E in `iwn_rx_poll` to avoid double-processing |
 
-### Phase 5: SNP + Integration
+### Phase 5: SNP Integration (done)
 
-- Implement `EFI_SIMPLE_NETWORK_PROTOCOL` (Transmit/Receive/GetStatus)
-- Install SNP on new handle
-- UEFI stack binds IP4/TCP4/UDP4 automatically
-- Existing BootAI networking works over WiFi
+Wraps the IWN driver as `EFI_SIMPLE_NETWORK_PROTOCOL` so UEFI's built-in IP4/TCP4/UDP4 stack binds automatically. After `iwn connect`, DHCP runs and all existing BootAI networking (HTTP server, mDNS, DNS, fetch) works over WiFi with zero changes.
+
+**File**: `iwn_snp.c` (~280 lines)
+
+#### Architecture
+
+```
+  BootAI HTTP Server / mDNS / DNS / HTTP GET
+          ↓
+  UEFI TCP4 / UDP4 / IP4 Protocols
+          ↓
+  MnpDxe / ArpDxe / Ip4Dxe (UEFI firmware DXE drivers)
+          ↓
+  EFI_SIMPLE_NETWORK_PROTOCOL ← iwn_snp.c implements this
+          ↓
+  iwn_encap_tx() / iwn_rx_dequeue() (Phase 4d)
+          ↓
+  802.11 + CCMP (firmware handles encryption)
+          ↓
+  Intel 6200 hardware
+```
+
+The SNP layer is thin — it translates between UEFI's Ethernet-style Transmit/Receive interface and the Phase 4d data path that handles 802.11 encapsulation, LLC/SNAP headers, and CCMP encryption.
+
+#### Automatic Connect Flow
+
+After Phase 5, the full connect-to-networking sequence is automatic:
+
+```
+> iwn connect Herrera
+  Connecting to 'Herrera' ch 11 ...
+  Auth ok
+  Assoc ok (AID=1)
+  EAPOL msg 1-4: handshake complete
+  PTK/GTK installed
+  SNP installed                    ← Phase 5: SNP + device path installed
+  Waiting for DHCP... OK           ← efi_net_init() runs automatically
+  Network: ready
+```
+
+This is triggered by two lines added at the end of `iwn_connect()` (in `iwn_assoc.c`):
+
+```c
+iwn_snp_install();
+efi_net_init();
+```
+
+#### SNP Function Table
+
+| Function | Implementation | Notes |
+|----------|---------------|-------|
+| `Start` | Set State = STARTED | No-op — HW already running |
+| `Stop` | Set State = STOPPED | No-op |
+| `Initialize` | Set State = INITIALIZED | No-op — HW init done by firmware load |
+| `Reset` | Return SUCCESS | No-op |
+| `Shutdown` | Set State = STOPPED | No-op |
+| `ReceiveFilters` | Store in Mode | Accept unicast + broadcast |
+| `StationAddress` | Copy MAC | Reset copies PermanentAddress |
+| `Statistics` | Return UNSUPPORTED | Not implemented |
+| `MCastIpToMac` | Map IPv4 multicast | `01:00:5E:(IP[1]&0x7F):IP[2]:IP[3]` |
+| `NvData` | Return UNSUPPORTED | Not implemented |
+| `GetStatus` | Poll HW + recycle TX | Calls `iwn_rx_poll()`, returns recycled TX buffer |
+| `Transmit` | Encapsulate + TX | Calls `iwn_encap_tx()` — handles both header modes |
+| `Receive` | Dequeue + parse | Calls `iwn_rx_dequeue()` — fills out Ethernet header fields |
+
+#### SNP Mode Initialization
+
+The Mode struct is initialized to report an Ethernet-like device:
+
+```c
+snp_mode.State              = EFI_SIMPLE_NETWORK_INITIALIZED;
+snp_mode.HwAddressSize      = 6;
+snp_mode.MediaHeaderSize    = 14;
+snp_mode.MaxPacketSize      = 1500;
+snp_mode.IfType             = 6;   /* IANA ifType for Ethernet */
+snp_mode.MediaPresent       = 1;
+snp_mode.ReceiveFilterMask  = UNICAST | BROADCAST;
+snp_mode.CurrentAddress     = dev->mac_addr;
+snp_mode.PermanentAddress   = dev->mac_addr;
+snp_mode.BroadcastAddress   = FF:FF:FF:FF:FF:FF;
+```
+
+State is set to INITIALIZED immediately (not STOPPED) because the hardware is fully initialized before SNP is installed — firmware loaded, associated, keys installed.
+
+#### TX Buffer Recycling
+
+UEFI's IP stack passes a buffer to `Transmit()` and expects `GetStatus()` to return the same pointer when TX is done. Since IWN's TX is synchronous (copy into HW ring, kick firmware), the buffer is free immediately:
+
+```c
+#define TX_RECYCLE_COUNT 8
+static void *tx_recycle[TX_RECYCLE_COUNT];
+static int tx_recycle_head, tx_recycle_tail;
+```
+
+`Transmit()` records the buffer pointer in the ring. `GetStatus()` returns one pointer per call. 8 slots is more than enough — the UEFI IP stack typically has 1-2 TX buffers in flight.
+
+#### Transmit HeaderSize Semantics
+
+UEFI's `Transmit()` has two modes controlled by `HeaderSize`:
+
+| HeaderSize | Meaning | Buffer Contains |
+|-----------|---------|-----------------|
+| 0 | Complete frame | Full Ethernet frame (14-byte header + payload) |
+| != 0 | Header components separate | Payload only; DestAddr, SrcAddr, Protocol provided as parameters |
+
+Both modes extract the destination MAC and ethertype, then call `iwn_encap_tx()` which builds the 802.11 frame with LLC/SNAP.
+
+#### Handle Installation
+
+SNP is installed on a new UEFI handle with two protocols:
+
+1. **SNP** (`gEfiSimpleNetworkProtocolGuid`): The protocol function table
+2. **Device Path** (`gEfiDevicePathProtocolGuid`): MAC Address Device Path for driver binding
+
+```
+Device Path:
+├── MAC Address Node (Type=3/Messaging, SubType=37)
+│   ├── Length: 37 bytes (4 header + 32 MAC + 1 IfType)
+│   ├── MAC: 00:27:10:56:AD:80 (+ 26 zero-padding to 32 bytes)
+│   └── IfType: 6 (Ethernet)
+└── End Entire Device Path (Type=0x7F, SubType=0xFF, Length=4)
+```
+
+After installation, `ConnectController(handle, NULL, NULL, TRUE)` triggers recursive driver binding. MnpDxe's `Supported()` checks for SNP on the handle — if found, it binds and creates the MNP → ARP → IP4 → TCP4/UDP4 protocol stack.
+
+#### UEFI Type Additions (efi.h)
+
+Phase 5 adds ~80 lines to `efi.h`:
+
+| Type | Purpose |
+|------|---------|
+| `EFI_MAC_ADDRESS` | 32-byte MAC address (UEFI spec, first 6 used) |
+| `EFI_IP_ADDRESS` | IP address union (IPv4/IPv6) |
+| `EFI_SIMPLE_NETWORK_MODE` | Read-only state (HwAddressSize, MAC, MediaPresent, etc.) |
+| `EFI_SIMPLE_NETWORK_PROTOCOL` | 14 function pointers + WaitForPacket + Mode |
+| SNP state constants | STOPPED=0, STARTED=1, INITIALIZED=2 |
+| Receive filter bits | UNICAST, MULTICAST, BROADCAST, PROMISCUOUS |
+| Interrupt status bits | RECEIVE_INTERRUPT, TRANSMIT_INTERRUPT |
+| `InstallProtocolInterface` | Typed (was `void *`) — needed to install SNP |
+
+#### GUID Definitions (net.c)
+
+Two new GUIDs added to `efi/net.c`:
+
+```c
+EFI_GUID gEfiSimpleNetworkProtocolGuid = {
+    0xA19832B9, 0xAC25, 0x11D3,
+    {0x9A, 0x2D, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D}
+};
+
+EFI_GUID gEfiDevicePathProtocolGuid = {
+    0x09576E91, 0x6D3F, 0x11D2,
+    {0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
+};
+```
+
+#### Guard Against Double Install
+
+`iwn_snp_install()` is guarded by a static `snp_installed` flag. This prevents issues if `iwn connect` is called multiple times (e.g., reconnect after deauth).
+
+#### Known Risks
+
+| Risk | Impact | Mitigation |
+|------|--------|-----------|
+| Dell firmware lacks MnpDxe | IP stack won't bind to SNP | Load MnpDxe.efi from `\drivers\` directory on USB |
+| DHCP timeout on slow AP | `efi_net_init()` waits 8s, may not be enough | DHCP can complete late — `net_available` set even on timeout |
+| No WaitForPacket event | MnpDxe may expect a signal event for RX notifications | Set to NULL (polling only) — most MnpDxe implementations handle this |
+| IfType mismatch | Some UEFI stacks check IfType strictly | Set to 6 (IANA Ethernet), matching MnpDxe's expectations |
+
+#### Common Gotchas
+
+| Bug | Prevention |
+|-----|-----------|
+| UEFI IP stack doesn't bind | Call `ConnectController(handle, NULL, NULL, TRUE)` after install |
+| Transmit HeaderSize == 0 semantics | Buffer has complete Ethernet frame — parse DST/ethertype from bytes 0-13 |
+| Transmit HeaderSize != 0 semantics | DestAddr and Protocol provided separately — Buffer is payload only |
+| GetStatus TxBuf NULL crash | Check `TxBuf != NULL` before dereferencing |
+| Mode State not checked | Each SNP function checks State and returns appropriate error |
+| IfType wrong value | IANA ifType for Ethernet is 6, not 1 |
+| MCastIpToMac mapping | IPv4 `224.x.y.z` → MAC `01:00:5E:(x & 0x7F):y:z` — mask bit 0 of second octet |
+| SNP installed before keys ready | Only install after `iwn_connect()` succeeds — not during `iwn_probe()` |
 
 ## Key Design Decisions
 
@@ -1106,3 +1281,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-25 | Phase 4b implemented: 802.11 Open System authentication + association. RXON state machine (INIT→AUTH→ASSOC→RUN), TX/RX management frames on ring 0, RSN IE for WPA2, post-assoc AP node (id=0) + full rate table. Password check before connect. `iwn_assoc.c` (~700 lines). |
 | 2026-02-25 | Phase 4c implemented: WPA2-PSK EAPOL 4-way handshake. PMK derivation (PBKDF2, 4096 rounds), EAPOL data frame TX/RX (LLC/SNAP 0x888E, node id=0), SNonce generation (RDTSC+SHA-1), PTK derivation (PRF-384), M2/M4 construction with HMAC-SHA1 MIC, M3 verification + AES-unwrap GTK extraction, pairwise+group key installation via ADD_NODE with CCMP flags. `iwn_eapol.c` (~420 lines). |
 | 2026-02-25 | Phase 4d implemented: Data frame TX/RX. `iwn_tx_raw()` canonical ring 0 submit (OFDM 24 Mbps, CCMP security field). `iwn_encap_tx()` Ethernet-to-802.11 encapsulation with LLC/SNAP, Protected bit, broadcast/unicast node selection. `iwn_rx_poll()` non-blocking HW drain with 802.11-to-Ethernet decapsulation, QoS data handling (26-byte header), deauth detection. 16-slot software RX buffer (24 KB). `iwn ping` ARP smoke test command. `iwn_data.c` (~280 lines). |
+| 2026-02-26 | Phase 5 implemented: SNP integration. `iwn_snp.c` (~280 lines) wraps IWN as `EFI_SIMPLE_NETWORK_PROTOCOL`. 14 SNP functions backed by `iwn_encap_tx()`/`iwn_rx_dequeue()`. TX buffer recycling ring (8 slots). MAC Address Device Path for driver binding. Auto DHCP via `efi_net_init()` after connect. Added SNP types + typed `InstallProtocolInterface` to `efi.h` (~80 lines). GUIDs in `net.c`. |

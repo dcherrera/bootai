@@ -13,7 +13,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [Inference on Bare Metal](architecture/inference-on-bare-metal.md) — Model conversion, disk image creation, running SmolLM2-135M
 - [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions
 - [WiFi & Driver Loader](architecture/wifi-and-drivers.md) — UEFI driver loading from disk, WiFi scan/connect via WiFi2 protocol, wifi.conf auto-connect
-- [IWN WiFi Driver](architecture/iwn-wifi-driver.md) — Native Intel 6200 WiFi driver ported from OpenBSD, PCI probe, register headers, SNP integration plan
+- [IWN WiFi Driver](architecture/iwn-wifi-driver.md) — Native Intel 6200 WiFi driver ported from OpenBSD: PCI probe, MMIO/EEPROM, DMA/firmware, scanning, auth/assoc, WPA2 EAPOL, data TX/RX, SNP integration
 
 ## Research
 

@@ -110,6 +110,10 @@ int iwn_rx_pending(iwn_dev *dev);
 int iwn_rx_dequeue(iwn_dev *dev, uint8_t *buf, uint16_t *buf_len);
 void iwn_ping_cmd(void);
 
+/* ---- SNP wrapper (iwn_snp.c) ---- */
+
+int iwn_snp_install(void);
+
 /* ---- Global device state (iwn_pci.c) ---- */
 
 extern iwn_dev g_iwn;

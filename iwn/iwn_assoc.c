@@ -678,6 +678,10 @@ int iwn_connect(iwn_dev *dev, const char *ssid) {
             return -1;
     }
 
+    /* Phase 5: Install SNP + start DHCP */
+    iwn_snp_install();
+    efi_net_init();
+
     return 0;
 }
 

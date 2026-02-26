@@ -447,7 +447,8 @@ struct EFI_BOOT_SERVICES {
     void *CheckEvent;
 
     /* Protocol Handlers */
-    void *InstallProtocolInterface;
+    EFI_STATUS (EFIAPI *InstallProtocolInterface)(EFI_HANDLE *Handle, EFI_GUID *Protocol,
+                                                  UINTN InterfaceType, void *Interface);
     void *ReinstallProtocolInterface;
     void *UninstallProtocolInterface;
     EFI_STATUS (EFIAPI *HandleProtocol)(EFI_HANDLE Handle, EFI_GUID *Protocol, void **Interface);
@@ -501,6 +502,93 @@ struct EFI_SYSTEM_TABLE {
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
     void                            *RuntimeServices;
     EFI_BOOT_SERVICES              *BootServices;
+};
+
+/* ---- EFI_SIMPLE_NETWORK_PROTOCOL (UEFI 2.x) ---- */
+
+/* SNP states */
+#define EFI_SIMPLE_NETWORK_STOPPED      0
+#define EFI_SIMPLE_NETWORK_STARTED      1
+#define EFI_SIMPLE_NETWORK_INITIALIZED  2
+
+/* Receive filter bits */
+#define EFI_SIMPLE_NETWORK_RECEIVE_UNICAST               0x01
+#define EFI_SIMPLE_NETWORK_RECEIVE_MULTICAST             0x02
+#define EFI_SIMPLE_NETWORK_RECEIVE_BROADCAST             0x04
+#define EFI_SIMPLE_NETWORK_RECEIVE_PROMISCUOUS           0x08
+#define EFI_SIMPLE_NETWORK_RECEIVE_PROMISCUOUS_MULTICAST 0x10
+
+/* Interrupt status bits (for GetStatus) */
+#define EFI_SIMPLE_NETWORK_RECEIVE_INTERRUPT  0x01
+#define EFI_SIMPLE_NETWORK_TRANSMIT_INTERRUPT 0x02
+
+/* MAC address (UEFI spec: 32 bytes, only first HwAddressSize used) */
+typedef struct { uint8_t Addr[32]; } EFI_MAC_ADDRESS;
+
+/* IP address union */
+typedef union {
+    uint32_t         Addr[4];
+    EFI_IPv4_ADDRESS v4;
+} EFI_IP_ADDRESS;
+
+/* SNP Mode — read-only state exposed to consumers */
+typedef struct {
+    uint32_t        State;
+    uint32_t        HwAddressSize;       /* 6 for Ethernet */
+    uint32_t        MediaHeaderSize;     /* 14 for Ethernet */
+    uint32_t        MaxPacketSize;       /* 1500 */
+    uint32_t        NvRamSize;
+    uint32_t        NvRamAccessSize;
+    uint32_t        ReceiveFilterMask;
+    uint32_t        ReceiveFilterSetting;
+    uint32_t        MaxMCastFilterCount;
+    uint32_t        MCastFilterCount;
+    EFI_MAC_ADDRESS MCastFilter[16];
+    EFI_MAC_ADDRESS CurrentAddress;
+    EFI_MAC_ADDRESS BroadcastAddress;
+    EFI_MAC_ADDRESS PermanentAddress;
+    uint8_t         IfType;              /* 6 = Ethernet (IANA) */
+    BOOLEAN         MacAddressChangeable;
+    BOOLEAN         MultipleTxSupported;
+    BOOLEAN         MediaPresentSupported;
+    BOOLEAN         MediaPresent;
+} EFI_SIMPLE_NETWORK_MODE;
+
+/* Forward declaration */
+typedef struct EFI_SIMPLE_NETWORK_PROTOCOL EFI_SIMPLE_NETWORK_PROTOCOL;
+
+struct EFI_SIMPLE_NETWORK_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *Start)(EFI_SIMPLE_NETWORK_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *Stop)(EFI_SIMPLE_NETWORK_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *Initialize)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                    UINTN ExtraRxBufSize, UINTN ExtraTxBufSize);
+    EFI_STATUS (EFIAPI *Reset)(EFI_SIMPLE_NETWORK_PROTOCOL *This, BOOLEAN ExtendedVerification);
+    EFI_STATUS (EFIAPI *Shutdown)(EFI_SIMPLE_NETWORK_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *ReceiveFilters)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                        uint32_t Enable, uint32_t Disable,
+                                        BOOLEAN ResetMCastFilter, UINTN MCastFilterCnt,
+                                        EFI_MAC_ADDRESS *MCastFilter);
+    EFI_STATUS (EFIAPI *StationAddress)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                        BOOLEAN Reset, EFI_MAC_ADDRESS *New);
+    EFI_STATUS (EFIAPI *Statistics)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                    BOOLEAN Reset, UINTN *StatisticsSize, void *StatisticsTable);
+    EFI_STATUS (EFIAPI *MCastIpToMac)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                      BOOLEAN IPv6, EFI_IP_ADDRESS *IP, EFI_MAC_ADDRESS *MAC);
+    EFI_STATUS (EFIAPI *NvData)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                BOOLEAN ReadWrite, UINTN Offset, UINTN BufferSize, void *Buffer);
+    EFI_STATUS (EFIAPI *GetStatus)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                   uint32_t *InterruptStatus, void **TxBuf);
+    EFI_STATUS (EFIAPI *Transmit)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                  UINTN HeaderSize, UINTN BufferSize, void *Buffer,
+                                  EFI_MAC_ADDRESS *SrcAddr, EFI_MAC_ADDRESS *DestAddr,
+                                  uint16_t *Protocol);
+    EFI_STATUS (EFIAPI *Receive)(EFI_SIMPLE_NETWORK_PROTOCOL *This,
+                                 UINTN *HeaderSize, UINTN *BufferSize, void *Buffer,
+                                 EFI_MAC_ADDRESS *SrcAddr, EFI_MAC_ADDRESS *DestAddr,
+                                 uint16_t *Protocol);
+    EFI_EVENT WaitForPacket;
+    EFI_SIMPLE_NETWORK_MODE *Mode;
 };
 
 /* ---- 802.11 / WiFi types (UEFI 2.7+) ---- */
@@ -608,6 +696,8 @@ extern EFI_GUID gEfiDns4ProtocolGuid;
 extern EFI_GUID gEfiWiFi2ProtocolGuid;
 extern EFI_GUID gEfiSupplicantProtocolGuid;
 extern EFI_GUID gEfiPciIoProtocolGuid;
+extern EFI_GUID gEfiSimpleNetworkProtocolGuid;
+extern EFI_GUID gEfiDevicePathProtocolGuid;
 
 /* Global system table + image handle — set in efi_main */
 extern EFI_SYSTEM_TABLE *gST;
@@ -680,5 +770,8 @@ EFI_STATUS efi_get_local_ip(EFI_IPv4_ADDRESS *out_ip);
 
 /* Network helpers (used by drivers.c and wifi.c) */
 void connect_all_controllers(void);
+
+/* Phase 5: SNP install after WiFi connect */
+int iwn_snp_install(void);
 
 #endif /* BOOTAI_EFI_H */
