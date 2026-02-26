@@ -143,10 +143,7 @@ static int iwn_poll_mgmt(iwn_dev *dev, uint8_t expected_subtype,
             } else if (desc->type == IWN_TX_DONE) {
                 /* TX completion — expected, silently consume */
             } else if (desc->type != 0) {
-                /* Log unexpected notification types */
-                efi_print_ascii("  rx[");
-                print_dec((uint32_t)desc->type);
-                efi_print_ascii("] ");
+                /* Silently consume beacons and other noise */
             }
 
             dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;

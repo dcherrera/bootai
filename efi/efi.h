@@ -354,7 +354,7 @@ struct EFI_FILE_PROTOCOL {
     EFI_STATUS (EFIAPI *GetInfo)(EFI_FILE_PROTOCOL *This, EFI_GUID *InformationType,
                                  UINTN *BufferSize, void *Buffer);
     void *SetInfo;
-    void *Flush;
+    EFI_STATUS (EFIAPI *Flush)(EFI_FILE_PROTOCOL *This);
 };
 
 typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
@@ -717,10 +717,14 @@ int efi_read_line(char *buf, int max_len);
 
 /* Filesystem */
 EFI_STATUS efi_fs_init(void);
+EFI_FILE_PROTOCOL *efi_fs_root(void);
 EFI_STATUS efi_file_size(const char *path, UINTN *size_out);
 EFI_STATUS efi_read_file(const char *path, void **buffer, UINTN *size);
 EFI_STATUS efi_write_file(const char *path, const void *data, UINTN size);
 EFI_STATUS efi_list_dir(const char *path);
+
+/* Log file (tees console output to \bootai.log on USB) */
+void efi_log_flush(void);
 
 /* Networking */
 EFI_STATUS efi_net_init(void);

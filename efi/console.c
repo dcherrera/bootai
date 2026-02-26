@@ -8,6 +8,17 @@
 
 #include "efi.h"
 
+/* ---- Log buffer: tee all console output, flush to file on demand ---- */
+#define LOG_BUF_SIZE (128 * 1024)  /* 128 KB ring buffer */
+static char log_buf[LOG_BUF_SIZE];
+static UINTN log_pos = 0;
+static int log_active = 0;
+
+void efi_log_flush(void) {
+    if (log_pos == 0) return;
+    efi_write_file("bootai.log", log_buf, log_pos);
+}
+
 /* x86 port I/O for serial debug output */
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -54,6 +65,14 @@ void efi_print(const CHAR16 *str) {
 
 void efi_print_ascii(const char *str) {
     if (!str) return;
+
+    /* Tee to log buffer */
+    if (!log_active && efi_fs_root()) log_active = 1;
+    if (log_active) {
+        const char *p = str;
+        while (*p && log_pos < LOG_BUF_SIZE - 1)
+            log_buf[log_pos++] = *p++;
+    }
 
     /* Init serial on first use */
     if (!serial_inited) {

@@ -9,6 +9,8 @@
 
 static EFI_FILE_PROTOCOL *fs_root = 0;
 
+EFI_FILE_PROTOCOL *efi_fs_root(void) { return fs_root; }
+
 static EFI_GUID gEfiFileInfoGuid = EFI_FILE_INFO_GUID;
 
 /* Convert ASCII path to UCS-2, replacing '/' with '\\' for UEFI */

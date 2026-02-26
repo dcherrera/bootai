@@ -12,7 +12,7 @@ bootai/
 ├── efi/
 │   ├── main.c                   # EFI entry point → boot menu → inference REPL
 │   ├── efi.h                    # UEFI protocol types and helpers
-│   ├── console.c                # Framebuffer text output via GOP
+│   ├── console.c                # Text output via ConOut + log tee to bootai.log
 │   ├── input.c                  # Keyboard via Simple Text Input protocol
 │   ├── fs.c                     # File ops via Simple File System protocol
 │   ├── net.c                    # Networking via TCP4/HTTP protocols
@@ -172,6 +172,40 @@ Free:                    ~3.0 GB
 - All commits are from the developer — no AI co-author tags
 - Never mention Claude, AI, or generated code in commits
 - Write commit messages as if the developer wrote the code directly
+
+## Console Logging (`bootai.log`)
+
+All `efi_print_ascii()` output is tee'd into a 128KB in-memory buffer. The buffer is flushed to `\bootai.log` on the USB drive at the top of each REPL iteration (before the `> ` prompt). This gives you a full transcript of every boot session.
+
+### How it works
+
+1. `console.c` accumulates all `efi_print_ascii()` output in a static `log_buf[128KB]`
+2. `efi_log_flush()` calls `efi_write_file("bootai.log", log_buf, log_pos)` — overwrites the file each time with the full buffer
+3. The flush runs at the top of the main REPL loop, so every command's output is persisted before the next prompt
+4. The log is plain ASCII — no UCS-2 conversion
+
+### Reading the log
+
+After a session on real hardware, mount the USB on Mac and read:
+
+```bash
+diskutil mount /dev/diskNs1
+cat /Volumes/BOOTAI/bootai.log
+```
+
+### Limitations
+
+- **128KB max** — if output exceeds this, later output is silently dropped
+- **No flush during long commands** — if you power off mid-command (e.g. during `iwn connect`), that command's output is lost. Wait for the `> ` prompt to ensure the flush completed.
+- **Overwrites each flush** — the file always contains the current session from boot to the last completed command. No append across boots.
+- **Typed commands not captured** — `efi_read_line()` echoes via `efi_print()` (UCS-2 direct), not `efi_print_ascii()`, so user input text bypasses the log buffer. You see `> ` prompts but not what was typed.
+
+### Key functions
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `efi_log_flush()` | `console.c` | Write buffer to `\bootai.log` via `efi_write_file` |
+| `efi_fs_root()` | `fs.c` | Exposes static `fs_root` for log open check |
 
 ## Testing
 

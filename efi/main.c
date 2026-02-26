@@ -323,6 +323,7 @@ static void command_repl(void) {
     efi_print_ascii("\r\n");
 
     for (;;) {
+        efi_log_flush();  /* persist log to bootai.log after each command */
         efi_print_ascii("> ");
 
         int len = efi_read_line(line, sizeof(line));

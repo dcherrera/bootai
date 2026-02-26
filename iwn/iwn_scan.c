@@ -103,12 +103,7 @@ int iwn_wait_cmd(iwn_dev *dev, uint8_t cmd_code, const char *cmd_name,
                 return 0;
             }
 
-            /* Log other notification types */
-            if (desc->type != 0) {
-                efi_print_ascii("  rx[");
-                print_dec((uint32_t)desc->type);
-                efi_print_ascii("] ");
-            }
+            /* Silently consume beacons (192=RX_PHY, 193=MPDU_RX_DONE) */
 
             dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
         }
@@ -659,10 +654,6 @@ static int iwn_poll_scan_results(iwn_dev *dev, int timeout_ms) {
             }
 
             default:
-                /* Log notification type during scan */
-                efi_print_ascii("  rx[");
-                print_dec((uint32_t)desc->type);
-                efi_print_ascii("] ");
                 break;
             }
 
