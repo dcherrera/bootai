@@ -99,6 +99,17 @@ int iwn_connect(iwn_dev *dev, const char *ssid);
 
 int iwn_eapol_handshake(iwn_dev *dev);
 
+/* ---- Data TX/RX (iwn_data.c) ---- */
+
+int iwn_tx_raw(iwn_dev *dev, const uint8_t *frame, uint16_t frame_len,
+               uint8_t node_id, uint8_t security);
+int iwn_encap_tx(iwn_dev *dev, const uint8_t *dst_mac,
+                 uint16_t ethertype, const uint8_t *payload, uint16_t payload_len);
+int iwn_rx_poll(iwn_dev *dev);
+int iwn_rx_pending(iwn_dev *dev);
+int iwn_rx_dequeue(iwn_dev *dev, uint8_t *buf, uint16_t *buf_len);
+void iwn_ping_cmd(void);
+
 /* ---- Global device state (iwn_pci.c) ---- */
 
 extern iwn_dev g_iwn;

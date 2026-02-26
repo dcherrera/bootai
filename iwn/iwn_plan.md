@@ -13,7 +13,7 @@ Port OpenBSD's `iwn` driver to UEFI for Intel 6200 WiFi on the Dell E6510.
 | 4a | Crypto Primitives | SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384 | **DONE** |
 | 4b | Auth + Association | RXON state machine, 802.11 auth/assoc frames | **CODE COMPLETE** |
 | 4c | WPA2 Handshake | PMK derivation, EAPOL 4-way, key install | **CODE COMPLETE** |
-| 4d | Data Frame TX/RX | 802.11 data encap/decap, TX ring 0 | Pending |
+| 4d | Data Frame TX/RX | 802.11 data encap/decap, TX ring 0 | **CODE COMPLETE** |
 | 5 | SNP Integration | Wrap as EFI_SIMPLE_NETWORK_PROTOCOL, DHCP, full stack | Pending |
 | 6 | Polish | Error handling, reconnect, wifi.c UI integration | Pending |
 
@@ -819,61 +819,76 @@ Reconstructed Ethernet frame:
 
 #### Tasks
 
-- [ ] Activate TX ring 0 in scheduler:
-  - TX ring 0 descriptors were allocated in Phase 2 but queue not activated
-  - Set `SCHED_QUEUE_STATUS(0)` active, add bit 0 to `TXFACT`
-  - Ring 0 = AC_BE (best effort) — used for both management and data frames
-- [ ] Implement `iwn_tx_data(dev, ring, tx_desc, frame, frame_len)`:
-  - Write `iwn_cmd_data` + frame payload into TX ring descriptor
-  - Same mechanism as `iwn_cmd()` but on ring 0, not ring 4
+- [x] Implement `iwn_tx_raw(dev, frame, frame_len, node_id, security)`:
+  - Canonical ring 0 submit — clean version of what `iwn_tx_frame()` and `iwn_tx_eapol()` duplicated
+  - Write `iwn_cmd_data` + frame payload into TX ring 0 descriptor
+  - OFDM 24 Mbps (`plcp=0x09`) for data frames — firmware uses LINK_QUALITY retry chain
   - Update scheduler byte count table for ring 0
   - Kick hardware via `IWN_HBUS_TARG_WRPTR`
-- [ ] Implement `iwn_encap_tx(dev, dst_mac, ethertype, payload, len)`:
+  - **Note:** TX ring 0 was already activated in Phase 4b (`iwn_tx_frame()` and `iwn_tx_eapol()` use it)
+- [x] Implement `iwn_encap_tx(dev, dst_mac, ethertype, payload, len)`:
   - Build 802.11 data frame header (24 bytes):
     - `FC[0]=0x08` (data), `FC[1]=0x41` (ToDS=1, Protected=1 if keys installed, else 0x01)
     - Addr1=BSSID, Addr2=our MAC, Addr3=dst_mac
   - Add LLC/SNAP (8 bytes): `AA:AA:03:00:00:00` + big-endian EtherType
   - Append payload
-  - TX descriptor: `flags = IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ`, `id = IWN_ID_BSS` (0)
-  - `security = IWN_CIPHER_CCMP` if keys installed, else 0
-  - Rate: start at OFDM 24Mbps (`plcp` from rate table), firmware uses LINK_QUALITY retry chain
-  - Submit via `iwn_tx_data(dev, 0, ...)`
-- [ ] Implement `iwn_decap_rx(dev, rx_data, rx_len, eth_frame, eth_len)`:
-  - Check FC type == 2 (data) and `from_ds == 1`
-  - Extract: DST = Addr1 (us), SRC = Addr3 (original source), EtherType from SNAP
-  - Build Ethernet frame: `[DST(6)][SRC(6)][EtherType(2)][payload]`
-  - Skip frames not addressed to us (check Addr1 == our MAC or broadcast)
-- [ ] Handle `IWN_TX_DONE` (type 28) notifications:
-  - Parse TX status: success, retry count, failure reason
-  - Update TX ring read pointer (free descriptor)
-  - Log failures for debugging
-- [ ] Implement simple TX/RX test (`iwn ping`):
-  - Craft ARP request: who-has gateway IP (from hypothetical DHCP, or hardcoded `192.168.1.1`)
-  - Send via `iwn_encap_tx(dev, ff:ff:ff:ff:ff:ff, 0x0806, arp_payload, 28)`
-  - Poll RX for ARP reply
-  - If reply received, data path is working
-  - This is a manual smoke test — full IP comes with SNP in Phase 5
-- [ ] Implement RX data frame buffer:
-  - Ring buffer of received Ethernet frames (e.g., 16 × 2KB)
-  - `iwn_rx_pending()` — check if frames available
-  - `iwn_rx_dequeue(buf, len)` — dequeue next frame
-  - Fed by RX interrupt handler in `iwn_poll_rx` when type=193 and FC is data frame
-  - This buffer is what SNP's `Receive()` will read from in Phase 5
+  - Broadcast/multicast detection: `dst_mac[0] & 1` → node_id=15 (GTK), else node_id=0 (PTK)
+  - `security = IWN_CIPHER_CCMP` (2) if keys installed, else 0
+  - Submit via `iwn_tx_raw()`
+- [x] Implement `iwn_rx_poll(dev)`:
+  - Non-blocking drain of HW RX ring into 16-slot software buffer
+  - Parse `IWN_MPDU_RX_DONE` notifications for data frames (type=2)
+  - Handle QoS data frames (subtype=8): header is 26 bytes instead of 24
+  - Skip EAPOL frames (ethertype 0x888E) to avoid double-processing
+  - Verify LLC/SNAP prefix (`AA AA 03 00 00 00`)
+  - Decapsulate FromDS → Ethernet: DST=Addr1, SRC=Addr3, EtherType from SNAP
+  - Detect deauth (type=0, subtype=12): set state=INIT, clear keys_installed
+  - Handle `IWN_TX_DONE` (type 28): increment `tx_ok` counter
+  - Update `IWN_FH_RX_WPTR` and clear `IWN_INT`/`IWN_FH_INT` after draining
+- [x] Implement RX data frame buffer:
+  - Ring buffer: 16 × 1518 bytes (~24 KB) in `iwn_dev` struct
+  - `rx_head` (consumer) / `rx_tail` (producer) indices
+  - Drop-on-full policy (sufficient for DHCP and low-throughput traffic)
+  - `iwn_rx_pending(dev)` — return count of queued frames
+  - `iwn_rx_dequeue(dev, buf, buf_len)` — dequeue one Ethernet frame (calls `iwn_rx_poll()` internally)
+  - This is what SNP's `Receive()` will read from in Phase 5
+- [x] Implement `iwn_ping_cmd()` — ARP smoke test:
+  - Build ARP request for 192.168.1.1 (28-byte payload, sender IP 0.0.0.0)
+  - Send as broadcast via `iwn_encap_tx(dev, ff:ff:ff:ff:ff:ff, 0x0806, arp, 28)`
+  - Poll `iwn_rx_dequeue()` for 3 seconds looking for ARP reply (opcode=2)
+  - Print sender IP and MAC on reply, or timeout message
+  - Also prints ethertype/length of any non-ARP frames received (debug aid)
+- [x] Add `iwn_data.c` to Makefile `EFI_SRC`
+- [x] Add `iwn ping` REPL command to `efi/main.c`
+- [x] Add declarations to `iwn_internal.h` and `iwn.h`
+- [x] Add RX buffer fields to `iwn_dev` in `if_iwnvar.h`
+- [x] Verify: `make efi` compiles with zero new warnings
+- [x] Verify: `make test-iwn-crypto` — 13/13 tests still pass
 
 #### Test on Hardware
 
-Boot → `iwn` → `iwn scan` → `iwn connect Herrera` → `iwn ping` → should show:
+Boot → `iwn` → `iwn scan` → `iwn pass <password>` → `iwn connect Herrera` → `iwn ping` → should show:
 ```
-TX: ARP who-has 192.168.1.1
-RX: ARP reply from 192.168.1.1 is-at AA:BB:CC:DD:EE:FF
-Data path working!
+  Sending ARP request for 192.168.1.1...
+  ARP sent, waiting for reply...
+  ARP reply from 192.168.1.1 [AA:BB:CC:DD:EE:FF]
+  Data path working!
 ```
+
+#### Code Size
+
+| Component | Lines |
+|-----------|-------|
+| `iwn_data.c` | ~280 |
+| `if_iwnvar.h` additions | ~10 |
+| `iwn_internal.h` additions | ~8 |
+| `efi/main.c` additions | ~6 |
 
 #### Files
 
 ```
 bootai/iwn/
-└── iwn_data.c          ← TX ring 0 activation, 802.11 encap/decap, TX/RX data path
+└── iwn_data.c          ← iwn_tx_raw, iwn_encap_tx, iwn_rx_poll, iwn_rx_dequeue, iwn_ping_cmd
 ```
 
 ---

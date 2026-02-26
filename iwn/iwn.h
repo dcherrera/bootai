@@ -28,3 +28,6 @@ void iwn_scan_cmd(void);
 /* Phase 4: Association — connect to a network */
 void iwn_connect_cmd(const char *ssid);
 void iwn_set_password(const char *password);
+
+/* Phase 4d: Data TX/RX — send/receive data frames */
+void iwn_ping_cmd(void);

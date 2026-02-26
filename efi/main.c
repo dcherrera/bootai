@@ -614,6 +614,12 @@ static void command_repl(void) {
             continue;
         }
 
+        /* iwn ping — ARP ping to test data path (Phase 4d) */
+        if (str_eq(line, "iwn ping")) {
+            iwn_ping_cmd();
+            continue;
+        }
+
         /* tensor — run tensor self-test */
         if (str_eq(line, "tensor")) {
             tensor_self_test();

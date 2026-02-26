@@ -138,6 +138,16 @@ typedef struct iwn_dev {
     uint8_t  gtk[16];            /* Group Temporal Key */
     uint8_t  gtk_kid;            /* GTK key index (0-3) */
     uint8_t  keys_installed;     /* 1 after PTK+GTK installed */
+
+    /* Phase 4d: Data frame RX buffer */
+#define IWN_RX_BUF_COUNT  16
+#define IWN_RX_BUF_SIZE   1518      /* max Ethernet frame */
+    uint8_t  rx_buf[IWN_RX_BUF_COUNT][IWN_RX_BUF_SIZE];
+    uint16_t rx_buf_len[IWN_RX_BUF_COUNT];
+    int      rx_head;               /* consumer reads here */
+    int      rx_tail;               /* producer writes here */
+    uint32_t tx_ok;                 /* TX success counter */
+    uint32_t tx_fail;               /* TX failure counter */
 } iwn_dev;
 
 /* ---- Connection state machine ---- */

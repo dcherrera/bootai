@@ -54,11 +54,11 @@ All PCI IDs are vendor `8086` (Intel). These cards were shipped in millions of l
 
 ```
 bootai/iwn/
-├── iwn.h              # Public API (iwn_probe, iwn_init, iwn_attach, iwn_scan_cmd, iwn_connect_cmd)
-├── iwn_internal.h     # Shared internal header (MMIO, prph, lock, DMA, FW, scan, assoc, EAPOL)
+├── iwn.h              # Public API (iwn_probe, iwn_init, iwn_attach, iwn_scan_cmd, iwn_connect_cmd, iwn_ping_cmd)
+├── iwn_internal.h     # Shared internal header (MMIO, prph, lock, DMA, FW, scan, assoc, EAPOL, data)
 ├── iwn_shim.h         # UEFI shim: OpenBSD types → stdint, byte-order no-ops, bus_space stubs
 ├── if_iwnreg.h        # Hardware registers (from OpenBSD, with additions)
-├── if_iwnvar.h        # iwn_dev struct, DMA ring structs, scan results, assoc/EAPOL state, device IDs
+├── if_iwnvar.h        # iwn_dev struct, DMA ring structs, scan results, assoc/EAPOL/data state, device IDs
 ├── iwn_pci.c          # PCI enumeration, device matching, iwn_init() entry point
 ├── iwn_hw.c           # MMIO primitives, NIC lock, APM init/stop, EEPROM read, iwn_attach()
 ├── iwn_dma.c          # DMA memory allocation, TX/RX ring setup, scheduler table
@@ -66,6 +66,7 @@ bootai/iwn/
 ├── iwn_scan.c         # Radio config, scan command, beacon parsing, result display
 ├── iwn_assoc.c        # 802.11 Open System auth + association + post-assoc config (~700 lines)
 ├── iwn_eapol.c        # WPA2-PSK EAPOL 4-way handshake (~420 lines)
+├── iwn_data.c         # Data frame TX/RX: Ethernet↔802.11, software RX buffer (~280 lines)
 ├── iwn_crypto.h       # Crypto API: SHA-1, HMAC-SHA1, PBKDF2, AES-128, AES Unwrap, PRF-384
 ├── iwn_crypto.c       # Self-contained crypto implementation (~490 lines, no libc)
 └── test_crypto.c      # Host-testable: 13 standard test vectors (FIPS, RFC, IEEE)
@@ -910,6 +911,163 @@ The parser walks TLV entries looking for tag=0xDD with OUI 00:0F:AC and data typ
 | Replay counter not echoed | M2 echoes M1's counter; M4 echoes M3's counter |
 | WPA2 without password | Must check `password[0]` before starting connect — fail early |
 
+### Phase 4d: Data Frame TX/RX (done)
+
+Ethernet-to-802.11 encapsulation (TX) and 802.11-to-Ethernet decapsulation (RX), plus a software receive buffer that Phase 5 (SNP) will read from. The firmware handles CCMP encrypt/decrypt — we just set the security field in the TX descriptor.
+
+**File**: `iwn_data.c` (~280 lines)
+
+REPL command: `iwn ping` (ARP smoke test)
+
+#### API
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `iwn_tx_raw` | `(dev, frame, frame_len, node_id, security)` → `int` | Low-level: submit pre-built 802.11 frame on ring 0 |
+| `iwn_encap_tx` | `(dev, dst_mac, ethertype, payload, payload_len)` → `int` | High-level: Ethernet-style TX with 802.11 + LLC/SNAP encapsulation |
+| `iwn_rx_poll` | `(dev)` → `int` | Non-blocking: drain HW RX ring into software buffer, return count |
+| `iwn_rx_pending` | `(dev)` → `int` | Return count of queued frames in software buffer |
+| `iwn_rx_dequeue` | `(dev, buf, buf_len)` → `int` | Dequeue one Ethernet frame (calls `iwn_rx_poll` internally) |
+| `iwn_ping_cmd` | `(void)` | REPL: send ARP request, wait 3s for reply |
+
+#### TX Path: `iwn_tx_raw()`
+
+Canonical ring 0 submit — the clean version of what `iwn_tx_frame()` and `iwn_tx_eapol()` each duplicated. Takes a pre-built 802.11 frame and submits it:
+
+- Same ring 0 mechanics as existing code: descriptor at `ring->desc + idx * 128`, command at `ring->cmd + idx * 140`
+- `cmd.code = IWN_CMD_TX_DATA` (28), `cmd.qid = 0`
+- `tx->flags = IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ`
+- `tx->id = node_id`, `tx->security = security`
+- Rate: OFDM 24 Mbps (`plcp = 0x09`, `rflags = ANT(txant)`) — firmware uses LINK_QUALITY retry chain for rate fallback
+- `tx->lifetime = IWN_LIFETIME_INFINITE`
+- Scheduler byte count table updated for queue 0
+- HW kick: `IWN_HBUS_TARG_WRPTR = ring->cur | (0 << 8)`
+
+#### TX Path: `iwn_encap_tx()`
+
+High-level TX that takes Ethernet-style parameters and builds a complete 802.11 data frame:
+
+```
+802.11 Data Header (24 bytes)
+├── FC[0] = 0x08 (type=2 data, subtype=0)
+├── FC[1] = 0x41 if keys_installed (ToDS=1, Protected=1)
+│         = 0x01 otherwise (ToDS=1 only)
+├── Duration: 0x0000
+├── Addr1 (RA) = target_bssid (AP receives)
+├── Addr2 (TA) = mac_addr (we transmit)
+├── Addr3 (DA) = dst_mac (final destination)
+├── SeqCtrl = 0x0000 (firmware fills via AUTO_SEQ)
+│
+LLC/SNAP Header (8 bytes)
+├── DSAP: 0xAA, SSAP: 0xAA, Control: 0x03
+├── OUI: 00:00:00
+├── EtherType: big-endian ethertype parameter
+│
+Payload (variable)
+└── Raw payload bytes
+```
+
+**Node ID and security selection:**
+
+| Destination | `dst[0] & 1` | Node ID | Key Used |
+|-------------|-------------|---------|----------|
+| Unicast | 0 | `IWN_ID_BSS` (0) | PTK (pairwise) |
+| Broadcast/multicast | 1 | `IWN5000_ID_BROADCAST` (15) | GTK (group) |
+
+If `keys_installed`, security = `IWN_CIPHER_CCMP` (2). Otherwise security = 0.
+
+#### RX Path: `iwn_rx_poll()`
+
+Non-blocking drain of the HW RX ring into a 16-slot software frame buffer. For each `IWN_MPDU_RX_DONE` notification:
+
+1. Parse FC: check frame type and subtype
+2. **Deauth detection** (type=0, subtype=12): set `state = IWN_STATE_INIT`, clear `keys_installed`
+3. **Data frames** (type=2, subtype=0 or 8):
+   - Handle QoS data (subtype=8): header is 26 bytes instead of 24
+   - Skip EAPOL frames (ethertype 0x888E)
+   - Verify LLC/SNAP prefix (`AA AA 03 00 00 00`)
+   - Decapsulate FromDS → Ethernet frame:
+
+```
+FromDS Address Mapping (AP → us):
+├── Addr1 (RA) = our MAC (destination)
+├── Addr2 (TA) = AP BSSID (transmitter)
+└── Addr3 (SA) = original source MAC
+
+Decapsulated Ethernet Frame:
+├── DST = Addr1 (our MAC, 6 bytes)
+├── SRC = Addr3 (original source, 6 bytes)
+├── EtherType = LLC/SNAP bytes 6-7
+└── Payload = frame data after LLC/SNAP (8 bytes)
+```
+
+4. Queue into `dev->rx_buf[]` ring buffer (drop if full)
+5. **TX completions** (`IWN_TX_DONE`): increment `tx_ok` counter
+
+After draining, update `IWN_FH_RX_WPTR` and clear `IWN_INT`/`IWN_FH_INT`.
+
+#### RX Path: `iwn_rx_dequeue()`
+
+Consumer interface for Phase 5 (SNP Receive):
+
+1. Call `iwn_rx_poll()` to drain any new HW frames
+2. If `rx_head == rx_tail`, return -1 (no frames)
+3. Copy frame from `dev->rx_buf[rx_head]` to caller's buffer
+4. Advance `rx_head`
+
+This matches UEFI's polling model — the SNP `Receive()` function just calls `iwn_rx_dequeue()`.
+
+#### Software RX Buffer
+
+```c
+#define IWN_RX_BUF_COUNT  16
+#define IWN_RX_BUF_SIZE   1518      /* max Ethernet frame */
+
+uint8_t  rx_buf[16][1518];          /* ~24 KB ring buffer */
+uint16_t rx_buf_len[16];            /* stored frame lengths */
+int      rx_head;                    /* consumer reads here */
+int      rx_tail;                    /* producer writes here */
+uint32_t tx_ok;                      /* TX success counter */
+uint32_t tx_fail;                    /* TX failure counter */
+```
+
+16 slots is sufficient for DHCP handshake and low-throughput inference API traffic. Drop-on-full policy — no backpressure to the hardware.
+
+#### ARP Ping Smoke Test
+
+The `iwn ping` REPL command verifies the data path end-to-end:
+
+1. Build ARP request for 192.168.1.1 (28-byte ARP payload)
+2. Send as broadcast via `iwn_encap_tx(dev, ff:ff:ff:ff:ff:ff, 0x0806, arp, 28)`
+3. Poll `iwn_rx_dequeue()` for 3 seconds looking for ARP reply (opcode=2)
+4. On reply: print sender IP and MAC address
+5. Also prints ethertype/length of any non-ARP frames received
+
+**Note:** Sender IP is 0.0.0.0 (gratuitous ARP style) because we don't have an IP yet — that comes from DHCP in Phase 5.
+
+#### Firmware CCMP Handling
+
+After Phase 4c installs CCMP keys via `IWN_CMD_ADD_NODE`, the firmware handles all per-frame encryption and decryption:
+
+- **TX**: Setting `tx->security = IWN_CIPHER_CCMP` (2) tells the firmware to encrypt using the key installed for `tx->id` (node ID 0 = PTK, node ID 15 = GTK)
+- **RX**: The firmware decrypts incoming CCMP frames and strips the CCMP header before delivering to us. We receive plaintext
+- **No software crypto needed** for data frames — the Intel firmware does it all
+
+#### Common Gotchas
+
+| Bug | Prevention |
+|-----|-----------|
+| Protected bit not set | `FC[1] = 0x41` when `keys_installed`, `0x01` otherwise |
+| Wrong security value | `IWN_CIPHER_CCMP = 2`, not 1 (that's WEP40) |
+| Broadcast uses wrong node | `dst[0] & 1` → node_id=15 (group key), not node_id=0 |
+| FromDS addresses swapped | RX: Addr1=us, Addr2=AP, Addr3=source (not Addr2=source) |
+| QoS data header length | Subtype 8 has 2 extra bytes (QoS Control) — LLC/SNAP at offset 26, not 24 |
+| Scheduler byte count | Must update BOTH layers: `sched[idx]` and `sched[idx + RING_COUNT]` |
+| RX WPTR alignment | Must mask `& ~7` (8-entry aligned) |
+| RX buffer full | New frames silently dropped — acceptable for low-throughput use case |
+| ARP payload size | ARP is 28 bytes (not including Ethernet header) |
+| EAPOL after handshake | Skip ethertype 0x888E in `iwn_rx_poll` to avoid double-processing |
+
 ### Phase 5: SNP + Integration
 
 - Implement `EFI_SIMPLE_NETWORK_PROTOCOL` (Transmit/Receive/GetStatus)
@@ -947,3 +1105,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-25 | Phase 4a implemented: WPA2-PSK crypto primitives — SHA-1, HMAC-SHA1, PBKDF2-SHA1, AES-128, AES Key Unwrap (RFC 3394), PRF-384. Self-contained module (~490 lines), 13/13 test vectors passing (FIPS, RFC, IEEE). No UEFI dependencies. |
 | 2026-02-25 | Phase 4b implemented: 802.11 Open System authentication + association. RXON state machine (INIT→AUTH→ASSOC→RUN), TX/RX management frames on ring 0, RSN IE for WPA2, post-assoc AP node (id=0) + full rate table. Password check before connect. `iwn_assoc.c` (~700 lines). |
 | 2026-02-25 | Phase 4c implemented: WPA2-PSK EAPOL 4-way handshake. PMK derivation (PBKDF2, 4096 rounds), EAPOL data frame TX/RX (LLC/SNAP 0x888E, node id=0), SNonce generation (RDTSC+SHA-1), PTK derivation (PRF-384), M2/M4 construction with HMAC-SHA1 MIC, M3 verification + AES-unwrap GTK extraction, pairwise+group key installation via ADD_NODE with CCMP flags. `iwn_eapol.c` (~420 lines). |
+| 2026-02-25 | Phase 4d implemented: Data frame TX/RX. `iwn_tx_raw()` canonical ring 0 submit (OFDM 24 Mbps, CCMP security field). `iwn_encap_tx()` Ethernet-to-802.11 encapsulation with LLC/SNAP, Protected bit, broadcast/unicast node selection. `iwn_rx_poll()` non-blocking HW drain with 802.11-to-Ethernet decapsulation, QoS data handling (26-byte header), deauth detection. 16-slot software RX buffer (24 KB). `iwn ping` ARP smoke test command. `iwn_data.c` (~280 lines). |
