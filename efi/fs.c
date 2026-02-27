@@ -161,6 +161,17 @@ EFI_STATUS efi_write_file(const char *path, const void *data, UINTN size) {
     CHAR16 wpath[256];
     ascii_to_ucs2(path, wpath, 256);
 
+    /* Delete existing file first to avoid stale data at end.
+     * UEFI Write() doesn't truncate — if the old file was larger,
+     * leftover bytes from the previous session persist. */
+    {
+        EFI_FILE_PROTOCOL *old = 0;
+        EFI_STATUS s = fs_root->Open(fs_root, &old, wpath,
+            EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+        if (s == EFI_SUCCESS)
+            old->Delete(old);  /* deletes file and closes handle */
+    }
+
     EFI_FILE_PROTOCOL *file = 0;
     EFI_STATUS status = fs_root->Open(fs_root, &file, wpath,
         EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);

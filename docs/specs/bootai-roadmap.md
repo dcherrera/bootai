@@ -158,7 +158,8 @@ The driver has its own internal phases:
 | 4c | WPA2 EAPOL — 4-way handshake, PTK/GTK derivation, CCMP key install | CODE COMPLETE |
 | 4d | Data TX/RX — Ethernet↔802.11 encap, software RX buffer, CCMP | COMPLETE |
 | 5a | SNP integration — EFI_SIMPLE_NETWORK_PROTOCOL wrapper | COMPLETE |
-| 5b | Network stack diagnostics — protocol enumeration, DXE driver strategy | COMPLETE |
+| 5b | Network stack diagnostics — protocol enumeration, DXE driver testing | COMPLETE |
+| 5c | Custom network stack — ARP/DHCP/IP/UDP/TCP on raw SNP | PLANNED |
 
 **IWN Phase 0-1** (2026-02-23): PCI bus enumeration finds Intel 6200, enables MMIO + bus master, reads EEPROM (MAC, RF config, calibration data, regulatory domain). Confirmed on Dell E6510 hardware.
 
@@ -176,7 +177,9 @@ The driver has its own internal phases:
 
 **IWN Phase 5a** (2026-02-26): SNP integration. `iwn_snp.c` (~280 lines) wraps IWN as `EFI_SIMPLE_NETWORK_PROTOCOL`. 14 SNP functions, TX buffer recycling, MAC device path. Auto DHCP via `efi_net_init()` after connect.
 
-**IWN Phase 5b** (2026-02-26): Network stack diagnostics for Dell E6510. `efi/net_diag.c` (~100 lines) enumerates 8 network protocol handles. `netdiag` REPL command. Guard `connect_all_controllers` behind `iwn_snp_is_installed()`. Three-phase strategy: diagnostics → bundle EDK2 DXE drivers on USB → custom network stack (only if DXE drivers fail).
+**IWN Phase 5b** (2026-02-26): Network stack diagnostics for Dell E6510. `efi/net_diag.c` (~100 lines) enumerates 8 network protocol handles. `netdiag` REPL command. Guard `connect_all_controllers` behind `iwn_snp_is_installed()`. Dell testing confirmed: zero IP stack protocols, DXE drivers loaded but ConnectController hangs (OVMF DXE drivers incompatible with Dell firmware). ConnectController removed from `iwn_snp_install()`. `iwn_snp_get_protocol()` getter added for custom stack access.
+
+**IWN Phase 5c** (planned): Custom network stack on raw SNP. ARP, DHCP, IP, UDP, TCP implemented directly against `EFI_SIMPLE_NETWORK_PROTOCOL` via `iwn_snp_get_protocol()`. Required because Dell E6510 firmware lacks EDK2 IP stack drivers and OVMF DXE drivers are incompatible. ~1800 LOC estimated.
 
 **Files**: `bootai/iwn/` — 13 source files (~4,600 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c, iwn_scan.c, iwn_assoc.c, iwn_eapol.c, iwn_data.c, iwn_snp.c, iwn_crypto.h, iwn_crypto.c, test_crypto.c)
 
@@ -186,10 +189,9 @@ The driver has its own internal phases:
 
 ### Remaining
 
+- **IWN Phase 5c**: Custom network stack (ARP/DHCP/IP/UDP/TCP) on raw SNP — required for Dell E6510 networking
 - mDNS discovery (5d) — quality-of-life, not a blocker
 - Streaming mode (`stream: true`) for chat completions (chunked transfer encoding + SSE)
-- IWN: Test full connect flow on Dell E6510 hardware (Phases 4b-5b are code-complete but untested on real hardware)
-- IWN: If Dell lacks IP stack DXE drivers, bundle EDK2 `.efi` files on USB (zero code changes, `efi/drivers.c` already loads them)
 
 ## Phase 6: Tool Use (SCAFFOLDED)
 

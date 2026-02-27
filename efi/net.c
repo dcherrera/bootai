@@ -204,10 +204,10 @@ EFI_STATUS efi_net_init(void) {
     if (!gBS) return EFI_NOT_READY;
 
     /* Connect all controllers so network stack binds to NIC.
-     * Skip if IWN SNP is already installed — iwn_snp_install() already
-     * called ConnectController on the SNP handle. Broad connect here
-     * could re-trigger driver enumeration on the PCI WiFi device. */
-    if (!iwn_snp_is_installed()) {
+     * On QEMU: binds built-in virtio-net → MnpDxe → IP stack.
+     * On Dell E6510: skip entirely — loaded DXE drivers (MnpDxe etc.)
+     * hang inside ConnectController. IWN uses custom network stack. */
+    if (!iwn_snp_is_installed() && !efi_drivers_were_loaded()) {
         connect_all_controllers();
         connect_all_controllers();
     }

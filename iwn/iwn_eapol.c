@@ -691,6 +691,11 @@ int iwn_eapol_handshake(iwn_dev *dev) {
      * ────────────────────────────────────────────────────────────────── */
     efi_print_ascii("  Waiting for M3...\r\n");
     {
+        /* Loop to handle M1 retransmissions from AP.
+         * The AP may resend M1 if it didn't receive M2 in time.
+         * We ignore M1 retransmissions and keep waiting for M3. */
+        int m3_attempts = 0;
+    wait_m3:
         if (iwn_poll_eapol(dev, eapol_buf, &eapol_len, 5000) != 0) {
             efi_print_ascii("  EAPOL: M3 timeout\r\n");
             return -1;
@@ -713,6 +718,12 @@ int iwn_eapol_handshake(iwn_dev *dev) {
         uint16_t ki = be16_load(body + EAPOL_KEY_INFO);
         if (!(ki & EAPOL_KI_ACK) || !(ki & EAPOL_KI_MIC) ||
             !(ki & EAPOL_KI_SECURE)) {
+            /* M1 retransmission: has ACK but no MIC/SECURE.
+             * Ignore and keep waiting for real M3 (max 3 retries). */
+            if (++m3_attempts < 4) {
+                efi_print_ascii("  EAPOL: M1 retransmission, ignoring\r\n");
+                goto wait_m3;
+            }
             efi_print_ascii("  EAPOL: M3 unexpected key info 0x");
             print_hex8((uint8_t)(ki >> 8));
             print_hex8((uint8_t)(ki));

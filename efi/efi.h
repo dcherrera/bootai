@@ -781,6 +781,12 @@ int iwn_snp_install(void);
 /* IWN SNP status (1 if SNP installed, 0 otherwise) */
 int iwn_snp_is_installed(void);
 
+/* Get raw SNP protocol for custom network stack (returns NULL if not installed) */
+EFI_SIMPLE_NETWORK_PROTOCOL *iwn_snp_get_protocol(void);
+
+/* Driver loader state (1 if DXE drivers were loaded from \drivers\) */
+int efi_drivers_were_loaded(void);
+
 /* Network diagnostics — enumerate protocol handles */
 void efi_net_diag(void);
 

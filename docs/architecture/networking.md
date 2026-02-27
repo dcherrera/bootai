@@ -329,13 +329,15 @@ The fix: skip `connect_all_controllers()` when `iwn_snp_is_installed()` returns 
 
 ### Resolution Strategy
 
-| Phase | Approach | Code Changes |
-|-------|----------|-------------|
-| 1 | `netdiag` to identify which protocols are missing | Done (~100 LOC) |
-| 2 | Bundle EDK2 DXE drivers on USB `\drivers\` | Zero (driver loader exists) |
-| 3 | Custom ARP/DHCP/IP/UDP/TCP on raw SNP | ~1800 LOC (fallback only) |
+| Phase | Approach | Status |
+|-------|----------|--------|
+| 1 | `netdiag` to identify which protocols are missing | **DONE** — Dell has zero IP stack protocols |
+| 2 | Bundle EDK2 DXE drivers on USB `\drivers\` | **FAILED** — ConnectController hangs on Dell firmware |
+| 3 | Custom ARP/DHCP/IP/UDP/TCP on raw SNP | **NEXT** — required path forward |
 
-Phase 2 is expected to work because `efi/drivers.c` already loads all `.efi` files from `\drivers\` and calls `connect_all_controllers()`. The loaded MnpDxe finds the IWN SNP handle and builds the IP stack.
+Phase 2 was tested with 6 EDK2 DXE drivers extracted from OVMF. Four loaded successfully but `Udp4Dxe.efi` and `TcpDxe.efi` failed at `StartImage`. When `ConnectController(snp_handle)` was called, MnpDxe's internal initialization hung — OVMF DXE drivers are incompatible with Dell E6510 firmware. ConnectController was removed from `iwn_snp_install()`.
+
+Phase 3 will build a custom network stack (ARP/DHCP/IP/UDP/TCP) directly on raw SNP, accessed via `iwn_snp_get_protocol()`. The existing `efi/net.c` TCP4/UDP4 code will need a dual-dispatch layer to route traffic to the custom stack when UEFI protocols are unavailable.
 
 ## Known Limitations
 

@@ -1138,7 +1138,7 @@ efi_net_init();
 The Mode struct is initialized to report an Ethernet-like device:
 
 ```c
-snp_mode.State              = EFI_SIMPLE_NETWORK_INITIALIZED;
+snp_mode.State              = EFI_SIMPLE_NETWORK_STOPPED;
 snp_mode.HwAddressSize      = 6;
 snp_mode.MediaHeaderSize    = 14;
 snp_mode.MaxPacketSize      = 1500;
@@ -1150,7 +1150,7 @@ snp_mode.PermanentAddress   = dev->mac_addr;
 snp_mode.BroadcastAddress   = FF:FF:FF:FF:FF:FF;
 ```
 
-State is set to INITIALIZED immediately (not STOPPED) because the hardware is fully initialized before SNP is installed — firmware loaded, associated, keys installed.
+State starts as STOPPED so DXE drivers (if present) can manage the full lifecycle: `Start() → Initialize() → Transmit/Receive`. The custom network stack (Phase 5c) calls `Start()` and `Initialize()` directly before using SNP.
 
 #### TX Buffer Recycling
 
@@ -1175,6 +1175,17 @@ UEFI's `Transmit()` has two modes controlled by `HeaderSize`:
 
 Both modes extract the destination MAC and ethertype, then call `iwn_encap_tx()` which builds the 802.11 frame with LLC/SNAP.
 
+#### WaitForPacket Event
+
+MnpDxe (and other DXE drivers) access the `WaitForPacket` event on the SNP protocol. This must be a valid `EVT_NOTIFY_WAIT` event — if NULL, MnpDxe crashes or hangs during driver binding.
+
+```c
+gBS->CreateEvent(EVT_NOTIFY_WAIT, TPL_CALLBACK, snp_wait_check, NULL, &snp_wait_event);
+snp_protocol.WaitForPacket = snp_wait_event;
+```
+
+The `snp_wait_check` callback calls `iwn_rx_poll()` to check for pending frames.
+
 #### Handle Installation
 
 SNP is installed on a new UEFI handle with two protocols:
@@ -1191,7 +1202,7 @@ Device Path:
 └── End Entire Device Path (Type=0x7F, SubType=0xFF, Length=4)
 ```
 
-After installation, `ConnectController(handle, NULL, NULL, TRUE)` triggers recursive driver binding. MnpDxe's `Supported()` checks for SNP on the handle — if found, it binds and creates the MNP → ARP → IP4 → TCP4/UDP4 protocol stack.
+**No `ConnectController` is called.** Earlier versions called `ConnectController(handle, NULL, NULL, TRUE)` to trigger MnpDxe binding, but this causes a hard hang on Dell E6510 (see Phase 5c). The custom network stack (Phase 5c) works directly on the SNP protocol without needing DXE driver binding.
 
 #### UEFI Type Additions (efi.h)
 
@@ -1232,10 +1243,11 @@ EFI_GUID gEfiDevicePathProtocolGuid = {
 
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| Dell firmware lacks MnpDxe | IP stack won't bind to SNP | Load MnpDxe.efi from `\drivers\` directory on USB |
-| DHCP timeout on slow AP | `efi_net_init()` waits 8s, may not be enough | DHCP can complete late — `net_available` set even on timeout |
-| No WaitForPacket event | MnpDxe may expect a signal event for RX notifications | Set to NULL (polling only) — most MnpDxe implementations handle this |
-| IfType mismatch | Some UEFI stacks check IfType strictly | Set to 6 (IANA Ethernet), matching MnpDxe's expectations |
+| Dell firmware lacks IP stack DXE drivers | CONFIRMED — IP stack won't bind to SNP | Custom network stack (Phase 5c) works directly on SNP |
+| OVMF DXE drivers incompatible with Dell | CONFIRMED — ConnectController hangs, UDP4/TCP fail to load | Do not call ConnectController; use custom stack instead |
+| WaitForPacket NULL | MnpDxe crashes during driver binding | Create proper `EVT_NOTIFY_WAIT` event (fixed) |
+| SNP state must start STOPPED | DXE drivers expect to manage Start()/Initialize() lifecycle | State set to STOPPED; custom stack calls Start()/Initialize() itself |
+| IfType mismatch | Some UEFI stacks check IfType strictly | Set to 6 (IANA Ethernet) |
 
 #### Common Gotchas
 
@@ -1312,36 +1324,46 @@ Four new ServiceBinding GUIDs defined in `efi/net_diag.c`:
 | IP4 SB | `{C51711E7-B4BF-404A-BFB8-0A048EF1FFE4}` | IPv4 stack |
 | DHCP4 SB | `{9D9A39D8-BD42-4A73-A4D5-8EE94BE11380}` | DHCP client |
 
-#### Three-Phase Diagnostic Strategy
+#### Three-Phase Strategy — Results
 
-| Phase | What | Code Changes | When |
-|-------|------|-------------|------|
-| **1. Diagnostics + Fix** | `netdiag` command + `connect_all_controllers` guard | ~100 LOC new, ~10 lines modified | **Done** |
-| **2. Bundle DXE Drivers** | Extract 6 EDK2 `.efi` files onto USB `\drivers\` | Zero code changes | If Dell lacks IP stack |
-| **3. Custom Network Stack** | ARP/DHCP/IP/UDP/TCP on raw SNP | ~1800 LOC new | Only if DXE drivers fail to load |
+| Phase | What | Status | Result |
+|-------|------|--------|--------|
+| **1. Diagnostics + Fix** | `netdiag` command + `connect_all_controllers` guard | **DONE** | Dell lacks ALL IP stack protocols (MNP, ARP, IP4, TCP4, UDP4 = 0 handles) |
+| **2. Bundle DXE Drivers** | Extract 6 EDK2 `.efi` files onto USB `\drivers\` | **TESTED — FAILED** | 4/6 loaded, 2 failed (Udp4, Tcp). ConnectController hangs on Dell firmware |
+| **3. Custom Network Stack** | ARP/DHCP/IP/UDP/TCP on raw SNP | **NEXT** | Required — DXE drivers incompatible with Dell E6510 |
 
-**Phase 2** requires zero code changes because `efi/drivers.c` already loads all `.efi` files from `\drivers\` alphabetically and calls `connect_all_controllers()`. The required drivers are:
+##### Phase 1 Results (netdiag on Dell E6510)
 
+Before `iwn connect`: all 8 protocols = 0 handles.
+After `iwn connect`: SNP = 1, everything else = 0.
+
+Confirmed: Dell E6510 firmware has **zero** IP stack DXE drivers.
+
+##### Phase 2 Results (EDK2 DXE drivers on Dell)
+
+Six EDK2 DXE drivers extracted from OVMF placed on USB `\drivers\`:
 ```
-\drivers\01-MnpDxe.efi
-\drivers\02-ArpDxe.efi
-\drivers\03-Dhcp4Dxe.efi
-\drivers\04-Ip4Dxe.efi
-\drivers\05-Udp4Dxe.efi
-\drivers\06-Tcp4Dxe.efi
+01-MnpDxe.efi     loaded OK
+02-ArpDxe.efi     loaded OK
+03-Dhcp4Dxe.efi   loaded OK
+04-Ip4Dxe.efi     loaded OK
+05-Udp4Dxe.efi    StartImage failed
+06-TcpDxe.efi     StartImage failed
 ```
 
-Extracted from the OVMF build. After `iwn_snp_install()` + driver load, MnpDxe finds SNP and cascades: MNP → ARP → IP4 → TCP4/UDP4.
+Three boots tested with different SNP configurations:
 
-**Phase 3** is the fallback if Dell firmware rejects `LoadImage` for the EDK2 drivers. Custom ARP/DHCP/IP/UDP/TCP directly on raw SNP — ~1800 LOC. Only build this if Phase 2 fails.
+1. **WaitForPacket=NULL, State=INITIALIZED**: ConnectController returned but MnpDxe never bound. MNP SB: 0 handles.
+2. **WaitForPacket=valid event, State=STOPPED**: System hung at `ConnectController(snp_handle)`. Hang is inside MnpDxe — `SNP: Start()` never called.
+3. **ConnectController removed**: No hang, SNP installs cleanly. But no IP stack (DXE drivers never bound to SNP).
 
-#### Expected `netdiag` Outcomes
+**Root cause**: OVMF DXE drivers expect a full EDK2 runtime environment that Dell's firmware doesn't provide.
 
-| After `iwn connect` | Meaning | Next Step |
-|---------------------|---------|-----------|
-| MNP/IP4/TCP4 appear | Dell **HAS** IP stack drivers. The `connect_all_controllers` guard may have been the only issue. | Try `efi_net_init()` — should work |
-| Only SNP appears | Dell **LACKS** IP stack drivers | Phase 2: bundle EDK2 DXE drivers on USB |
-| Nothing appears | SNP install itself failed | Debug SNP handle + device path |
+**Conclusion**: DXE driver approach is not viable on Dell E6510. Phase 3 (custom network stack) is required.
+
+##### Phase 3 Plan (Custom Network Stack)
+
+Build ARP/DHCP/IP/UDP/TCP directly on raw SNP via `iwn_snp_get_protocol()`. Bypass the entire DXE driver chain. ~1800 LOC estimated across `ns_arp.c`, `ns_dhcp.c`, `ns_ip.c`, `ns_udp.c`, `ns_tcp.c`.
 
 ## Key Design Decisions
 
@@ -1376,3 +1398,4 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-25 | Phase 4d implemented: Data frame TX/RX. `iwn_tx_raw()` canonical ring 0 submit (OFDM 24 Mbps, CCMP security field). `iwn_encap_tx()` Ethernet-to-802.11 encapsulation with LLC/SNAP, Protected bit, broadcast/unicast node selection. `iwn_rx_poll()` non-blocking HW drain with 802.11-to-Ethernet decapsulation, QoS data handling (26-byte header), deauth detection. 16-slot software RX buffer (24 KB). `iwn ping` ARP smoke test command. `iwn_data.c` (~280 lines). |
 | 2026-02-26 | Phase 5 implemented: SNP integration. `iwn_snp.c` (~280 lines) wraps IWN as `EFI_SIMPLE_NETWORK_PROTOCOL`. 14 SNP functions backed by `iwn_encap_tx()`/`iwn_rx_dequeue()`. TX buffer recycling ring (8 slots). MAC Address Device Path for driver binding. Auto DHCP via `efi_net_init()` after connect. Added SNP types + typed `InstallProtocolInterface` to `efi.h` (~80 lines). GUIDs in `net.c`. |
 | 2026-02-26 | Phase 5b: Network stack diagnostics. `efi/net_diag.c` (~100 lines) enumerates 8 UEFI network protocol handles (SNP, MNP, ARP, IP4, IP4Config2, DHCP4, TCP4, UDP4). `netdiag` REPL command. Guard `connect_all_controllers` behind `iwn_snp_is_installed()` to prevent double driver enumeration. `iwn_snp_is_installed()` getter. 4 new ServiceBinding GUIDs (MNP, ARP, IP4, DHCP4). Three-phase strategy: diagnostics → bundle DXE drivers → custom network stack. |
+| 2026-02-26 | Phase 5b Dell testing: `netdiag` confirmed Dell has zero IP stack drivers. EDK2 DXE drivers tested — 4/6 loaded but ConnectController hangs (MnpDxe incompatible with Dell firmware). Three boots tested with different SNP configs. Fix: removed ConnectController from `iwn_snp_install()`, added `iwn_snp_get_protocol()` getter. DXE approach abandoned — custom network stack (Phase 5c) required. |

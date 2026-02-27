@@ -602,6 +602,11 @@ int iwn_connect(iwn_dev *dev, const char *ssid) {
         return -1;
     }
 
+    if (dev->state >= IWN_STATE_RUN && dev->keys_installed) {
+        efi_print_ascii("  iwn: already connected\r\n");
+        return 0;
+    }
+
     if (dev->n_scan_results == 0) {
         efi_print_ascii("  iwn: no scan results — run 'iwn scan' first\r\n");
         return -1;

@@ -8,6 +8,10 @@
 
 #include "efi.h"
 
+static int g_drivers_loaded = 0;
+
+int efi_drivers_were_loaded(void) { return g_drivers_loaded; }
+
 /* Freestanding helpers */
 static void drv_memset(void *dst, int val, UINTN n) {
     uint8_t *d = (uint8_t *)dst;
@@ -198,7 +202,10 @@ void efi_load_drivers(void) {
     if (loaded == 0) {
         efi_print_ascii("  No drivers found.\r\n");
     } else {
-        /* Bind newly-loaded drivers to hardware */
-        connect_all_controllers();
+        g_drivers_loaded = 1;
     }
+    /* NOTE: We do NOT call connect_all_controllers() here.
+     * Loaded DXE drivers (MnpDxe etc.) hang on Dell E6510 firmware
+     * during ConnectController. The custom network stack (ns_*)
+     * works directly on SNP without needing DXE driver binding. */
 }

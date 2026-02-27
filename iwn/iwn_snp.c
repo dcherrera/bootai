@@ -18,12 +18,23 @@ static EFI_SIMPLE_NETWORK_MODE snp_mode;
 static EFI_SIMPLE_NETWORK_PROTOCOL snp_protocol;
 static EFI_HANDLE snp_handle;
 static int snp_installed;
+static EFI_EVENT snp_wait_event;
 
 /* TX buffer recycling ring for GetStatus() */
 #define TX_RECYCLE_COUNT 8
 static void *tx_recycle[TX_RECYCLE_COUNT];
 static int tx_recycle_head;
 static int tx_recycle_tail;
+
+/* ---- WaitForPacket notify (EVT_NOTIFY_WAIT) ---- */
+
+static void EFIAPI snp_wait_check(EFI_EVENT event, void *ctx) {
+    (void)event;
+    (void)ctx;
+    /* Check if RX frames are pending — called by firmware when
+     * WaitForEvent/CheckEvent is used on WaitForPacket */
+    iwn_rx_poll(&g_iwn);
+}
 
 /* ---- SNP Function Implementations ---- */
 
@@ -32,6 +43,7 @@ static EFI_STATUS EFIAPI iwn_snp_start(EFI_SIMPLE_NETWORK_PROTOCOL *This) {
     if (snp_mode.State != EFI_SIMPLE_NETWORK_STOPPED)
         return EFI_DEVICE_ERROR;
     snp_mode.State = EFI_SIMPLE_NETWORK_STARTED;
+    efi_print_ascii("  SNP: Start()\r\n");
     return EFI_SUCCESS;
 }
 
@@ -52,6 +64,7 @@ static EFI_STATUS EFIAPI iwn_snp_initialize(EFI_SIMPLE_NETWORK_PROTOCOL *This,
     if (snp_mode.State != EFI_SIMPLE_NETWORK_STARTED)
         return EFI_DEVICE_ERROR;
     snp_mode.State = EFI_SIMPLE_NETWORK_INITIALIZED;
+    efi_print_ascii("  SNP: Initialize()\r\n");
     return EFI_SUCCESS;
 }
 
@@ -256,9 +269,11 @@ int iwn_snp_install(void) {
 
     iwn_dev *dev = &g_iwn;
 
-    /* Initialize Mode struct */
+    /* Initialize Mode struct.
+     * State starts as STOPPED — DXE drivers (MnpDxe etc.) manage the
+     * lifecycle: Start() → Initialize() → ready for Transmit/Receive. */
     iwn_memset(&snp_mode, 0, sizeof(snp_mode));
-    snp_mode.State = EFI_SIMPLE_NETWORK_INITIALIZED;
+    snp_mode.State = EFI_SIMPLE_NETWORK_STOPPED;
     snp_mode.HwAddressSize = 6;
     snp_mode.MediaHeaderSize = 14;
     snp_mode.MaxPacketSize = 1500;
@@ -291,7 +306,13 @@ int iwn_snp_install(void) {
     snp_protocol.GetStatus = iwn_snp_get_status;
     snp_protocol.Transmit = iwn_snp_transmit;
     snp_protocol.Receive = iwn_snp_receive;
-    snp_protocol.WaitForPacket = (void *)0;  /* polling only */
+    /* Create WaitForPacket event — MnpDxe requires this to be non-NULL.
+     * EVT_NOTIFY_WAIT (0x100) fires when firmware checks the event. */
+    snp_wait_event = (void *)0;
+    gBS->CreateEvent(0x00000100, /* EVT_NOTIFY_WAIT */
+                     8,          /* TPL_CALLBACK */
+                     snp_wait_check, (void *)0, &snp_wait_event);
+    snp_protocol.WaitForPacket = snp_wait_event;
     snp_protocol.Mode = &snp_mode;
 
     /* Reset TX recycle ring */
@@ -338,8 +359,11 @@ int iwn_snp_install(void) {
         0,
         mac_devpath);
 
-    /* Trigger UEFI stack binding: MnpDxe -> ArpDxe -> Ip4Dxe -> Tcp4Dxe */
-    gBS->ConnectController(snp_handle, (void *)0, (void *)0, 1);
+    /* NOTE: We do NOT call ConnectController here.
+     * OVMF DXE drivers (MnpDxe etc.) hang on Dell E6510 firmware during
+     * binding — their internal initialization is incompatible.
+     * Instead, efi_net_init() uses the custom network stack (ns_*)
+     * which works directly on SNP without DXE drivers. */
 
     efi_print_ascii("  SNP installed\r\n");
     snp_installed = 1;
@@ -347,3 +371,7 @@ int iwn_snp_install(void) {
 }
 
 int iwn_snp_is_installed(void) { return snp_installed; }
+
+EFI_SIMPLE_NETWORK_PROTOCOL *iwn_snp_get_protocol(void) {
+    return snp_installed ? &snp_protocol : (void *)0;
+}
