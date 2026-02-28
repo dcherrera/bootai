@@ -941,6 +941,8 @@ Canonical ring 0 submit — the clean version of what `iwn_tx_frame()` and `iwn_
 - Scheduler byte count table updated for queue 0
 - HW kick: `IWN_HBUS_TARG_WRPTR = ring->cur | (0 << 8)`
 
+**2-segment TX for large frames**: Each ring entry is 140 bytes. After the 4-byte header and 56-byte `iwn_cmd_data`, only 80 bytes remain for inline frame data. Small frames (ARP at 60 bytes, management frames) fit inline using a single TX descriptor segment. Frames larger than 80 bytes (DHCP at 310 bytes, HTTP data) use 2 segments: segment 0 points to the ring buffer (header + cmd_data, 60 bytes), segment 1 points to a dedicated 4 KB DMA page (`dev->tx_data`). This follows OpenBSD's multi-segment approach, adapted for bare metal without mbufs.
+
 #### TX Path: `iwn_encap_tx()`
 
 High-level TX that takes Ethernet-style parameters and builds a complete 802.11 data frame:
@@ -1361,9 +1363,42 @@ Three boots tested with different SNP configurations:
 
 **Conclusion**: DXE driver approach is not viable on Dell E6510. Phase 3 (custom network stack) is required.
 
-##### Phase 3 Plan (Custom Network Stack)
+##### Phase 3 Result (Custom Network Stack — DONE)
 
-Build ARP/DHCP/IP/UDP/TCP directly on raw SNP via `iwn_snp_get_protocol()`. Bypass the entire DXE driver chain. ~1800 LOC estimated across `ns_arp.c`, `ns_dhcp.c`, `ns_ip.c`, `ns_udp.c`, `ns_tcp.c`.
+ARP/DHCP/IP/UDP/TCP implemented directly on raw SNP via `iwn_snp_get_protocol()`. 7 new files in `efi/ns_*.c` (~1,155 lines total). Dual dispatch in `net.c` routes to custom stack when UEFI protocols are absent. Builds with zero warnings. See [Networking Architecture — Custom Network Stack](networking.md#custom-network-stack-phase-5c) for full details.
+
+### Phase 5c: Custom Network Stack (done)
+
+Complete ARP/DHCP/IPv4/UDP/TCP stack built on raw SNP frames, used when UEFI firmware lacks IP stack DXE drivers.
+
+**Files**: `efi/ns_net.h`, `efi/ns_net.c`, `efi/ns_arp.c`, `efi/ns_ip.c`, `efi/ns_udp.c`, `efi/ns_dhcp.c`, `efi/ns_tcp.c` (~1,155 lines total). Plus modifications to `efi/net.c`, `efi/efi.h`, `efi/mdns.c`, `Makefile`.
+
+#### Layer Architecture
+
+| Layer | File | Lines | What It Does |
+|-------|------|-------|-------------|
+| Frame dispatch | `ns_net.c` | ~105 | `ns_init()`, `ns_poll()` EtherType dispatch, `ns_raw_send()` |
+| ARP | `ns_arp.c` | ~130 | 16-entry table, blocking resolve (3s), auto-reply |
+| IPv4 | `ns_ip.c` | ~145 | Subnet routing, multicast MAC, checksum, protocol dispatch |
+| UDP | `ns_udp.c` | ~95 | Port binding table (4 entries), used by DHCP + mDNS |
+| DHCP | `ns_dhcp.c` | ~280 | Full DHCP exchange (raw broadcast, no IP yet) |
+| TCP | `ns_tcp.c` | ~400 | State machine: LISTEN→SYN_RCVD→ESTABLISHED→FIN_WAIT, MSS 1460 |
+
+#### Dual Dispatch
+
+`tcp4_conn_t` extended with `ns_tcp_conn *ns_conn` field. Each `tcp4_*()` function checks `conn->ns_conn` (or `ns_is_ready()` for listen) to route to the custom stack. UEFI path unchanged.
+
+#### TCP Design
+
+Minimal TCP for HTTP/1.0 server (single connection, Connection: close):
+- Window size 8192 (matches rx_buf)
+- No OOO reassembly, no window scaling, no Nagle, no congestion control
+- ISN increments by 64000 per connection
+- SYN+ACK includes MSS option (1460)
+
+#### mDNS Updates
+
+When custom stack is active, mDNS uses `ns_udp_bind(5353, callback)` and `ns_udp_send()` for multicast instead of UEFI UDP4 ServiceBinding.
 
 ## Key Design Decisions
 
@@ -1373,7 +1408,7 @@ OpenBSD's `iwn` driver is ~7,000 lines in 3 files. Linux's `iwlwifi` is ~60,000 
 
 ### Why SNP instead of custom networking?
 
-By implementing UEFI's standard network protocol, we get the entire TCP/IP stack for free. UEFI firmware already includes IP4, ARP, DHCP, TCP4, UDP4, and DNS4. All existing BootAI code (HTTP server, mDNS, API) works without modification.
+By implementing UEFI's standard network protocol, we get the entire TCP/IP stack for free — on firmware that has it. UEFI firmware already includes IP4, ARP, DHCP, TCP4, UDP4, and DNS4. All existing BootAI code (HTTP server, mDNS, API) works without modification. When the firmware lacks these drivers (Dell E6510), the custom `ns_*` stack provides the same functionality through a dual-dispatch layer in `net.c`.
 
 ### Why polling instead of interrupts?
 
@@ -1399,3 +1434,6 @@ UEFI boot services mode doesn't provide a clean interrupt handler mechanism. Pol
 | 2026-02-26 | Phase 5 implemented: SNP integration. `iwn_snp.c` (~280 lines) wraps IWN as `EFI_SIMPLE_NETWORK_PROTOCOL`. 14 SNP functions backed by `iwn_encap_tx()`/`iwn_rx_dequeue()`. TX buffer recycling ring (8 slots). MAC Address Device Path for driver binding. Auto DHCP via `efi_net_init()` after connect. Added SNP types + typed `InstallProtocolInterface` to `efi.h` (~80 lines). GUIDs in `net.c`. |
 | 2026-02-26 | Phase 5b: Network stack diagnostics. `efi/net_diag.c` (~100 lines) enumerates 8 UEFI network protocol handles (SNP, MNP, ARP, IP4, IP4Config2, DHCP4, TCP4, UDP4). `netdiag` REPL command. Guard `connect_all_controllers` behind `iwn_snp_is_installed()` to prevent double driver enumeration. `iwn_snp_is_installed()` getter. 4 new ServiceBinding GUIDs (MNP, ARP, IP4, DHCP4). Three-phase strategy: diagnostics → bundle DXE drivers → custom network stack. |
 | 2026-02-26 | Phase 5b Dell testing: `netdiag` confirmed Dell has zero IP stack drivers. EDK2 DXE drivers tested — 4/6 loaded but ConnectController hangs (MnpDxe incompatible with Dell firmware). Three boots tested with different SNP configs. Fix: removed ConnectController from `iwn_snp_install()`, added `iwn_snp_get_protocol()` getter. DXE approach abandoned — custom network stack (Phase 5c) required. |
+| 2026-02-26 | Phase 5c implemented: Custom network stack on raw SNP. 7 new files (~1,155 lines): `ns_net.h` (types/declarations), `ns_net.c` (frame dispatch), `ns_arp.c` (16-entry ARP table), `ns_ip.c` (IPv4 routing/checksum), `ns_udp.c` (port binding), `ns_dhcp.c` (full DHCP client), `ns_tcp.c` (HTTP/1.0 TCP state machine). Dual dispatch in `net.c` — each `tcp4_*()` function routes to custom stack when `ns_is_ready()`. `tcp4_conn_t` extended with `ns_tcp_conn *ns_conn`. mDNS updated for custom UDP. Builds with zero errors/warnings. |
+| 2026-02-26 | Phase 5c Dell testing (round 1): SNP function pointer table hangs on `snp->Start(snp)` — bypassed with direct IWN data path functions (`iwn_snp_get_mac`, `iwn_snp_direct_tx`, `iwn_snp_direct_rx`). `ns_net.c` rewritten to call IWN directly instead of through SNP protocol. See [Phase 5c debug log](../research/phase5-debug-log.md). |
+| 2026-02-26 | Phase 5c Dell testing (round 2): DHCP DISCOVER sent but no OFFER received. Three bugs found: (1) MAC hex display out-of-bounds (`"0123456789AB"` → `"0123456789ABCDEF"`), (2) TX ring buffer overflow — 310-byte DHCP frame overflows 80-byte inline space, fixed with 2-segment TX descriptor + 4 KB DMA page (`dev->tx_data`), (3) IP destination filter drops DHCP OFFER during DHCP — fixed by accepting all IP packets when `ip_ready=0`. |

@@ -138,7 +138,7 @@ Advertise BootAI on the local network so clients can connect without knowing the
 - Send multicast DNS response to `224.0.0.251:5353` (mDNS group)
 - Advertise hostname `bootai.local` → DHCP-assigned IP
 - Advertise service `_http._tcp.local` on port 8080
-- Reuse existing UDP4 infrastructure from Phase 2
+- Reuse existing UDP4 infrastructure from Phase 2, or custom `ns_udp_send()` on Dell
 - Respond to mDNS queries (RFC 6762)
 
 ### 5e. Native Intel WiFi Driver — IWN (IN PROGRESS)
@@ -159,7 +159,7 @@ The driver has its own internal phases:
 | 4d | Data TX/RX — Ethernet↔802.11 encap, software RX buffer, CCMP | COMPLETE |
 | 5a | SNP integration — EFI_SIMPLE_NETWORK_PROTOCOL wrapper | COMPLETE |
 | 5b | Network stack diagnostics — protocol enumeration, DXE driver testing | COMPLETE |
-| 5c | Custom network stack — ARP/DHCP/IP/UDP/TCP on raw SNP | PLANNED |
+| 5c | Custom network stack — ARP/DHCP/IP/UDP/TCP on raw SNP | COMPLETE |
 
 **IWN Phase 0-1** (2026-02-23): PCI bus enumeration finds Intel 6200, enables MMIO + bus master, reads EEPROM (MAC, RF config, calibration data, regulatory domain). Confirmed on Dell E6510 hardware.
 
@@ -179,9 +179,9 @@ The driver has its own internal phases:
 
 **IWN Phase 5b** (2026-02-26): Network stack diagnostics for Dell E6510. `efi/net_diag.c` (~100 lines) enumerates 8 network protocol handles. `netdiag` REPL command. Guard `connect_all_controllers` behind `iwn_snp_is_installed()`. Dell testing confirmed: zero IP stack protocols, DXE drivers loaded but ConnectController hangs (OVMF DXE drivers incompatible with Dell firmware). ConnectController removed from `iwn_snp_install()`. `iwn_snp_get_protocol()` getter added for custom stack access.
 
-**IWN Phase 5c** (planned): Custom network stack on raw SNP. ARP, DHCP, IP, UDP, TCP implemented directly against `EFI_SIMPLE_NETWORK_PROTOCOL` via `iwn_snp_get_protocol()`. Required because Dell E6510 firmware lacks EDK2 IP stack drivers and OVMF DXE drivers are incompatible. ~1800 LOC estimated.
+**IWN Phase 5c** (2026-02-26): Custom network stack on raw SNP. ARP, DHCP, IPv4, UDP, TCP implemented directly against `EFI_SIMPLE_NETWORK_PROTOCOL` via `iwn_snp_get_protocol()`. 7 new files (~1,155 lines): `ns_net.h`, `ns_net.c`, `ns_arp.c`, `ns_ip.c`, `ns_udp.c`, `ns_dhcp.c`, `ns_tcp.c`. Dual dispatch in `net.c` — UEFI path (QEMU) unchanged, custom path activates when `ns_is_ready()` returns true. mDNS updated to use `ns_udp_send()` on custom stack. Builds with zero warnings.
 
-**Files**: `bootai/iwn/` — 13 source files (~4,600 lines total: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c, iwn_scan.c, iwn_assoc.c, iwn_eapol.c, iwn_data.c, iwn_snp.c, iwn_crypto.h, iwn_crypto.c, test_crypto.c)
+**Files**: `bootai/iwn/` — 13 source files (~4,600 lines: iwn.h, iwn_internal.h, iwn_shim.h, if_iwnreg.h, if_iwnvar.h, iwn_pci.c, iwn_hw.c, iwn_dma.c, iwn_fw.c, iwn_scan.c, iwn_assoc.c, iwn_eapol.c, iwn_data.c, iwn_snp.c, iwn_crypto.h, iwn_crypto.c, test_crypto.c). `bootai/efi/ns_*.c` — 7 files (~1,155 lines: ns_net.h, ns_net.c, ns_arp.c, ns_ip.c, ns_udp.c, ns_dhcp.c, ns_tcp.c).
 
 **Firmware**: `iwlwifi-6000-4.ucode` (454KB, legacy v2 format) renamed to `iwn-6000`, placed in `\drivers\` on the EFI partition.
 
@@ -189,7 +189,7 @@ The driver has its own internal phases:
 
 ### Remaining
 
-- **IWN Phase 5c**: Custom network stack (ARP/DHCP/IP/UDP/TCP) on raw SNP — required for Dell E6510 networking
+- **Dell E6510 hardware test**: Custom network stack builds clean, needs end-to-end test on Dell: `iwn connect` → DHCP → `serve 8080` → `curl http://<dell-ip>:8080/health` from Mac
 - mDNS discovery (5d) — quality-of-life, not a blocker
 - Streaming mode (`stream: true`) for chat completions (chunked transfer encoding + SSE)
 

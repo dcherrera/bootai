@@ -34,65 +34,12 @@ static int iwn_strcmp(const char *a, const char *b) {
  * sizeof(iwn_cmd_data) + frame_len > 136.
  */
 static int iwn_tx_frame(iwn_dev *dev, const uint8_t *frame, uint16_t frame_len) {
-    iwn_tx_ring *ring = &dev->txq[0];
-    int idx = ring->cur;
-
-    /* Build TX command header in ring's cmd buffer */
-    struct iwn_tx_cmd *cmd = (struct iwn_tx_cmd *)
-        ((uint8_t *)ring->cmd.vaddr + idx * sizeof(struct iwn_tx_cmd));
-    iwn_memset(cmd, 0, sizeof(*cmd));
-    cmd->code = IWN_CMD_TX_DATA;
-    cmd->flags = 0;
-    cmd->idx = (uint8_t)idx;
-    cmd->qid = 0;
-
-    /* Build iwn_cmd_data TX params immediately after the 4-byte header */
-    uint8_t *ring_buf = (uint8_t *)ring->cmd.vaddr +
-                        idx * sizeof(struct iwn_tx_cmd);
-    struct iwn_cmd_data *tx = (struct iwn_cmd_data *)(ring_buf + 4);
-    iwn_memset(tx, 0, sizeof(*tx));
-
-    tx->len = htole16(frame_len);
-    tx->flags = htole32(IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ);
-    tx->id = IWN5000_ID_BROADCAST;
-    tx->security = 0;
-    tx->lifetime = htole32(IWN_LIFETIME_INFINITE);
-
-    /* CCK 1 Mbps for management frames (2.4 GHz) */
+    /* Send via iwn_tx_raw() — handles 2-segment DMA for large frames.
+     * CCK 1 Mbps for management frame reliability. Unencrypted. */
     uint8_t txant = (uint8_t)IWN_LSB(dev->txchainmask);
-    tx->plcp = 10;  /* CCK 1 Mbps */
-    tx->rflags = IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant);
-
-    /* Copy 802.11 frame after iwn_cmd_data */
-    iwn_memcpy(ring_buf + 4 + sizeof(struct iwn_cmd_data), frame, frame_len);
-
-    /* Build TX descriptor */
-    struct iwn_tx_desc *desc = (struct iwn_tx_desc *)
-        ((uint8_t *)ring->desc.vaddr + idx * sizeof(struct iwn_tx_desc));
-    iwn_memset(desc, 0, sizeof(*desc));
-
-    uint32_t totlen = 4 + sizeof(struct iwn_cmd_data) + frame_len;
-    uint64_t buf_paddr = ring->cmd.paddr + idx * sizeof(struct iwn_tx_cmd);
-
-    desc->nsegs = 1;
-    desc->segs[0].addr = IWN_LOADDR(buf_paddr);
-    desc->segs[0].len = (uint16_t)(IWN_HIADDR(buf_paddr) |
-                                    ((uint16_t)totlen << 4));
-
-    /* Update scheduler byte count table for ring 0 */
-    uint16_t *sched = (uint16_t *)dev->sched.vaddr;
-    int sched_idx = 0 * IWN5000_SCHED_COUNT + idx;
-    uint16_t bc = (uint16_t)(totlen + 3);
-    bc = (bc / 4) & 0x0fff;
-    sched[sched_idx] = bc;
-    sched[sched_idx + IWN_TX_RING_COUNT] = bc;
-
-    /* Kick hardware: advance write pointer for ring 0 */
-    ring->cur = (idx + 1) % IWN_TX_RING_COUNT;
-    ring->queued++;
-    iwn_write(dev, IWN_HBUS_TARG_WRPTR, ring->cur | (0 << 8));
-
-    return 0;
+    return iwn_tx_raw(dev, frame, frame_len,
+                      IWN5000_ID_BROADCAST, 0,
+                      10, IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant));
 }
 
 /* ---- Poll RX ring for a management frame with specific subtype ---- */
@@ -590,6 +537,11 @@ static int iwn_run(iwn_dev *dev) {
         efi_print_ascii("  LINKQ(AP) ok\r\n");
     }
 
+    /* Note: broadcast node (id=15) was already added during iwn_auth()
+     * and survives RXON(assoc). Do NOT re-add it here — a duplicate
+     * ADD_NODE without IWN_NODE_UPDATE hangs the firmware. The node
+     * persists and GTK can be installed via UPDATE in iwn_install_keys(). */
+
     dev->state = IWN_STATE_RUN;
     return 0;
 }
@@ -656,13 +608,31 @@ int iwn_connect(iwn_dev *dev, const char *ssid) {
         return -1;
     }
 
-    /* Run the connection state machine */
-    if (iwn_auth(dev) != 0)
+    /* Run the connection state machine with auto-retry.
+     * Auth/assoc can fail intermittently due to RF contention
+     * or the AP not responding in time. Retry up to 3 times. */
+    int connected = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            efi_print_ascii("  Retry ");
+            print_dec((uint32_t)attempt);
+            efi_print_ascii("/3...\r\n");
+        }
+
+        if (iwn_auth(dev) != 0)
+            continue;
+        if (iwn_associate(dev) != 0)
+            continue;
+        if (iwn_run(dev) != 0)
+            continue;
+
+        connected = 1;
+        break;
+    }
+    if (!connected) {
+        efi_print_ascii("  iwn: connect failed after 3 attempts\r\n");
         return -1;
-    if (iwn_associate(dev) != 0)
-        return -1;
-    if (iwn_run(dev) != 0)
-        return -1;
+    }
 
     efi_print_ascii("  Associated with '");
     efi_print_ascii(dev->target_ssid);

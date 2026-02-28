@@ -102,7 +102,8 @@ int iwn_eapol_handshake(iwn_dev *dev);
 /* ---- Data TX/RX (iwn_data.c) ---- */
 
 int iwn_tx_raw(iwn_dev *dev, const uint8_t *frame, uint16_t frame_len,
-               uint8_t node_id, uint8_t security);
+               uint8_t node_id, uint8_t security,
+               uint8_t plcp, uint8_t rflags);
 int iwn_encap_tx(iwn_dev *dev, const uint8_t *dst_mac,
                  uint16_t ethertype, const uint8_t *payload, uint16_t payload_len);
 int iwn_rx_poll(iwn_dev *dev);

@@ -732,10 +732,16 @@ int efi_net_available(void);
 EFI_STATUS efi_http_get(const char *url, char *response, UINTN max_size, UINTN *out_size);
 EFI_STATUS efi_dns_resolve(const char *hostname, EFI_IPv4_ADDRESS *out_ip);
 
-/* TCP4 connection handle (used by net.c, http_server.c, api.c) */
+/* Forward declaration for custom network stack TCP connection */
+typedef struct ns_tcp_conn ns_tcp_conn;
+
+/* TCP4 connection handle (used by net.c, http_server.c, api.c)
+ * Dual dispatch: UEFI path (QEMU) uses tcp4/child_handle,
+ * custom stack path (Dell) uses ns_conn. */
 typedef struct {
-    EFI_TCP4_PROTOCOL *tcp4;
-    EFI_HANDLE child_handle;
+    EFI_TCP4_PROTOCOL *tcp4;       /* UEFI path (QEMU) */
+    EFI_HANDLE child_handle;       /* UEFI path */
+    ns_tcp_conn *ns_conn;          /* Custom path (Dell) — NULL on UEFI */
 } tcp4_conn_t;
 
 /* TCP4 server primitives */
@@ -783,6 +789,20 @@ int iwn_snp_is_installed(void);
 
 /* Get raw SNP protocol for custom network stack (returns NULL if not installed) */
 EFI_SIMPLE_NETWORK_PROTOCOL *iwn_snp_get_protocol(void);
+
+/* Direct data path — bypasses SNP function pointer table (hangs on Dell E6510).
+ * Used by the custom ns_* network stack instead of snp->Transmit/Receive. */
+void iwn_snp_get_mac(uint8_t *mac);
+int  iwn_snp_direct_tx(const uint8_t *dst_mac, uint16_t ethertype,
+                       const uint8_t *payload, int len);
+int  iwn_snp_direct_rx(uint8_t *buf, int buf_size, int *frame_len);
+
+/* Debug: dump HW state (tx_ok, HW RX ring index, sw buffer) */
+void iwn_snp_debug_state(void);
+
+/* Debug: RX frame type diagnostics (enable/disable + print summary) */
+void iwn_rx_set_debug(int on);
+void iwn_rx_print_debug(void);
 
 /* Driver loader state (1 if DXE drivers were loaded from \drivers\) */
 int efi_drivers_were_loaded(void);

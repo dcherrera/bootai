@@ -335,64 +335,12 @@ static int iwn_tx_eapol(iwn_dev *dev,
     /* EAPOL-Key body */
     iwn_memcpy(eapol_hdr + EAPOL_HDR_LEN, eapol_body, eapol_body_len);
 
-    /* ---- Send on TX ring 0, addressed to AP node (id=0) ---- */
-    iwn_tx_ring *ring = &dev->txq[0];
-    int idx = ring->cur;
-
-    struct iwn_tx_cmd *cmd = (struct iwn_tx_cmd *)
-        ((uint8_t *)ring->cmd.vaddr + idx * sizeof(struct iwn_tx_cmd));
-    iwn_memset(cmd, 0, sizeof(*cmd));
-    cmd->code = IWN_CMD_TX_DATA;
-    cmd->flags = 0;
-    cmd->idx = (uint8_t)idx;
-    cmd->qid = 0;
-
-    uint8_t *ring_buf = (uint8_t *)ring->cmd.vaddr +
-                        idx * sizeof(struct iwn_tx_cmd);
-    struct iwn_cmd_data *tx = (struct iwn_cmd_data *)(ring_buf + 4);
-    iwn_memset(tx, 0, sizeof(*tx));
-
-    tx->len = htole16(frame_len);
-    tx->flags = htole32(IWN_TX_NEED_ACK | IWN_TX_AUTO_SEQ);
-    tx->id = IWN_ID_BSS;  /* AP node, not broadcast */
-    tx->security = 0;     /* EAPOL is sent unencrypted */
-    tx->lifetime = htole32(IWN_LIFETIME_INFINITE);
-
-    /* CCK 1 Mbps for reliability */
+    /* Send via iwn_tx_raw() — handles 2-segment DMA for large frames.
+     * CCK 1 Mbps for EAPOL reliability. Unencrypted (security=0). */
     uint8_t txant = (uint8_t)IWN_LSB(dev->txchainmask);
-    tx->plcp = 10;  /* CCK 1 Mbps */
-    tx->rflags = IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant);
-
-    /* Copy frame after iwn_cmd_data */
-    iwn_memcpy(ring_buf + 4 + sizeof(struct iwn_cmd_data), frame, frame_len);
-
-    /* Build TX descriptor */
-    struct iwn_tx_desc *desc = (struct iwn_tx_desc *)
-        ((uint8_t *)ring->desc.vaddr + idx * sizeof(struct iwn_tx_desc));
-    iwn_memset(desc, 0, sizeof(*desc));
-
-    uint32_t totlen = 4 + sizeof(struct iwn_cmd_data) + frame_len;
-    uint64_t buf_paddr = ring->cmd.paddr + idx * sizeof(struct iwn_tx_cmd);
-
-    desc->nsegs = 1;
-    desc->segs[0].addr = IWN_LOADDR(buf_paddr);
-    desc->segs[0].len = (uint16_t)(IWN_HIADDR(buf_paddr) |
-                                    ((uint16_t)totlen << 4));
-
-    /* Update scheduler byte count table */
-    uint16_t *sched = (uint16_t *)dev->sched.vaddr;
-    int sched_idx = 0 * IWN5000_SCHED_COUNT + idx;
-    uint16_t bc = (uint16_t)(totlen + 3);
-    bc = (bc / 4) & 0x0fff;
-    sched[sched_idx] = bc;
-    sched[sched_idx + IWN_TX_RING_COUNT] = bc;
-
-    /* Kick hardware */
-    ring->cur = (idx + 1) % IWN_TX_RING_COUNT;
-    ring->queued++;
-    iwn_write(dev, IWN_HBUS_TARG_WRPTR, ring->cur | (0 << 8));
-
-    return 0;
+    return iwn_tx_raw(dev, frame, frame_len,
+                      IWN_ID_BSS, 0,
+                      10, IWN_RFLAG_CCK | IWN_RFLAG_ANT(txant));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -517,8 +465,20 @@ static int iwn_install_keys(iwn_dev *dev, const uint8_t *tk,
         node.control = IWN_NODE_UPDATE;
         node.flags = IWN_FLAG_SET_KEY;
         iwn_memcpy(node.macaddr, dev->target_bssid, 6);
-        node.kflags = htole16(IWN_KFLAG_CCMP | IWN_KFLAG_KID(0));
+        node.kflags = htole16(IWN_KFLAG_CCMP | IWN_KFLAG_MAP | IWN_KFLAG_KID(0));
         iwn_memcpy(node.key, tk, 16);
+
+        /* Debug: print kflags and first 4 key bytes */
+        {
+            uint16_t kf = IWN_KFLAG_CCMP | IWN_KFLAG_MAP | IWN_KFLAG_KID(0);
+            efi_print_ascii("    kflags=0x");
+            print_hex8((uint8_t)(kf >> 8));
+            print_hex8((uint8_t)(kf));
+            efi_print_ascii(" key[0:4]=");
+            print_hex8(tk[0]); print_hex8(tk[1]);
+            print_hex8(tk[2]); print_hex8(tk[3]);
+            efi_print_ascii("\r\n");
+        }
         node.tsc = 0;
 
         if (iwn_cmd(dev, IWN_CMD_ADD_NODE, &node, sizeof(node)) != 0) {
@@ -542,6 +502,21 @@ static int iwn_install_keys(iwn_dev *dev, const uint8_t *tk,
         node.kflags = htole16(IWN_KFLAG_CCMP |
                               IWN_KFLAG_KID(gtk_kid) |
                               IWN_KFLAG_GROUP);
+
+        /* Debug: print kflags and kid */
+        {
+            uint16_t kf = IWN_KFLAG_CCMP |
+                          IWN_KFLAG_KID(gtk_kid) | IWN_KFLAG_GROUP;
+            efi_print_ascii("    kflags=0x");
+            print_hex8((uint8_t)(kf >> 8));
+            print_hex8((uint8_t)(kf));
+            efi_print_ascii(" kid=");
+            print_dec((uint32_t)gtk_kid);
+            efi_print_ascii(" key[0:4]=");
+            print_hex8(gtk[0]); print_hex8(gtk[1]);
+            print_hex8(gtk[2]); print_hex8(gtk[3]);
+            efi_print_ascii("\r\n");
+        }
         iwn_memcpy(node.key, gtk, 16);
 
         /* Set RSC (replay counter) from M3 if provided */
@@ -813,6 +788,11 @@ int iwn_eapol_handshake(iwn_dev *dev) {
                 return -1;
             }
             efi_print_ascii("  M4 sent\r\n");
+
+            /* Wait for M4 to actually transmit before installing keys.
+             * Without this delay, the AP may not have received M4 yet
+             * and will deauth us when we start sending encrypted data. */
+            gBS->Stall(200000);  /* 200 ms */
         }
 
         /* ──────────────────────────────────────────────────────────────

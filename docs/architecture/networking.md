@@ -1,35 +1,44 @@
 # Networking Architecture
 
-Deep dive into BootAI's network stack: DHCP, TCP4, UDP4 DNS, and HTTP/1.0.
+Deep dive into BootAI's network stack: DHCP, TCP4, UDP4 DNS, HTTP/1.0, and the custom network stack for hardware without UEFI IP stack drivers.
 
-All networking code lives in `efi/net.c`. Protocol type definitions are in `efi/efi.h`.
+Networking dispatch lives in `efi/net.c`. Protocol type definitions are in `efi/efi.h`. Custom stack code lives in `efi/ns_*.c` files.
 
 ## Overview
 
+BootAI has two networking paths, selected automatically based on hardware capabilities:
+
 ```
-HTTP/1.0 GET (efi_http_get)
-    ↓
-DNS Resolution (efi_dns_resolve)          ← UDP4 wire-format DNS client
-    ↓
-TCP4 Connect/Send/Recv/Close              ← Service binding pattern
-    ↓
-IP4Config2 (DHCP)                         ← Automatic IP configuration
-    ↓
-ConnectController                         ← Driver chain binding
-    ↓
-MnpDxe → ArpDxe → Ip4Dxe → Tcp4Dxe / Udp4Dxe
-    ↓
-EFI_SIMPLE_NETWORK_PROTOCOL (SNP)
-    ↓
-┌────────────────┬──────────────────┐
-│ QEMU/wired     │ Dell E6510 WiFi  │
-│ VirtioNetDxe   │ IWN SNP wrapper  │
-│ (built into    │ (iwn_snp.c)      │
-│  firmware)     │      ↓           │
-│                │ iwn driver       │
-│                │ (802.11 + CCMP)  │
-└────────────────┴──────────────────┘
+        http_server.c / mdns.c / main.c (callers — unchanged)
+        tcp4_listen, tcp4_accept, tcp4_send, tcp4_recv, tcp4_close
+                            ↓
+                     net.c (dual dispatch)
+                ┌───────────┴───────────────┐
+                ↓                           ↓
+        UEFI TCP4/UDP4/IP4           Custom ns_* Stack
+        (QEMU, wired Ethernet)       (Dell E6510 WiFi)
+                ↓                           ↓
+        IP4Config2 (DHCP)           ns_tcp.c (TCP state machine)
+        ConnectController           ns_udp.c (UDP send/recv)
+        MnpDxe → ArpDxe →          ns_ip.c  (IPv4 build/parse)
+         Ip4Dxe → Tcp4Dxe          ns_arp.c (ARP table/resolve)
+                ↓                   ns_dhcp.c (DHCP client)
+                ↓                   ns_net.c (frame dispatch)
+        EFI_SIMPLE_NETWORK_PROTOCOL (SNP)
+                ↓                           ↓
+        ┌────────────────┬──────────────────┐
+        │ QEMU/wired     │ Dell E6510 WiFi  │
+        │ VirtioNetDxe   │ IWN SNP wrapper  │
+        │ (built into    │ (iwn_snp.c)      │
+        │  firmware)     │      ↓           │
+        │                │ iwn driver       │
+        │                │ (802.11 + CCMP)  │
+        └────────────────┴──────────────────┘
 ```
+
+**QEMU path** (left): UEFI firmware includes full IP stack DXE drivers. `ConnectController` binds MnpDxe → ArpDxe → Ip4Dxe → Tcp4Dxe automatically. Existing code runs unchanged.
+
+**Dell path** (right): Firmware lacks IP stack drivers. Custom `ns_*` stack implements ARP, DHCP, IPv4, UDP, and TCP directly on raw SNP frames. Callers never change — `net.c` dispatches based on which path is available.
 
 ## DHCP
 
@@ -333,17 +342,185 @@ The fix: skip `connect_all_controllers()` when `iwn_snp_is_installed()` returns 
 |-------|----------|--------|
 | 1 | `netdiag` to identify which protocols are missing | **DONE** — Dell has zero IP stack protocols |
 | 2 | Bundle EDK2 DXE drivers on USB `\drivers\` | **FAILED** — ConnectController hangs on Dell firmware |
-| 3 | Custom ARP/DHCP/IP/UDP/TCP on raw SNP | **NEXT** — required path forward |
+| 3 | Custom ARP/DHCP/IP/UDP/TCP on raw SNP | **DONE** — Phase 5c implemented |
 
 Phase 2 was tested with 6 EDK2 DXE drivers extracted from OVMF. Four loaded successfully but `Udp4Dxe.efi` and `TcpDxe.efi` failed at `StartImage`. When `ConnectController(snp_handle)` was called, MnpDxe's internal initialization hung — OVMF DXE drivers are incompatible with Dell E6510 firmware. ConnectController was removed from `iwn_snp_install()`.
 
-Phase 3 will build a custom network stack (ARP/DHCP/IP/UDP/TCP) directly on raw SNP, accessed via `iwn_snp_get_protocol()`. The existing `efi/net.c` TCP4/UDP4 code will need a dual-dispatch layer to route traffic to the custom stack when UEFI protocols are unavailable.
+Phase 3 implemented a custom network stack (ARP/DHCP/IP/UDP/TCP) directly on raw SNP. See the [Custom Network Stack](#custom-network-stack-phase-5c) section below for full details.
+
+---
+
+## Custom Network Stack (Phase 5c)
+
+A complete ARP/DHCP/IPv4/UDP/TCP stack built on raw `EFI_SIMPLE_NETWORK_PROTOCOL` frames. Used on hardware where UEFI firmware lacks IP stack DXE drivers (e.g. Dell E6510 with IWN WiFi driver).
+
+### Architecture
+
+```
+┌──────────────────────────────────────────┐
+│     http_server.c / mdns.c / main.c      │  callers — unchanged
+│  tcp4_listen, tcp4_accept, tcp4_send,    │
+│  tcp4_recv, tcp4_close, efi_get_local_ip │
+├──────────────────────────────────────────┤
+│              net.c (dual dispatch)       │  checks ns_is_ready()
+├────────────┬─────────────────────────────┤
+│  UEFI TCP4 │    ns_tcp.c (~400 lines)    │  TCP state machine
+│  (QEMU)    │    ns_udp.c (~95 lines)     │  UDP send/recv + port binding
+│            │    ns_ip.c  (~145 lines)    │  IPv4 build/parse/checksum
+│            │    ns_arp.c (~130 lines)    │  ARP table/resolve/reply
+│            │    ns_dhcp.c (~280 lines)   │  DHCP discover/offer/request/ack
+│            │    ns_net.c (~105 lines)    │  Frame dispatch + raw TX
+├────────────┴─────────────────────────────┤
+│              SNP (iwn_snp.c)             │  Layer 2
+└──────────────────────────────────────────┘
+```
+
+**Total**: ~1,155 lines of new code across 7 files (6 `ns_*.c` + `ns_net.h`), ~100 lines modified in existing files.
+
+**RAM budget**: ~12 KB static (ARP table 160B, DHCP buffers 1KB, TCP rx_buf 8KB, ns_state 32B, misc).
+
+### Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `efi/ns_net.h` | ~110 | Shared types (`ns_state`, `ns_tcp_conn`, `ns_arp_entry`), TCP states, public API declarations |
+| `efi/ns_net.c` | ~105 | Core: `ns_init()`, `ns_poll()` (EtherType dispatch), `ns_raw_send()` (Ethernet frame TX) |
+| `efi/ns_arp.c` | ~130 | 16-entry ARP table, `ns_arp_resolve()` (blocking 3s), `ns_arp_handle()` (learn + reply) |
+| `efi/ns_ip.c` | ~145 | `ns_ip_send()` (subnet routing, checksum), `ns_ip_handle()` (parse, dispatch to UDP/TCP) |
+| `efi/ns_udp.c` | ~95 | `ns_udp_send()`, `ns_udp_handle()`, 4-entry port binding table |
+| `efi/ns_dhcp.c` | ~280 | Full DHCP exchange: discover→offer→request→ack, raw broadcast (no IP yet) |
+| `efi/ns_tcp.c` | ~400 | TCP state machine: listen/accept/send/recv/close, retransmit, MSS 1460 |
+
+### Dual Dispatch in `net.c`
+
+The `tcp4_conn_t` struct holds both paths:
+
+```c
+typedef struct {
+    EFI_TCP4_PROTOCOL *tcp4;       /* UEFI path (QEMU) */
+    EFI_HANDLE child_handle;       /* UEFI path */
+    ns_tcp_conn *ns_conn;          /* Custom path (Dell) — NULL on UEFI path */
+} tcp4_conn_t;
+```
+
+Each function checks which path to use:
+
+| Function | UEFI path | Custom path |
+|----------|-----------|-------------|
+| `efi_net_init()` | IP4Config2 DHCP | `ns_init()` + `ns_dhcp_run()` |
+| `efi_get_local_ip()` | IP4Config2 GetData | `ns_get_ip()` |
+| `tcp4_listen()` | TCP4 ServiceBinding | `ns_tcp_listen()` |
+| `tcp4_accept()` | TCP4 Accept token | `ns_tcp_accept()` (500ms timeout) |
+| `tcp4_send()` | TCP4 Transmit token | `ns_tcp_send()` |
+| `tcp4_recv()` | TCP4 Receive token | `ns_tcp_recv()` (10s timeout) |
+| `tcp4_close()` | TCP4 Close + DestroyChild | `ns_tcp_close()` |
+
+The custom path activates when `ns_is_ready()` returns true — which only happens after `ns_init()` + `ns_dhcp_run()` succeeds. On QEMU, the UEFI path runs unchanged.
+
+### Layer Details
+
+#### ns_net.c — Core Frame Dispatch
+
+- **`ns_init(snp)`**: Stores SNP pointer, copies MAC from `snp->Mode->CurrentAddress`, ensures SNP is INITIALIZED (calls Start+Initialize if needed)
+- **`ns_raw_send(dst_mac, ethertype, payload, len)`**: Builds 14-byte Ethernet header + payload, calls `snp->Transmit()` with HeaderSize=0, recycles TX buffer via `GetStatus()`
+- **`ns_poll()`**: Calls `snp->Receive()`, dispatches by EtherType:
+  - `0x0806` → `ns_arp_handle()`
+  - `0x0800` → `ns_ip_handle()`
+
+#### ns_arp.c — ARP
+
+- 16-entry static table (`NS_ARP_TABLE_SIZE`)
+- `ns_arp_resolve(ip, mac_out)`: Table hit → immediate return. Miss → broadcast ARP request → poll for 3 seconds
+- `ns_arp_handle(frame, len)`: Learns sender MAC→IP from every ARP frame. Replies to requests for our IP
+- Same 28-byte ARP packet format as `iwn_data.c:331-358`
+
+#### ns_ip.c — IPv4
+
+- **`ns_ip_send(dst_ip, protocol, payload, len)`**:
+  - Subnet routing: on-subnet → ARP resolve directly, off-subnet → ARP resolve gateway
+  - Multicast: destination MAC calculated as `01:00:5E:(IP[1]&0x7F):IP[2]:IP[3]`
+  - 20-byte IPv4 header: version=4, IHL=5, DF=1, TTL=64, no options
+  - Internet checksum (RFC 1071) over header
+- **`ns_ip_handle(frame, len)`**:
+  - Parses IPv4 header from offset 14 (after Ethernet header)
+  - Verifies header checksum, checks destination (our IP, broadcast, subnet broadcast)
+  - Dispatches: protocol 17 → `ns_udp_handle()`, protocol 6 → `ns_tcp_handle()`
+
+#### ns_udp.c — UDP
+
+- 4-entry port binding table (`NS_UDP_MAX_BINDINGS`)
+- Used by DHCP (port 68) and mDNS (port 5353)
+- `ns_udp_send()`: 8-byte UDP header, checksum=0 (valid for IPv4), passes to `ns_ip_send()` with protocol=17
+- `ns_udp_handle()`: Dispatches to registered callback by destination port
+
+#### ns_dhcp.c — DHCP Client
+
+Full blocking DHCP exchange (~5 seconds):
+
+1. **DISCOVER**: Raw Ethernet+IP+UDP broadcast (can't use `ns_ip_send()` — no IP yet). Source 0.0.0.0:68 → dest 255.255.255.255:67. DHCP magic cookie `0x63825363`
+2. **OFFER**: Parse server response. Extract offered IP, server IP, gateway, subnet, DNS from DHCP options (TLV at offset 240)
+3. **REQUEST**: Broadcast requesting the offered IP with server identifier
+4. **ACK**: Confirm. Store IP/gateway/subnet/DNS in `ns_state`, set `ip_ready=1`
+
+DHCP options parsed: subnet mask (1), router/gateway (3), DNS server (6), message type (53), server identifier (54).
+
+#### ns_tcp.c — TCP State Machine
+
+Minimal TCP for HTTP/1.0 server (Connection: close, single connection at a time):
+
+**Server flow**:
+1. `ns_tcp_listen(port, conn)` → state = LISTEN, registered as global listener
+2. `ns_tcp_accept(listener, client, timeout_ms)` → wait for SYN → send SYN+ACK (with MSS option) → wait for ACK → ESTABLISHED
+3. `ns_tcp_recv(conn, buf, max_len, timeout_ms)` → return buffered data from 8KB rx_buf
+4. `ns_tcp_send(conn, data, len)` → PSH+ACK segments, 1460-byte MSS chunks
+5. `ns_tcp_close(conn)` → FIN+ACK, wait 2s for remote FIN
+
+**State machine**: CLOSED → LISTEN → SYN_RCVD → ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → CLOSING → TIME_WAIT → CLOSED
+
+**TCP checksum**: Full pseudo-header checksum (src IP, dst IP, protocol, TCP length) + header + data.
+
+**Simplifications** (HTTP/1.0 on LAN only):
+- No window scaling (window = 8192, matching rx_buf)
+- No out-of-order reassembly (drop OOO segments)
+- No Nagle, no congestion control
+- Single connection at a time
+- ISN increments by 64000 per connection
+
+### mDNS Integration
+
+When the custom stack is active, mDNS uses `ns_udp_send()` for multicast instead of UEFI UDP4 ServiceBinding:
+
+- `ba_mdns_init()`: If `ns_is_ready()` → binds port 5353 via `ns_udp_bind()`, skips UEFI UDP4 setup
+- `ba_mdns_poll()`: If `ns_is_ready()` → calls `ns_poll()`, checks query flag
+- `mdns_send()`: If `ns_is_ready()` → `ns_udp_send()` to multicast 224.0.0.251:5353
+- `ba_mdns_stop()`: If `ns_is_ready()` → `ns_udp_unbind(5353)`
+
+### Automatic Activation
+
+The custom stack activates automatically during `efi_net_init()`:
+
+```
+efi_net_init()
+  ├── Try UEFI IP4Config2 (existing code)
+  ├── If found → UEFI path (QEMU, wired Ethernet)
+  └── If not found AND iwn_snp_is_installed()
+      ├── ns_init(iwn_snp_get_protocol())
+      ├── ns_dhcp_run()
+      ├── If DHCP succeeds → net_available = 1
+      └── efi_get_local_ip() reads from ns_state
+```
+
+On QEMU (where UEFI IP4Config2 exists), the custom stack is never initialized.
+
+---
 
 ## Known Limitations
 
 - **No HTTPS/TLS** — would require a crypto library (mbedTLS or similar)
 - **No IPv6** — only IPv4 protocols are used
-- **QEMU user-mode only** — external IPs don't route on macOS; use `10.0.2.2` for host access
-- **Single DNS server** — hardcoded to `10.0.2.3` (QEMU forwarder)
+- **QEMU user-mode only** — external IPs don't route on macOS; use `10.0.2.2` for host access (UEFI path)
+- **Single DNS server** — hardcoded to `10.0.2.3` (QEMU forwarder, UEFI path only)
 - **No DNS caching** — every hostname lookup makes a new UDP query
-- **No TCP retransmission** — relies on firmware's TCP4 implementation
+- **Single TCP connection** — custom stack supports one connection at a time (HTTP/1.0)
+- **No TCP retransmission** — UEFI path relies on firmware; custom stack has no retransmit (LAN only)
+- **No DNS on custom stack** — DNS resolution not implemented (custom stack is for server mode only)

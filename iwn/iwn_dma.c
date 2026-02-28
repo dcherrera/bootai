@@ -95,6 +95,20 @@ int iwn_alloc_tx_ring(iwn_dev *dev, int qid) {
         return -1;
     }
 
+    /* Data ring 0: allocate a 4 KB DMA page for large frame payloads.
+     * The ring cmd buffer only has 80 bytes of frame space per entry
+     * (140 - 4 header - 56 iwn_cmd_data). Frames larger than 80 bytes
+     * (e.g. DHCP at 311 bytes) use a 2-segment TX descriptor: seg[0]
+     * points to the ring (header+cmd_data), seg[1] to this buffer. */
+    if (qid == 0) {
+        if (iwn_dma_alloc(&dev->tx_data, 4096) != 0) {
+            efi_print_ascii("  iwn: DMA alloc failed (tx_data)\r\n");
+            iwn_dma_free(&ring->cmd);
+            iwn_dma_free(&ring->desc);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -192,6 +206,7 @@ void iwn_free_dma(iwn_dev *dev) {
         iwn_dma_free(&dev->txq[q].desc);
         iwn_dma_free(&dev->txq[q].cmd);
     }
+    iwn_dma_free(&dev->tx_data);
 
     /* RX ring */
     for (int i = 0; i < IWN_RX_RING_COUNT; i++)

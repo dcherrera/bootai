@@ -375,3 +375,47 @@ int iwn_snp_is_installed(void) { return snp_installed; }
 EFI_SIMPLE_NETWORK_PROTOCOL *iwn_snp_get_protocol(void) {
     return snp_installed ? &snp_protocol : (void *)0;
 }
+
+/* ---- Direct data path for custom network stack ----
+ * Bypasses the SNP protocol function pointer table, which hangs on
+ * Dell E6510 firmware (likely a PIC/relocation issue with EFIAPI
+ * indirect calls). The custom ns_* stack calls these instead. */
+
+void iwn_snp_get_mac(uint8_t *mac) {
+    iwn_memcpy(mac, g_iwn.mac_addr, 6);
+}
+
+int iwn_snp_direct_tx(const uint8_t *dst_mac, uint16_t ethertype,
+                      const uint8_t *payload, int len) {
+    return iwn_encap_tx(&g_iwn, dst_mac, ethertype,
+                        payload, (uint16_t)len);
+}
+
+int iwn_snp_direct_rx(uint8_t *buf, int buf_size, int *frame_len) {
+    (void)buf_size;
+    iwn_rx_poll(&g_iwn);
+    uint16_t flen = 0;
+    int ret = iwn_rx_dequeue(&g_iwn, buf, &flen);
+    if (ret == 0 && frame_len) *frame_len = (int)flen;
+    return ret;
+}
+
+/* ---- Debug: dump HW state for diagnostics ---- */
+
+void iwn_snp_debug_state(void) {
+    iwn_dev *dev = &g_iwn;
+    struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
+    uint32_t hw_idx = stat->closed_count & 0x0fff;
+    int sw_pending = (dev->rx_tail - dev->rx_head + IWN_RX_BUF_COUNT)
+                     % IWN_RX_BUF_COUNT;
+
+    efi_print_ascii("  IWN: tx_ok=");
+    print_dec(dev->tx_ok);
+    efi_print_ascii(" hw=");
+    print_dec(hw_idx);
+    efi_print_ascii(" cur=");
+    print_dec((uint32_t)dev->rxq.cur);
+    efi_print_ascii(" sw=");
+    print_dec((uint32_t)sw_pending);
+    efi_print_ascii("\r\n");
+}

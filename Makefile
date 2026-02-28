@@ -15,7 +15,7 @@ CFLAGS = -O2 -msse4.2 \
 SHIM_CFLAGS = -I shim
 
 # Phase 1: EFI layer only (console + input + memory)
-EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/net_diag.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c efi/mdns.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c iwn/iwn_crypto.c iwn/iwn_assoc.c iwn/iwn_eapol.c iwn/iwn_data.c iwn/iwn_snp.c
+EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/net.c efi/net_diag.c efi/http_server.c efi/api.c efi/drivers.c efi/wifi.c efi/mdns.c efi/ns_net.c efi/ns_arp.c efi/ns_ip.c efi/ns_udp.c efi/ns_dhcp.c efi/ns_tcp.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c iwn/iwn_crypto.c iwn/iwn_assoc.c iwn/iwn_eapol.c iwn/iwn_data.c iwn/iwn_snp.c
 
 # Phase 3: UEFI libc shim (malloc/printf via UEFI Boot Services)
 LIBC_SRC  = efi/uefi_libc.c

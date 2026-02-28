@@ -17,6 +17,64 @@ static const uint8_t llc_snap_prefix[6] = {
     0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00
 };
 
+/* ---- RX debug diagnostics ---- */
+
+static int      iwn_rx_dbg_on;
+static uint32_t iwn_rx_dbg_total;   /* total ring entries processed */
+static uint32_t iwn_rx_dbg_mpdu;    /* IWN_MPDU_RX_DONE (193) count */
+static uint32_t iwn_rx_dbg_rxdone;  /* IWN_RX_DONE (195) count */
+static uint32_t iwn_rx_dbg_rxphy;   /* IWN_RX_PHY (192) count */
+static uint32_t iwn_rx_dbg_data;    /* data frames (type=2) */
+static uint32_t iwn_rx_dbg_mgmt;    /* management frames (type=0) */
+static uint32_t iwn_rx_dbg_txdone;  /* IWN_TX_DONE count */
+static uint32_t iwn_rx_dbg_other;   /* unrecognized notification types */
+static uint8_t  iwn_rx_dbg_otypes[8]; /* first 8 other type codes */
+static int      iwn_rx_dbg_ocnt;    /* how many unique other types */
+
+void iwn_rx_set_debug(int on) {
+    iwn_rx_dbg_on = on;
+    if (on) {
+        iwn_rx_dbg_total = 0;
+        iwn_rx_dbg_mpdu = 0;
+        iwn_rx_dbg_rxdone = 0;
+        iwn_rx_dbg_rxphy = 0;
+        iwn_rx_dbg_data = 0;
+        iwn_rx_dbg_mgmt = 0;
+        iwn_rx_dbg_txdone = 0;
+        iwn_rx_dbg_other = 0;
+        iwn_rx_dbg_ocnt = 0;
+    }
+}
+
+void iwn_rx_print_debug(void) {
+    efi_print_ascii("  RX debug: total=");
+    print_dec(iwn_rx_dbg_total);
+    efi_print_ascii(" mpdu=");
+    print_dec(iwn_rx_dbg_mpdu);
+    efi_print_ascii(" rxdone=");
+    print_dec(iwn_rx_dbg_rxdone);
+    efi_print_ascii(" phy=");
+    print_dec(iwn_rx_dbg_rxphy);
+    efi_print_ascii("\r\n");
+    efi_print_ascii("    data=");
+    print_dec(iwn_rx_dbg_data);
+    efi_print_ascii(" mgmt=");
+    print_dec(iwn_rx_dbg_mgmt);
+    efi_print_ascii(" tx=");
+    print_dec(iwn_rx_dbg_txdone);
+    efi_print_ascii(" other=");
+    print_dec(iwn_rx_dbg_other);
+    if (iwn_rx_dbg_ocnt > 0) {
+        efi_print_ascii(" [");
+        for (int i = 0; i < iwn_rx_dbg_ocnt; i++) {
+            print_dec((uint32_t)iwn_rx_dbg_otypes[i]);
+            if (i < iwn_rx_dbg_ocnt - 1) efi_print_ascii(",");
+        }
+        efi_print_ascii("]");
+    }
+    efi_print_ascii("\r\n");
+}
+
 /* =====================================================================
  * iwn_tx_raw -- Low-level TX on ring 0
  *
@@ -25,7 +83,8 @@ static const uint8_t llc_snap_prefix[6] = {
  * ===================================================================== */
 
 int iwn_tx_raw(iwn_dev *dev, const uint8_t *frame, uint16_t frame_len,
-               uint8_t node_id, uint8_t security) {
+               uint8_t node_id, uint8_t security,
+               uint8_t plcp, uint8_t rflags) {
     iwn_tx_ring *ring = &dev->txq[0];
     int idx = ring->cur;
 
@@ -50,27 +109,54 @@ int iwn_tx_raw(iwn_dev *dev, const uint8_t *frame, uint16_t frame_len,
     tx->security = security;
     tx->lifetime = htole32(IWN_LIFETIME_INFINITE);
 
-    /* OFDM 24 Mbps for data frames -- firmware uses LINK_QUALITY
-     * retry chain for rate fallback (54->48->36->24->...->CCK 1) */
-    uint8_t txant = (uint8_t)IWN_LSB(dev->txchainmask);
-    tx->plcp = 0x09;  /* OFDM 24 Mbps */
-    tx->rflags = IWN_RFLAG_ANT(txant);
-
-    /* Copy frame after iwn_cmd_data */
-    iwn_memcpy(ring_buf + 4 + sizeof(struct iwn_cmd_data), frame, frame_len);
+    /* TX rate: caller specifies plcp + rflags */
+    tx->plcp = plcp;
+    tx->rflags = rflags;
 
     /* Build TX descriptor */
     struct iwn_tx_desc *desc = (struct iwn_tx_desc *)
         ((uint8_t *)ring->desc.vaddr + idx * sizeof(struct iwn_tx_desc));
     iwn_memset(desc, 0, sizeof(*desc));
 
-    uint32_t totlen = 4 + sizeof(struct iwn_cmd_data) + frame_len;
     uint64_t buf_paddr = ring->cmd.paddr + idx * sizeof(struct iwn_tx_cmd);
+    uint32_t hdr_len = 4 + sizeof(struct iwn_cmd_data);
+    uint32_t inline_space = sizeof(struct iwn_tx_cmd) - hdr_len;
+    uint32_t totlen = hdr_len + frame_len;
 
-    desc->nsegs = 1;
-    desc->segs[0].addr = IWN_LOADDR(buf_paddr);
-    desc->segs[0].len = (uint16_t)(IWN_HIADDR(buf_paddr) |
-                                    ((uint16_t)totlen << 4));
+    if (frame_len <= (uint16_t)inline_space) {
+        /* Small frame: fits inline in ring entry (1 segment) */
+        iwn_memcpy(ring_buf + hdr_len, frame, frame_len);
+        desc->nsegs = 1;
+        desc->segs[0].addr = IWN_LOADDR(buf_paddr);
+        desc->segs[0].len = (uint16_t)(IWN_HIADDR(buf_paddr) |
+                                        ((uint16_t)totlen << 4));
+    } else {
+        /* Large frame: 2 segments. The 802.11 header MUST be inline in
+         * segment 0 (same as OpenBSD) — the firmware expects it there
+         * for CCMP IV insertion, AUTO_SEQ, and rate control.
+         *
+         * Seg 0: cmd header + iwn_cmd_data + first inline_space bytes of frame
+         * Seg 1: remaining frame bytes in separate DMA buffer */
+        uint32_t inline_bytes = inline_space;
+        uint32_t overflow = frame_len - inline_bytes;
+
+        /* Copy first part inline (fills ring entry to sizeof(iwn_tx_cmd)) */
+        iwn_memcpy(ring_buf + hdr_len, frame, inline_bytes);
+
+        /* Copy remainder to DMA buffer */
+        iwn_memcpy(dev->tx_data.vaddr, frame + inline_bytes, overflow);
+
+        desc->nsegs = 2;
+        /* Seg 0: full ring entry (hdr + cmd_data + inline frame data) */
+        uint32_t seg0_len = hdr_len + inline_bytes;
+        desc->segs[0].addr = IWN_LOADDR(buf_paddr);
+        desc->segs[0].len = (uint16_t)(IWN_HIADDR(buf_paddr) |
+                                        ((uint16_t)seg0_len << 4));
+        /* Seg 1: overflow frame data in DMA buffer */
+        desc->segs[1].addr = IWN_LOADDR(dev->tx_data.paddr);
+        desc->segs[1].len = (uint16_t)(IWN_HIADDR(dev->tx_data.paddr) |
+                                        ((uint16_t)overflow << 4));
+    }
 
     /* Update scheduler byte count table for ring 0 */
     uint16_t *sched = (uint16_t *)dev->sched.vaddr;
@@ -133,25 +219,22 @@ int iwn_encap_tx(iwn_dev *dev, const uint8_t *dst_mac,
     /* Payload */
     iwn_memcpy(frame + 32, payload, payload_len);
 
-    /* Determine node ID and security:
-     * - Broadcast/multicast (dst[0] & 1): node_id=15 (GTK), security=CCMP
-     * - Unicast: node_id=0 (PTK), security=CCMP
-     * - If keys not installed: security=0 */
-    uint8_t node_id;
+    /* In infrastructure mode (ToDS=1), ALL TX goes to the AP and is
+     * encrypted with PTK. Always use BSS node (id=0, PTK key).
+     * The GTK (node 15) is only for RX group frame decryption.
+     * Using GTK for TX causes the AP to fail PTK decryption → deauth. */
+    uint8_t node_id = IWN_ID_BSS;
     uint8_t security;
-
-    if (dst_mac[0] & 1) {
-        node_id = IWN5000_ID_BROADCAST;
-    } else {
-        node_id = IWN_ID_BSS;
-    }
 
     if (dev->keys_installed)
         security = IWN_CIPHER_CCMP;
     else
         security = 0;
 
-    return iwn_tx_raw(dev, frame, frame_len, node_id, security);
+    /* OFDM 24 Mbps -- firmware uses LINK_QUALITY retry chain for fallback */
+    uint8_t txant = (uint8_t)IWN_LSB(dev->txchainmask);
+    return iwn_tx_raw(dev, frame, frame_len, node_id, security,
+                      0x09, IWN_RFLAG_ANT(txant));
 }
 
 /* =====================================================================
@@ -172,7 +255,15 @@ int iwn_rx_poll(iwn_dev *dev) {
         struct iwn_rx_desc *desc = (struct iwn_rx_desc *)buf;
         uint8_t *data = (uint8_t *)buf + sizeof(struct iwn_rx_desc);
 
-        if (desc->type == IWN_MPDU_RX_DONE) {
+        if (iwn_rx_dbg_on) iwn_rx_dbg_total++;
+
+        if (desc->type == IWN_MPDU_RX_DONE || desc->type == 195 /* IWN_RX_DONE */) {
+            if (iwn_rx_dbg_on) {
+                if (desc->type == IWN_MPDU_RX_DONE)
+                    iwn_rx_dbg_mpdu++;
+                else
+                    iwn_rx_dbg_rxdone++;
+            }
             struct iwn_rx_mpdu *mpdu = (struct iwn_rx_mpdu *)data;
             uint16_t flen = letoh16(mpdu->len);
             uint8_t *frame = data + sizeof(struct iwn_rx_mpdu);
@@ -190,12 +281,42 @@ int iwn_rx_poll(iwn_dev *dev) {
                     goto advance;
                 }
 
+                if (iwn_rx_dbg_on && type == 0)
+                    iwn_rx_dbg_mgmt++;
+
                 /* Data frame: type=2, subtype=0 (data) or 8 (QoS data) */
                 if (type == 2 && (subtype == 0 || subtype == 8)) {
+                    /* Debug: dump data frame bytes at offset 24-39 */
+                    if (iwn_rx_dbg_on) {
+                        iwn_rx_dbg_data++;
+                        efi_print_ascii("  RX DATA: fc=");
+                        print_hex8(frame[0]);
+                        print_hex8(frame[1]);
+                        efi_print_ascii(" len=");
+                        print_dec(flen);
+                        efi_print_ascii(" [");
+                        int dend = 40;
+                        if (dend > (int)flen) dend = (int)flen;
+                        for (int d = 24; d < dend; d++) {
+                            print_hex8(frame[d]);
+                            if (d < dend - 1) efi_print_ascii(" ");
+                        }
+                        efi_print_ascii("]\r\n");
+                    }
                     /* Determine header length (QoS has 2 extra bytes) */
                     int hdr_len = 24;
                     if (subtype == 8)
                         hdr_len = 26;
+
+                    /* If Protected bit set: firmware decrypted the frame
+                     * but the 8-byte CCMP header (IV + ExtIV) remains
+                     * between the 802.11 header and LLC/SNAP payload.
+                     * Skip it. (Same as OpenBSD iwn_rx_done.) */
+                    int ccmp_hdr = 0;
+                    if (frame[1] & 0x40) {
+                        ccmp_hdr = 8;
+                        hdr_len += 8;
+                    }
 
                     /* Need at least header + LLC/SNAP */
                     if (flen < (uint16_t)(hdr_len + 8))
@@ -232,6 +353,9 @@ int iwn_rx_poll(iwn_dev *dev) {
                      */
                     uint8_t *eth = dev->rx_buf[dev->rx_tail];
                     uint16_t payload_len = flen - (uint16_t)hdr_len - 8;
+                    /* CCMP MIC (8 bytes) at end of decrypted frame */
+                    if (ccmp_hdr && payload_len >= 8)
+                        payload_len -= 8;
 
                     /* Clamp to buffer size (14-byte ETH header + payload) */
                     if (14 + payload_len > IWN_RX_BUF_SIZE)
@@ -254,9 +378,26 @@ int iwn_rx_poll(iwn_dev *dev) {
             }
         } else if (desc->type == IWN_TX_DONE) {
             /* TX completion -- update counters */
+            if (iwn_rx_dbg_on) iwn_rx_dbg_txdone++;
             dev->tx_ok++;
+        } else if (iwn_rx_dbg_on) {
+            if (desc->type == 192) /* IWN_RX_PHY */
+                iwn_rx_dbg_rxphy++;
+            else {
+                iwn_rx_dbg_other++;
+                /* Record first 8 unique type codes */
+                if (iwn_rx_dbg_ocnt < 8) {
+                    int dup = 0;
+                    for (int j = 0; j < iwn_rx_dbg_ocnt; j++) {
+                        if (iwn_rx_dbg_otypes[j] == desc->type) {
+                            dup = 1; break;
+                        }
+                    }
+                    if (!dup)
+                        iwn_rx_dbg_otypes[iwn_rx_dbg_ocnt++] = desc->type;
+                }
+            }
         }
-        /* Other notification types: silently ignore */
 
 advance:
         dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;

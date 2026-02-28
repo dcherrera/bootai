@@ -9,6 +9,7 @@
  */
 
 #include "efi.h"
+#include "ns_net.h"
 
 /* ---- Constants ---- */
 
@@ -116,9 +117,30 @@ static int mdns_build_response(uint8_t *buf, int buf_size, uint32_t ttl) {
     return pos;
 }
 
+/* ---- Custom stack mDNS receive callback ---- */
+
+static int mdns_ns_got_query;
+static uint8_t mdns_ns_rx_buf[512];
+static int mdns_ns_rx_len;
+
+static void mdns_ns_callback(const uint8_t *data, int len,
+                              const uint8_t *src_ip, uint16_t src_port) {
+    (void)src_ip; (void)src_port;
+    if (len > (int)sizeof(mdns_ns_rx_buf)) len = (int)sizeof(mdns_ns_rx_buf);
+    mdns_memcpy(mdns_ns_rx_buf, data, (UINTN)len);
+    mdns_ns_rx_len = len;
+    mdns_ns_got_query = 1;
+}
+
 /* ---- Send a UDP packet to multicast ---- */
 
 static EFI_STATUS mdns_send(const uint8_t *data, int len) {
+    /* Custom stack path (Dell) */
+    if (ns_is_ready()) {
+        uint8_t mcast_ip[4] = {224, 0, 0, 251};
+        ns_udp_send(mcast_ip, MDNS_PORT, MDNS_PORT, data, len);
+        return EFI_SUCCESS;
+    }
     EFI_UDP4_SESSION_DATA session;
     mdns_memset(&session, 0, sizeof(session));
     mdns_memcpy(&session.DestinationAddress, &mdns_mcast, 4);
@@ -256,6 +278,15 @@ EFI_STATUS ba_mdns_init(void) {
         return status;
     }
 
+    /* Custom stack path (Dell) — use ns_udp for mDNS */
+    if (ns_is_ready()) {
+        ns_udp_bind(MDNS_PORT, mdns_ns_callback);
+        mdns_running = 1;
+        mdns_ns_got_query = 0;
+        efi_print_ascii("  mDNS: initialized via custom stack (bootai.local)\r\n");
+        return EFI_SUCCESS;
+    }
+
     /* Locate UDP4 Service Binding */
     UINTN handle_count = 0;
     EFI_HANDLE *handles = 0;
@@ -341,7 +372,23 @@ void ba_mdns_announce(void) {
 }
 
 void ba_mdns_poll(void) {
-    if (!mdns_running || !mdns_udp4) return;
+    if (!mdns_running) return;
+
+    /* Custom stack path (Dell) */
+    if (ns_is_ready()) {
+        ns_poll();
+        if (mdns_ns_got_query) {
+            mdns_ns_got_query = 0;
+            if (mdns_is_our_query(mdns_ns_rx_buf, mdns_ns_rx_len)) {
+                uint8_t resp[64];
+                int rlen = mdns_build_response(resp, sizeof(resp), MDNS_TTL);
+                if (rlen > 0) mdns_send(resp, rlen);
+            }
+        }
+        return;
+    }
+
+    if (!mdns_udp4) return;
 
     /* Drive the network stack */
     mdns_udp4->Poll(mdns_udp4);
@@ -384,12 +431,22 @@ void ba_mdns_poll(void) {
 }
 
 void ba_mdns_stop(void) {
-    if (!mdns_running || !mdns_udp4) return;
+    if (!mdns_running) return;
 
     /* Send goodbye (TTL=0) */
     uint8_t pkt[64];
     int len = mdns_build_response(pkt, sizeof(pkt), 0);
     if (len > 0) mdns_send(pkt, len);
+
+    /* Custom stack path (Dell) */
+    if (ns_is_ready()) {
+        ns_udp_unbind(MDNS_PORT);
+        mdns_running = 0;
+        efi_print_ascii("  mDNS: stopped\r\n");
+        return;
+    }
+
+    if (!mdns_udp4) return;
 
     /* Cancel pending receive */
     if (mdns_rx_pending) {

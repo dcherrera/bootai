@@ -9,7 +9,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 ## Architecture
 
 - [UEFI Boot Architecture](architecture/uefi-boot-architecture.md) — Boot flow, memory model, build pipeline, driver binding
-- [Networking](architecture/networking.md) — DHCP, TCP4, UDP4 DNS, HTTP/1.0, mDNS/Bonjour discovery
+- [Networking](architecture/networking.md) — DHCP, TCP4, UDP4 DNS, HTTP/1.0, mDNS/Bonjour, custom network stack (ARP/DHCP/IP/UDP/TCP on raw SNP)
 - [Inference on Bare Metal](architecture/inference-on-bare-metal.md) — Model conversion, disk image creation, running SmolLM2-135M
 - [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions
 - [WiFi & Driver Loader](architecture/wifi-and-drivers.md) — UEFI driver loading from disk, WiFi scan/connect via WiFi2 protocol, wifi.conf auto-connect
@@ -20,6 +20,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 
 - [Phase 2 Debug Log](research/phase2-debug-log.md) — Networking bring-up: bugs found, fixes applied
 - [IWN Phase 3 Debug Log](research/iwn-phase3-debug-log.md) — WiFi scanning bring-up: 10 bugs found on Dell E6510 (BT coex, FH_INT, missing commands, probe frame)
+- [Phase 5c Debug Log](research/phase5-debug-log.md) — Custom network stack bring-up: SNP function pointer hang on Dell, direct IWN bypass fix
 
 ## Adding Documentation
 
@@ -40,6 +41,8 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | Build commands | `../Makefile` |
 | UEFI types | `../efi/efi.h` |
 | Network stack | `../efi/net.c` |
+| Custom stack types | `../efi/ns_net.h` |
+| Custom stack core | `../efi/ns_net.c`, `ns_arp.c`, `ns_ip.c`, `ns_udp.c`, `ns_dhcp.c`, `ns_tcp.c` |
 | Network diagnostics | `../efi/net_diag.c` |
 | mDNS responder | `../efi/mdns.c` |
 | WiFi management | `../efi/wifi.c` |

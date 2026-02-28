@@ -8,6 +8,7 @@
  */
 
 #include "efi.h"
+#include "ns_net.h"
 
 /* ---- Protocol GUIDs ---- */
 
@@ -228,8 +229,22 @@ EFI_STATUS efi_net_init(void) {
         /* Fallback to LocateProtocol */
         status = gBS->LocateProtocol(&gEfiIp4Config2ProtocolGuid, 0, (void **)&ip4_config2);
         if (status != EFI_SUCCESS) {
-            efi_print_ascii("  IP4Config2 not found\r\n");
             ip4_config2 = 0;
+
+            /* No UEFI IP stack — try custom network stack on IWN SNP */
+            EFI_SIMPLE_NETWORK_PROTOCOL *snp = iwn_snp_get_protocol();
+            if (snp) {
+                efi_print_ascii("  No UEFI IP stack — using custom network stack\r\n");
+                ns_init(snp);
+                if (ns_dhcp_run() == 0) {
+                    net_available = 1;
+                    return EFI_SUCCESS;
+                }
+                efi_print_ascii("  Custom DHCP failed\r\n");
+                return EFI_DEVICE_ERROR;
+            }
+
+            efi_print_ascii("  IP4Config2 not found\r\n");
             return status;
         }
     }
@@ -301,6 +316,12 @@ int efi_net_available(void) {
 }
 
 EFI_STATUS efi_get_local_ip(EFI_IPv4_ADDRESS *out_ip) {
+    /* Custom stack path (Dell) */
+    if (ns_is_ready()) {
+        ns_get_ip(out_ip->Addr);
+        return EFI_SUCCESS;
+    }
+
     if (!ip4_config2) return EFI_NOT_READY;
 
     /* Query size first */
@@ -445,6 +466,12 @@ static EFI_STATUS tcp4_connect(EFI_IPv4_ADDRESS *host_ip, uint16_t port, tcp4_co
 EFI_STATUS tcp4_send(tcp4_conn_t *conn, const void *data, UINTN len) {
     EFI_STATUS status;
 
+    /* Custom stack path (Dell) */
+    if (conn->ns_conn) {
+        int ret = ns_tcp_send(conn->ns_conn, data, (int)len);
+        return (ret >= 0) ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+    }
+
     if (!conn->tcp4 || !gBS) return EFI_NOT_READY;
 
     /* Build transmit data */
@@ -487,6 +514,11 @@ EFI_STATUS tcp4_send(tcp4_conn_t *conn, const void *data, UINTN len) {
 
 INTN tcp4_recv(tcp4_conn_t *conn, void *buf, UINTN max_len) {
     EFI_STATUS status;
+
+    /* Custom stack path (Dell) */
+    if (conn->ns_conn) {
+        return (INTN)ns_tcp_recv(conn->ns_conn, buf, (int)max_len, 10000);
+    }
 
     if (!conn->tcp4 || !gBS) return -1;
 
@@ -538,6 +570,13 @@ INTN tcp4_recv(tcp4_conn_t *conn, void *buf, UINTN max_len) {
 }
 
 void tcp4_close(tcp4_conn_t *conn) {
+    /* Custom stack path (Dell) */
+    if (conn->ns_conn) {
+        ns_tcp_close(conn->ns_conn);
+        conn->ns_conn = (void *)0;
+        return;
+    }
+
     if (!conn->tcp4 || !gBS) return;
 
     EFI_TCP4_CLOSE_TOKEN close_token;
@@ -564,9 +603,21 @@ void tcp4_close(tcp4_conn_t *conn) {
     conn->child_handle = 0;
 }
 
+/* ---- Static ns_tcp_conn storage for custom stack path ---- */
+
+static ns_tcp_conn ns_listener_conn;
+static ns_tcp_conn ns_client_conn;
+
 /* ---- TCP4 listen/accept (server side) ---- */
 
 EFI_STATUS tcp4_listen(uint16_t port, tcp4_conn_t *listener) {
+    /* Custom stack path (Dell) */
+    if (ns_is_ready()) {
+        ba_memset(listener, 0, sizeof(*listener));
+        listener->ns_conn = &ns_listener_conn;
+        ns_tcp_listen(port, listener->ns_conn);
+        return EFI_SUCCESS;
+    }
     EFI_STATUS status;
 
     if (!tcp4_sb || !gBS) return EFI_NOT_READY;
@@ -621,6 +672,14 @@ EFI_STATUS tcp4_listen(uint16_t port, tcp4_conn_t *listener) {
 
 EFI_STATUS tcp4_accept(tcp4_conn_t *listener, tcp4_conn_t *client) {
     EFI_STATUS status;
+
+    /* Custom stack path (Dell) */
+    if (listener->ns_conn) {
+        ba_memset(client, 0, sizeof(*client));
+        client->ns_conn = &ns_client_conn;
+        int ret = ns_tcp_accept(listener->ns_conn, client->ns_conn, 500);
+        return (ret == 0) ? EFI_SUCCESS : EFI_TIMEOUT;
+    }
 
     if (!listener->tcp4 || !gBS) return EFI_NOT_READY;
 

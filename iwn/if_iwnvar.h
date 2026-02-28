@@ -103,6 +103,7 @@ typedef struct iwn_dev {
     iwn_dma_info    sched;                  /* TX scheduler table */
     iwn_tx_ring     txq[5];                 /* TX queues 0-4 (4 = cmd) */
     iwn_rx_ring     rxq;                    /* RX queue */
+    iwn_dma_info    tx_data;                /* 4 KB DMA buf for large data frames */
 
     /* Phase 2: Firmware */
     iwn_fw          fw;                     /* parsed firmware sections */
