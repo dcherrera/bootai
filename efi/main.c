@@ -328,6 +328,17 @@ static void command_chat(void) {
  * Interactive/blocking commands check this and refuse to run. */
 int g_api_context = 0;
 
+/* Flag: set to 1 when reboot is requested via API (after response is sent) */
+int g_reboot_pending = 0;
+
+void efi_reboot(void) {
+    efi_print_ascii("  Rebooting...\r\n");
+    efi_log_flush();
+    gST->RuntimeServices->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, 0);
+    /* Should not return — halt if it does */
+    for (;;) __asm__ volatile("hlt");
+}
+
 /*
  * ba_exec_cmd — Execute a single REPL command.
  * Returns 0 on success, -1 for "exit", -2 for blocked commands (interactive).
@@ -761,6 +772,17 @@ int ba_exec_cmd(const char *line) {
         return 0;
     }
 
+    /* reboot — reset system */
+    if (str_eq(line, "reboot")) {
+        if (g_api_context) {
+            efi_print_ascii("  Rebooting...\r\n");
+            g_reboot_pending = 1;
+            return 0;
+        }
+        efi_reboot();
+        return 0;  /* unreachable */
+    }
+
     /* Default: echo back */
     efi_print_ascii("  ");
     efi_print_line(line);
@@ -773,7 +795,7 @@ static void command_repl(void) {
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
     efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
-    efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, tensor, exit\r\n");
+    efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, tensor, reboot, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {

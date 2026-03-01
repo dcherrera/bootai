@@ -499,6 +499,22 @@ struct EFI_BOOT_SERVICES {
     EFI_STATUS (EFIAPI *LocateProtocol)(EFI_GUID *Protocol, void *Registration, void **Interface);
 };
 
+/* Runtime Services (minimal — only ResetSystem) */
+#define EfiResetCold     0
+#define EfiResetWarm     1
+#define EfiResetShutdown 2
+
+typedef struct {
+    char _hdr[24];    /* EFI_TABLE_HEADER */
+    char _pad[80];    /* 10 functions before ResetSystem (8 bytes each):
+                         GetTime, SetTime, GetWakeupTime, SetWakeupTime,
+                         SetVirtualAddressMap, ConvertPointer,
+                         GetVariable, GetNextVariableName, SetVariable,
+                         GetNextHighMonotonicCount */
+    void (EFIAPI *ResetSystem)(uint32_t ResetType, EFI_STATUS ResetStatus,
+                                UINTN DataSize, void *ResetData);
+} EFI_RUNTIME_SERVICES;
+
 /* System Table */
 struct EFI_SYSTEM_TABLE {
     char _hdr[24]; /* EFI_TABLE_HEADER */
@@ -510,7 +526,7 @@ struct EFI_SYSTEM_TABLE {
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
     EFI_HANDLE                       StandardErrorHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
-    void                            *RuntimeServices;
+    EFI_RUNTIME_SERVICES            *RuntimeServices;
     EFI_BOOT_SERVICES              *BootServices;
 };
 
@@ -845,5 +861,14 @@ extern EFI_GUID gEfiMnpServiceBindingGuid;
 extern EFI_GUID gEfiArpServiceBindingGuid;
 extern EFI_GUID gEfiIp4ServiceBindingGuid;
 extern EFI_GUID gEfiDhcp4ServiceBindingGuid;
+
+/* Reboot */
+void efi_reboot(void);
+extern int g_reboot_pending;
+
+/* Firmware update streaming handler (called from http_server.c) */
+void mgmt_handle_update(tcp4_conn_t *client, const char *auth_header,
+                         int auth_header_len, const char *body_start,
+                         int body_bytes_read, int content_length);
 
 #endif /* BOOTAI_EFI_H */

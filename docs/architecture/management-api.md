@@ -48,6 +48,7 @@ curl "http://localhost:8080/api/log?offset=0"
 | `POST` | `/api/cmd` | Execute a REPL command, return captured output |
 | `GET` | `/api/log` | Read the log buffer (supports `?offset=N` for streaming) |
 | `GET` | `/api/health` | Extended status: network, WiFi, IP, log position |
+| `POST` | `/api/update` | Stream a new EFI binary to disk (OTA firmware update) |
 
 ### POST /api/cmd
 
@@ -82,7 +83,7 @@ Interactive commands that require keyboard input are blocked from the API to pre
 
 The `exit` command is safe to call — it returns success but does NOT actually exit the REPL (only the local keyboard can do that).
 
-All other commands work: `ls`, `cat`, `iwn scan`, `iwn pass`, `iwn connect`, `iwn ping`, `wifi scan`, `wifi save`, `wifi disconnect`, `netinfo`, `netdiag`, `tensor`, `fetch`.
+All other commands work: `ls`, `cat`, `iwn scan`, `iwn pass`, `iwn connect`, `iwn ping`, `wifi scan`, `wifi save`, `wifi disconnect`, `netinfo`, `netdiag`, `tensor`, `fetch`, `reboot`.
 
 ### GET /api/log
 
@@ -146,6 +147,100 @@ Extended health check with network diagnostics.
 | `network` | string | `"ready"` or `"unavailable"` |
 | `ip` | string | Local IP address (omitted if unavailable) |
 | `log_pos` | int | Current log buffer position (for streaming) |
+
+### POST /api/update
+
+Stream a new EFI binary to `\EFI\BOOT\BOOTX64.EFI` on the USB drive. This is the OTA firmware update endpoint — it eliminates the physical USB swap cycle.
+
+The binary is streamed directly from TCP to disk in 4KB chunks. The request body can be any size up to 4MB, bypassing the 8KB HTTP request buffer limit.
+
+**Request:**
+
+```bash
+curl -H "Authorization: Bearer bootai" \
+     --data-binary @all_bootai.efi \
+     http://192.168.0.101:8080/api/update
+```
+
+**Response (success):**
+
+```json
+{"ok": true, "message": "firmware updated"}
+```
+
+**Response (errors):**
+
+| Status | Body | Cause |
+|--------|------|-------|
+| 403 | `{"ok":false,"error":"unauthorized"}` | Missing or invalid Bearer token |
+| 400 | `{"ok":false,"error":"invalid content-length"}` | Missing Content-Length or > 4MB |
+| 500 | `{"ok":false,"error":"filesystem not ready"}` | `efi_fs_init()` not called or failed |
+| 500 | `{"ok":false,"error":"file create fail"}` | Could not create file on disk |
+| 500 | `{"ok":false,"error":"incomplete transfer"}` | TCP connection dropped before all bytes received |
+
+**How it works:**
+
+1. HTTP server parses headers, detects `/api/update` path
+2. Hands off the TCP connection to `mgmt_handle_update()` before reading the full body
+3. Handler authenticates, deletes old `\EFI\BOOT\BOOTX64.EFI`, creates new file
+4. Writes any body bytes already in the request buffer (typically ~7KB from the first TCP recv)
+5. Loops `tcp4_recv()` in 4KB chunks, writing each directly to the file
+6. Flushes and closes the file, sends JSON response
+
+### Reboot Command
+
+The `reboot` command resets the system via UEFI `RuntimeServices->ResetSystem(EfiResetWarm)`. Available from both the REPL and the API.
+
+**REPL:**
+
+```
+> reboot
+  Rebooting...
+```
+
+Calls `efi_reboot()` directly — immediate warm reset.
+
+**API:**
+
+```bash
+curl -H "Authorization: Bearer bootai" \
+     -d '{"cmd":"reboot"}' \
+     http://192.168.0.101:8080/api/cmd
+```
+
+```json
+{"ok": true, "output": "  Rebooting...\r\n"}
+```
+
+Sets `g_reboot_pending = 1` and returns. The HTTP server sends the response, closes the TCP connection, then calls `efi_reboot()`. This ensures the client receives its response before the machine resets.
+
+### OTA Update Workflow
+
+Build, push, and reboot — all from the Mac terminal:
+
+```bash
+# 1. Build new firmware
+cd bootai && make clean && make efi
+
+# 2. Push to Dell over network
+curl -H "Authorization: Bearer bootai" \
+     --data-binary @all_bootai.efi \
+     http://192.168.0.101:8080/api/update
+
+# 3. Reboot into new firmware
+curl -H "Authorization: Bearer bootai" \
+     -d '{"cmd":"reboot"}' \
+     http://192.168.0.101:8080/api/cmd
+
+# 4. Wait for Dell to boot, start server on Dell keyboard:
+#    > serve 8080
+
+# 5. Verify new firmware is running
+curl -H "Authorization: Bearer bootai" \
+     http://192.168.0.101:8080/api/health
+```
+
+This replaces the manual cycle of: eject USB, mount on Mac, copy EFI, eject, plug into Dell, boot.
 
 ## Authentication
 

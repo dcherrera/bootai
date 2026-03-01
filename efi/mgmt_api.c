@@ -363,6 +363,124 @@ static void mgmt_api_health(http_request *req, http_response *resp) {
                          cmd_output_buf, ji);
 }
 
+/* ---- POST /api/update — streaming firmware update ---- */
+
+#define UPDATE_CHUNK_SIZE 4096
+
+void mgmt_handle_update(tcp4_conn_t *client, const char *auth_header,
+                         int auth_header_len, const char *body_start,
+                         int body_bytes_read, int content_length) {
+    /* 1. Auth check */
+    if (!mgmt_auth_check(auth_header, auth_header_len)) {
+        const char *r = "HTTP/1.0 403 Forbidden\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 34\r\n\r\n"
+                        "{\"ok\":false,\"error\":\"unauthorized\"}";
+        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+        return;
+    }
+
+    /* 2. Validate Content-Length */
+    if (content_length <= 0 || content_length > 4 * 1024 * 1024) {
+        const char *r = "HTTP/1.0 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 45\r\n\r\n"
+                        "{\"ok\":false,\"error\":\"invalid content-length\"}";
+        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+        return;
+    }
+
+    /* 3. Open filesystem root */
+    EFI_FILE_PROTOCOL *root = efi_fs_root();
+    if (!root) {
+        const char *r = "HTTP/1.0 500 Internal Server Error\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 40\r\n\r\n"
+                        "{\"ok\":false,\"error\":\"filesystem not ready\"}";
+        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+        return;
+    }
+
+    /* 4. Build UCS-2 path for \EFI\BOOT\BOOTX64.EFI */
+    CHAR16 wpath[32];
+    {
+        const char *apath = "\\EFI\\BOOT\\BOOTX64.EFI";
+        int i = 0;
+        while (apath[i]) { wpath[i] = (CHAR16)(unsigned char)apath[i]; i++; }
+        wpath[i] = 0;
+    }
+
+    /* 5. Delete old file if it exists */
+    EFI_FILE_PROTOCOL *old = 0;
+    if (root->Open(root, &old, wpath,
+        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0) == EFI_SUCCESS) {
+        old->Delete(old); /* Delete closes the handle */
+    }
+
+    /* 6. Create new file */
+    EFI_FILE_PROTOCOL *file = 0;
+    EFI_STATUS st = root->Open(root, &file, wpath,
+        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+    if (st != EFI_SUCCESS) {
+        const char *r = "HTTP/1.0 500 Internal Server Error\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 37\r\n\r\n"
+                        "{\"ok\":false,\"error\":\"file create fail\"}";
+        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+        return;
+    }
+
+    /* 7. Write body bytes already in request buffer */
+    int total_written = 0;
+    if (body_bytes_read > 0) {
+        UINTN ws = (UINTN)body_bytes_read;
+        file->Write(file, &ws, (void *)body_start);
+        total_written += body_bytes_read;
+    }
+
+    /* 8. Stream remaining from TCP in chunks */
+    char chunk[UPDATE_CHUNK_SIZE];
+    while (total_written < content_length) {
+        int remaining = content_length - total_written;
+        int to_read = remaining < UPDATE_CHUNK_SIZE ? remaining : UPDATE_CHUNK_SIZE;
+        INTN got = tcp4_recv(client, chunk, (UINTN)to_read);
+        if (got <= 0) break;
+        UINTN ws = (UINTN)got;
+        file->Write(file, &ws, chunk);
+        total_written += (int)got;
+    }
+
+    /* 9. Flush and close file */
+    file->Flush(file);
+    file->Close(file);
+
+    /* 10. Log result */
+    efi_print_ascii("  Firmware updated (");
+    {
+        char num[12]; int ni = 0; int v = total_written;
+        if (v == 0) { num[ni++] = '0'; }
+        else { char t[12]; int ti = 0; while (v > 0) { t[ti++] = '0' + v % 10; v /= 10; } while (ti > 0) num[ni++] = t[--ti]; }
+        num[ni] = '\0';
+        efi_print_ascii(num);
+    }
+    efi_print_ascii(" bytes)\r\n");
+
+    /* 11. Send response */
+    if (total_written == content_length) {
+        const char *r = "HTTP/1.0 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 38\r\n\r\n"
+                        "{\"ok\":true,\"message\":\"firmware updated\"}";
+        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+    } else {
+        const char *r = "HTTP/1.0 500 Internal Server Error\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 40\r\n\r\n"
+                        "{\"ok\":false,\"error\":\"incomplete transfer\"}";
+        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+    }
+}
+
 /* ---- Router ---- */
 
 void mgmt_route(http_request *req, http_response *resp) {

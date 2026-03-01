@@ -338,6 +338,7 @@ void ba_http_serve(uint16_t port) {
         int headers_done = 0;
         int content_length = -1;
         int body_start = 0;
+        int streaming_handled = 0;
 
         while (total_read < HTTP_REQ_BUF_SIZE - 1) {
             INTN got = tcp4_recv(&client, g_req_buf + total_read,
@@ -369,12 +370,34 @@ void ba_http_serve(uint16_t port) {
                 }
             }
 
-            /* If we know Content-Length, check if we have the full body */
+            /* Once headers are done, check for streaming endpoints */
             if (headers_done) {
+                http_request hdr_req;
+                if (http_parse_request(g_req_buf, total_read, &hdr_req) &&
+                    hdr_req.path_len == 11 &&
+                    http_strncmp(hdr_req.path, "/api/update", 11) == 0) {
+                    /* Streaming endpoint — hand off to handler */
+                    efi_print_ascii("  POST /api/update\r\n");
+                    int body_bytes = total_read - body_start;
+                    mgmt_handle_update(&client, hdr_req.auth_header,
+                                       hdr_req.auth_header_len,
+                                       g_req_buf + body_start,
+                                       body_bytes, content_length);
+                    streaming_handled = 1;
+                    break;
+                }
+
+                /* Normal request: wait for full body */
                 if (content_length <= 0) break; /* No body expected */
                 int body_received = total_read - body_start;
                 if (body_received >= content_length) break; /* Full body received */
             }
+        }
+
+        if (streaming_handled) {
+            tcp4_close(&client);
+            if (g_reboot_pending) efi_reboot();
+            continue;
         }
 
         /* Parse and route */
@@ -405,6 +428,9 @@ void ba_http_serve(uint16_t port) {
         /* Send response and close */
         tcp4_send(&client, resp.buf, (UINTN)resp.len);
         tcp4_close(&client);
+
+        /* Check for pending reboot (from API "reboot" command) */
+        if (g_reboot_pending) efi_reboot();
     }
 
     /* Clean up listener */
