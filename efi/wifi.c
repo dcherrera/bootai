@@ -383,6 +383,14 @@ void efi_wifi_status(void) {
     }
 }
 
+/* ---- API token (parsed from wifi.conf) ---- */
+
+static char g_api_token[128] = {0};
+
+const char *efi_get_api_token(void) {
+    return g_api_token[0] ? g_api_token : 0;
+}
+
 /* ---- Config file parser ---- */
 
 #define MAX_WIFI_NETWORKS 16
@@ -421,6 +429,18 @@ static int parse_wifi_conf(const char *data, UINTN size, wifi_network_entry *ent
         /* Skip empty lines and comments */
         if (trimmed_len == 0 || *ls == '#') {
             /* advance past line ending */
+            p = line_end;
+            while (p < end && (*p == '\n' || *p == '\r')) p++;
+            continue;
+        }
+
+        /* Check for api_token= (outside [network] blocks) */
+        if (!in_network && trimmed_len > 10 && wifi_strncmp(ls, "api_token=", 10) == 0) {
+            const char *val = ls + 10;
+            int vlen = (int)(line_end - val);
+            if (vlen > 127) vlen = 127;
+            wifi_memcpy(g_api_token, val, (UINTN)vlen);
+            g_api_token[vlen] = '\0';
             p = line_end;
             while (p < end && (*p == '\n' || *p == '\r')) p++;
             continue;

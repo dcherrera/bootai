@@ -5,6 +5,8 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 ## Specs & Plans
 
 - [BootAI Roadmap](specs/bootai-roadmap.md) — 6-phase plan from boot to full AI assistant
+- [e1000e SNP Driver](specs/e1000e-snp-spec.md) — Intel wired Ethernet driver spec: 82577LM hardware, register map, descriptor rings, SNP integration
+- [e1000e SNP Plan](specs/e1000e-snp-plan.md) — Phased implementation plan: PCI probe → MMIO → RX/TX rings → SNP → Dell test
 
 ## Architecture
 
@@ -16,6 +18,8 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [IWN WiFi Driver](architecture/iwn-wifi-driver.md) — Native Intel 6200 WiFi driver ported from OpenBSD: PCI probe, MMIO/EEPROM, DMA/firmware, scanning, auth/assoc, WPA2 EAPOL, data TX/RX, SNP integration
 - [Console Logging](architecture/console-logging.md) — Tee all console output to `\bootai.log` on USB for post-session debugging
 - [PROD Build](architecture/prod-build.md) — `PROD=1` flag to skip boot menu and boot straight into chat inference
+- [Management API](architecture/management-api.md) — Remote debugging over Ethernet: execute commands, stream logs, health check (`/api/cmd`, `/api/log`, `/api/health`)
+- [Memory Diagnostics](architecture/memory-diagnostics.md) — `meminfo` REPL command: UEFI memory map breakdown by type (loader, firmware, free)
 
 ## Research
 
@@ -50,5 +54,6 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | Driver loader | `../efi/drivers.c` |
 | HTTP server | `../efi/http_server.c` |
 | API handlers | `../efi/api.c` |
+| Management API | `../efi/mgmt_api.c` |
 | Entry point | `../efi/main.c` |
 | Project guidelines | `../CLAUDE.md` |

@@ -62,6 +62,10 @@ typedef struct {
     const char *body;       /* POST body — points into req_buf */
     int body_len;
     int content_length;     /* Content-Length header value, or -1 */
+    const char *auth_header;  /* "Bearer xyz..." or NULL */
+    int auth_header_len;
+    const char *query;      /* "offset=12345" or NULL */
+    int query_len;
 } http_request;
 
 /* ---- HTTP response builder ---- */
@@ -114,6 +118,10 @@ static int http_parse_request(const char *buf, int buf_len, http_request *req) {
     req->body = "";
     req->body_len = 0;
     req->content_length = -1;
+    req->auth_header = 0;
+    req->auth_header_len = 0;
+    req->query = 0;
+    req->query_len = 0;
 
     if (buf_len < 4) return 0;
 
@@ -125,11 +133,20 @@ static int http_parse_request(const char *buf, int buf_len, http_request *req) {
     if (pos >= buf_len) return 0;
     pos++; /* skip space */
 
-    /* Parse path (up to next space) */
+    /* Parse path (up to next space or '?') */
     req->path = buf + pos;
     int path_start = pos;
     while (pos < buf_len && buf[pos] != ' ' && buf[pos] != '?') pos++;
     req->path_len = pos - path_start;
+
+    /* Capture query string if '?' is present */
+    if (pos < buf_len && buf[pos] == '?') {
+        pos++; /* skip '?' */
+        req->query = buf + pos;
+        int query_start = pos;
+        while (pos < buf_len && buf[pos] != ' ') pos++;
+        req->query_len = pos - query_start;
+    }
 
     /* Skip to end of request line */
     while (pos < buf_len && buf[pos] != '\n') pos++;
@@ -152,6 +169,18 @@ static int http_parse_request(const char *buf, int buf_len, http_request *req) {
             if (http_strncmp(buf + pos, "Content-Length: ", 16) == 0 ||
                 http_strncmp(buf + pos, "content-length: ", 16) == 0) {
                 req->content_length = http_atoi(buf + pos + 16);
+            }
+        }
+
+        /* Check for Authorization header */
+        if ((buf[pos] == 'A' || buf[pos] == 'a') && pos + 15 <= buf_len) {
+            if (http_strncmp(buf + pos, "Authorization: ", 15) == 0 ||
+                http_strncmp(buf + pos, "authorization: ", 15) == 0) {
+                req->auth_header = buf + pos + 15;
+                /* Find end of header value */
+                int hend = pos + 15;
+                while (hend < buf_len && buf[hend] != '\r' && buf[hend] != '\n') hend++;
+                req->auth_header_len = hend - (pos + 15);
             }
         }
 
@@ -209,12 +238,21 @@ void api_health(http_response *resp);
 void api_models(http_response *resp);
 void api_chat_completions(const char *body, int body_len, http_response *resp);
 
+/* Management API (implemented in mgmt_api.c) */
+void mgmt_route(http_request *req, http_response *resp);
+
 /* ---- HTTP router ---- */
 
 static void http_route(http_request *req, http_response *resp) {
     /* OPTIONS preflight for CORS */
     if (req->method_len == 7 && http_strncmp(req->method, "OPTIONS", 7) == 0) {
         http_format_response(resp, 204, "No Content", "text/plain", "", 0);
+        return;
+    }
+
+    /* Management API: /api/... */
+    if (req->path_len >= 4 && http_strncmp(req->path, "/api/", 5) == 0) {
+        mgmt_route(req, resp);
         return;
     }
 

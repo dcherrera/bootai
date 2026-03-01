@@ -9,6 +9,7 @@
 #include "foundry/tensor/tensor.h"
 #include "model/model.h"
 #include "iwn/iwn.h"
+#include "e1000e/e1000e.h"
 
 /* Printf (provided by uefi_libc.c) */
 int uefi_printf(const char *fmt, ...);
@@ -157,6 +158,16 @@ static void int_to_str(char *buf, int val) {
     while (val > 0) { tmp[ti++] = '0' + val % 10; val /= 10; }
     int si = 0;
     if (neg) buf[si++] = '-';
+    while (ti > 0) buf[si++] = tmp[--ti];
+    buf[si] = '\0';
+}
+
+/* ---- uint64 to ASCII helper (freestanding) ---- */
+static void u64_to_str(char *buf, uint64_t val) {
+    if (val == 0) { buf[0] = '0'; buf[1] = '\0'; return; }
+    char tmp[21]; int ti = 0;
+    while (val > 0) { tmp[ti++] = '0' + (int)(val % 10); val /= 10; }
+    int si = 0;
     while (ti > 0) buf[si++] = tmp[--ti];
     buf[si] = '\0';
 }
@@ -313,14 +324,443 @@ static void command_chat(void) {
 #define HTTP_RESPONSE_MAX 8192
 #define DISPLAY_MAX       2048
 
+/* Flag: set to 1 when executing a command from the management API.
+ * Interactive/blocking commands check this and refuse to run. */
+int g_api_context = 0;
+
+/*
+ * ba_exec_cmd — Execute a single REPL command.
+ * Returns 0 on success, -1 for "exit", -2 for blocked commands (interactive).
+ */
+int ba_exec_cmd(const char *line) {
+    static char response[HTTP_RESPONSE_MAX];
+
+    /* exit */
+    if (str_eq(line, "exit")) {
+        if (g_api_context) {
+            efi_print_ascii("  exit acknowledged\r\n");
+            return 0;  /* Don't actually exit from API */
+        }
+        return -1;
+    }
+
+    /* chat — multi-turn conversation (interactive — blocked from API) */
+    if (str_eq(line, "chat") || str_eq(line, "infer")) {
+        if (g_api_context) return -2;
+        command_chat();
+        return 0;
+    }
+
+    /* ls [path] — list directory */
+    if (str_eq(line, "ls") || str_starts_with(line, "ls ")) {
+        if (efi_fs_init() != EFI_SUCCESS) {
+            efi_print_ascii("  Filesystem not available\r\n");
+            return 0;
+        }
+        const char *path = line[2] == ' ' ? line + 3 : "";
+        while (*path == ' ') path++;
+        efi_list_dir(path);
+        return 0;
+    }
+
+    /* cat <file> — read and display file */
+    if (str_starts_with(line, "cat ")) {
+        const char *path = line + 4;
+        while (*path == ' ') path++;
+        if (*path == '\0') {
+            efi_print_ascii("  Usage: cat <file>\r\n");
+            return 0;
+        }
+        if (efi_fs_init() != EFI_SUCCESS) {
+            efi_print_ascii("  Filesystem not available\r\n");
+            return 0;
+        }
+        void *buf = 0;
+        UINTN fsize = 0;
+        if (efi_read_file(path, &buf, &fsize) == EFI_SUCCESS && buf) {
+            /* Display up to 2KB */
+            UINTN show = fsize > 2048 ? 2048 : fsize;
+            char *p = (char *)buf;
+            for (UINTN i = 0; i < show; i++) {
+                if (p[i] == '\n') {
+                    efi_print_ascii("\r\n");
+                } else if (p[i] >= 0x20 && p[i] < 0x7F) {
+                    CHAR16 ch[2] = { (CHAR16)(unsigned char)p[i], 0 };
+                    efi_print(ch);
+                }
+            }
+            efi_print_ascii("\r\n");
+            if (fsize > 2048) efi_print_ascii("  (truncated to 2KB)\r\n");
+            gBS->FreePool(buf);
+        } else {
+            efi_print_ascii("  File not found\r\n");
+        }
+        return 0;
+    }
+
+    /* netinfo */
+    if (str_eq(line, "netinfo")) {
+        if (efi_net_available()) {
+            efi_print_ascii("  Network: ready\r\n");
+        } else {
+            efi_print_ascii("  Network: unavailable\r\n");
+        }
+        return 0;
+    }
+
+    /* serve [port] — start HTTP server (interactive — blocked from API) */
+    if (str_eq(line, "serve") || str_starts_with(line, "serve ")) {
+        if (g_api_context) return -2;
+        if (!efi_net_available()) {
+            efi_print_ascii("  Network not available\r\n");
+            return 0;
+        }
+        if (!ensure_model_loaded()) return 0;
+
+        uint16_t port = 8080;
+        if (line[5] == ' ') {
+            const char *p = line + 6;
+            while (*p == ' ') p++;
+            if (*p >= '1' && *p <= '9') {
+                int v = 0;
+                while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+                if (v > 0 && v < 65536) port = (uint16_t)v;
+            }
+        }
+        if (ba_mdns_init() == EFI_SUCCESS) ba_mdns_announce();
+        ba_http_serve(port);
+        ba_mdns_stop();
+        return 0;
+    }
+
+    /* fetch <url> */
+    if (str_starts_with(line, "fetch ")) {
+        const char *url = line + 6;
+        /* Skip leading spaces */
+        while (*url == ' ') url++;
+
+        if (*url == '\0') {
+            efi_print_ascii("  Usage: fetch <url>\r\n");
+            return 0;
+        }
+
+        if (!efi_net_available()) {
+            efi_print_ascii("  Network not available\r\n");
+            return 0;
+        }
+
+        efi_print_ascii("  Fetching: ");
+        efi_print_ascii(url);
+        efi_print_ascii("\r\n");
+
+        UINTN out_size = 0;
+        EFI_STATUS status = efi_http_get(url, response, sizeof(response), &out_size);
+
+        if (status == EFI_SUCCESS && out_size > 0) {
+            efi_print_ascii("\r\n--- Response (");
+            /* Print size */
+            char size_str[12];
+            int si = 0;
+            UINTN sv = out_size;
+            if (sv == 0) {
+                size_str[si++] = '0';
+            } else {
+                char tmp[12];
+                int ti = 0;
+                while (sv > 0) {
+                    tmp[ti++] = '0' + (int)(sv % 10);
+                    sv /= 10;
+                }
+                while (ti > 0) size_str[si++] = tmp[--ti];
+            }
+            size_str[si] = '\0';
+            efi_print_ascii(size_str);
+            efi_print_ascii(" bytes) ---\r\n");
+
+            /* Truncate for display */
+            if (out_size > DISPLAY_MAX) {
+                response[DISPLAY_MAX] = '\0';
+                out_size = DISPLAY_MAX;
+            }
+
+            /* Print response, converting \n to \r\n */
+            for (UINTN i = 0; i < out_size; i++) {
+                if (response[i] == '\n') {
+                    efi_print_ascii("\r\n");
+                } else if (response[i] == '\r') {
+                    /* skip — we handle \n above */
+                } else if (response[i] >= 0x20 && response[i] < 0x7F) {
+                    CHAR16 ch[2] = { (CHAR16)(unsigned char)response[i], 0 };
+                    efi_print(ch);
+                }
+            }
+
+            efi_print_ascii("\r\n--- End ---\r\n");
+
+            if (out_size == DISPLAY_MAX) {
+                efi_print_ascii("  (truncated to 2KB for display)\r\n");
+            }
+        } else {
+            efi_print_ascii("  Fetch failed or empty response\r\n");
+        }
+        return 0;
+    }
+
+    /* wifi — WiFi management commands */
+    if (str_eq(line, "wifi")) {
+        efi_wifi_status();
+        return 0;
+    }
+    if (str_eq(line, "wifi scan")) {
+        efi_wifi_scan();
+        return 0;
+    }
+    if (str_eq(line, "wifi disconnect")) {
+        efi_wifi_disconnect();
+        return 0;
+    }
+    if (str_starts_with(line, "wifi save")) {
+        const char *ssid = line + 9;
+        while (*ssid == ' ') ssid++;
+        if (*ssid == '\0') {
+            efi_print_ascii("  Usage: wifi save <SSID> [password]\r\n");
+            return 0;
+        }
+        /* Check if password is provided after SSID (space-separated) */
+        const char *pw = ssid;
+        while (*pw && *pw != ' ') pw++;
+        if (*pw == ' ') {
+            /* Split SSID and password */
+            char save_ssid[64];
+            int slen = (int)(pw - ssid);
+            if (slen > 63) slen = 63;
+            for (int i = 0; i < slen; i++) save_ssid[i] = ssid[i];
+            save_ssid[slen] = '\0';
+            pw++;
+            while (*pw == ' ') pw++;
+            efi_wifi_save(save_ssid, pw);
+        } else {
+            efi_wifi_save(ssid, "");
+        }
+        return 0;
+    }
+    if (str_starts_with(line, "wifi connect ")) {
+        /* Interactive — blocked from API (prompts for password) */
+        if (g_api_context) return -2;
+        const char *ssid = line + 13;
+        while (*ssid == ' ') ssid++;
+        if (*ssid == '\0') {
+            efi_print_ascii("  Usage: wifi connect <SSID>\r\n");
+            return 0;
+        }
+        /* Prompt for password */
+        efi_print_ascii("  Password: ");
+        char password[128];
+        int plen = efi_read_line(password, sizeof(password));
+        if (plen < 0) plen = 0;
+        password[plen] = '\0';
+
+        EFI_STATUS ws = efi_wifi_connect(ssid, password);
+        if (ws == EFI_SUCCESS) {
+            efi_print_ascii("  Save to wifi.conf? (y/n) ");
+            char yn[8];
+            efi_read_line(yn, sizeof(yn));
+            if (yn[0] == 'y' || yn[0] == 'Y') {
+                efi_wifi_save(ssid, password);
+            }
+        }
+        return 0;
+    }
+
+    /* mdns — manual mDNS test (interactive — blocked from API) */
+    if (str_eq(line, "mdns")) {
+        if (g_api_context) return -2;
+        if (!efi_net_available()) {
+            efi_print_ascii("  Network not available\r\n");
+            return 0;
+        }
+        if (ba_mdns_init() == EFI_SUCCESS) {
+            ba_mdns_announce();
+            efi_print_ascii("  mDNS running. Press any key to stop.\r\n");
+            for (;;) {
+                ba_mdns_poll();
+                gBS->Stall(100000);
+                EFI_INPUT_KEY k;
+                if (efi_read_key(&k) == EFI_SUCCESS) break;
+            }
+            ba_mdns_stop();
+        }
+        return 0;
+    }
+
+    /* e1000e — PCI probe for Intel Ethernet */
+    if (str_eq(line, "e1000e")) {
+        e1000e_probe();
+        return 0;
+    }
+
+    /* iwn — PCI probe for Intel WiFi */
+    if (str_eq(line, "iwn")) {
+        iwn_probe();
+        return 0;
+    }
+
+    /* iwn scan — scan for WiFi networks (Phase 3) */
+    if (str_eq(line, "iwn scan")) {
+        iwn_scan_cmd();
+        return 0;
+    }
+
+    /* iwn connect <SSID> — connect to a WiFi network (Phase 4b) */
+    if (str_starts_with(line, "iwn connect ")) {
+        const char *ssid = line + 12;
+        while (*ssid == ' ') ssid++;
+        if (*ssid) {
+            iwn_connect_cmd(ssid);
+        } else {
+            efi_print_ascii("  Usage: iwn connect <SSID>\r\n");
+        }
+        return 0;
+    }
+
+    /* iwn pass <password> — set WPA2 password (Phase 4b) */
+    if (str_starts_with(line, "iwn pass ")) {
+        const char *pw = line + 9;
+        while (*pw == ' ') pw++;
+        if (*pw) {
+            iwn_set_password(pw);
+        } else {
+            efi_print_ascii("  Usage: iwn pass <password>\r\n");
+        }
+        return 0;
+    }
+
+    /* iwn ping — ARP ping to test data path (Phase 4d) */
+    if (str_eq(line, "iwn ping")) {
+        iwn_ping_cmd();
+        return 0;
+    }
+
+    /* meminfo — memory usage summary */
+    if (str_eq(line, "meminfo")) {
+        UINTN map_size = 0, map_key = 0, desc_size = 0;
+        uint32_t desc_ver = 0;
+
+        /* First call: get required buffer size */
+        gBS->GetMemoryMap(&map_size, 0, &map_key, &desc_size, &desc_ver);
+        map_size += 2 * desc_size;
+
+        void *map_buf = 0;
+        if (gBS->AllocatePool(EfiLoaderData, map_size, &map_buf) != EFI_SUCCESS) {
+            efi_print_ascii("  Failed to allocate buffer\r\n");
+            return 0;
+        }
+
+        if (gBS->GetMemoryMap(&map_size, map_buf, &map_key, &desc_size, &desc_ver) != EFI_SUCCESS) {
+            efi_print_ascii("  GetMemoryMap failed\r\n");
+            gBS->FreePool(map_buf);
+            return 0;
+        }
+
+        /* Sum pages by memory type */
+        uint64_t pages[EfiMaxMemoryType];
+        for (int i = 0; i < EfiMaxMemoryType; i++) pages[i] = 0;
+
+        uint8_t *p = (uint8_t *)map_buf;
+        uint8_t *end = p + map_size;
+        while (p < end) {
+            EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)p;
+            if (d->Type < EfiMaxMemoryType)
+                pages[d->Type] += d->NumberOfPages;
+            p += desc_size;
+        }
+        gBS->FreePool(map_buf);
+
+        char num[24];
+        uint64_t total_mb = 0;
+        for (int i = 0; i < EfiMaxMemoryType; i++)
+            total_mb += (pages[i] * 4096) / (1024 * 1024);
+
+        /* BootAI usage = LoaderCode + LoaderData */
+        uint64_t bootai_kb = ((pages[EfiLoaderCode] + pages[EfiLoaderData]) * 4096) / 1024;
+
+        /* Firmware usage = everything except Free, LoaderCode, LoaderData */
+        uint64_t fw_mb = 0;
+        for (int i = 0; i < EfiMaxMemoryType; i++) {
+            if (i == EfiConventionalMemory || i == EfiLoaderCode || i == EfiLoaderData)
+                continue;
+            fw_mb += (pages[i] * 4096) / (1024 * 1024);
+        }
+
+        uint64_t free_mb = (pages[EfiConventionalMemory] * 4096) / (1024 * 1024);
+        uint64_t pool_free_mb = ba_mem_pool_free() / (1024 * 1024);
+        uint64_t pool_used_mb = ba_mem_pool_used() / (1024 * 1024);
+        uint64_t usable_mb = free_mb + pool_free_mb;
+
+        /* Clean user-facing output */
+        efi_print_ascii("\r\n");
+        efi_print_ascii("  Installed RAM:  ");
+        u64_to_str(num, total_mb); efi_print_ascii(num);
+        efi_print_ascii(" MB\r\n");
+
+        efi_print_ascii("  Firmware:       ");
+        u64_to_str(num, fw_mb); efi_print_ascii(num);
+        efi_print_ascii(" MB\r\n");
+
+        efi_print_ascii("  BootAI:         ");
+        u64_to_str(num, bootai_kb); efi_print_ascii(num);
+        efi_print_ascii(" KB\r\n");
+
+        if (pool_used_mb > 0) {
+            efi_print_ascii("  Model/Data:     ");
+            u64_to_str(num, pool_used_mb); efi_print_ascii(num);
+            efi_print_ascii(" MB\r\n");
+        }
+
+        efi_print_ascii("  ----\r\n");
+        efi_print_ascii("  Available:      ");
+        u64_to_str(num, usable_mb); efi_print_ascii(num);
+        efi_print_ascii(" MB\r\n");
+
+        if (ba_mem_pool_regions() > 0) {
+            efi_print_ascii("    (includes ");
+            u64_to_str(num, ba_mem_pool_free() / (1024 * 1024));
+            efi_print_ascii(num);
+            efi_print_ascii(" MB reclaimed from ");
+            u64_to_str(num, ba_mem_pool_regions());
+            efi_print_ascii(num);
+            efi_print_ascii(" firmware region(s))\r\n");
+        }
+
+        efi_print_ascii("\r\n");
+        return 0;
+    }
+
+    /* netdiag — enumerate network protocols */
+    if (str_eq(line, "netdiag")) {
+        efi_net_diag();
+        return 0;
+    }
+
+    /* tensor — run tensor self-test */
+    if (str_eq(line, "tensor")) {
+        tensor_self_test();
+        return 0;
+    }
+
+    /* Default: echo back */
+    efi_print_ascii("  ");
+    efi_print_line(line);
+    return 0;
+}
+
 static void command_repl(void) {
     char line[512];
-    char response[HTTP_RESPONSE_MAX];
 
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
     efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
-    efi_print_ascii("            netdiag, tensor, exit\r\n");
+    efi_print_ascii("            e1000e, netdiag, meminfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -331,312 +771,7 @@ static void command_repl(void) {
 
         if (len <= 0) continue;
 
-        /* exit */
-        if (str_eq(line, "exit")) {
-            break;
-        }
-
-        /* chat — multi-turn conversation */
-        if (str_eq(line, "chat") || str_eq(line, "infer")) {
-            command_chat();
-            continue;
-        }
-
-        /* ls [path] — list directory */
-        if (str_eq(line, "ls") || str_starts_with(line, "ls ")) {
-            if (efi_fs_init() != EFI_SUCCESS) {
-                efi_print_ascii("  Filesystem not available\r\n");
-                continue;
-            }
-            const char *path = line[2] == ' ' ? line + 3 : "";
-            while (*path == ' ') path++;
-            efi_list_dir(path);
-            continue;
-        }
-
-        /* cat <file> — read and display file */
-        if (str_starts_with(line, "cat ")) {
-            const char *path = line + 4;
-            while (*path == ' ') path++;
-            if (*path == '\0') {
-                efi_print_ascii("  Usage: cat <file>\r\n");
-                continue;
-            }
-            if (efi_fs_init() != EFI_SUCCESS) {
-                efi_print_ascii("  Filesystem not available\r\n");
-                continue;
-            }
-            void *buf = 0;
-            UINTN fsize = 0;
-            if (efi_read_file(path, &buf, &fsize) == EFI_SUCCESS && buf) {
-                /* Display up to 2KB */
-                UINTN show = fsize > 2048 ? 2048 : fsize;
-                char *p = (char *)buf;
-                for (UINTN i = 0; i < show; i++) {
-                    if (p[i] == '\n') {
-                        efi_print_ascii("\r\n");
-                    } else if (p[i] >= 0x20 && p[i] < 0x7F) {
-                        CHAR16 ch[2] = { (CHAR16)(unsigned char)p[i], 0 };
-                        efi_print(ch);
-                    }
-                }
-                efi_print_ascii("\r\n");
-                if (fsize > 2048) efi_print_ascii("  (truncated to 2KB)\r\n");
-                gBS->FreePool(buf);
-            } else {
-                efi_print_ascii("  File not found\r\n");
-            }
-            continue;
-        }
-
-        /* netinfo */
-        if (str_eq(line, "netinfo")) {
-            if (efi_net_available()) {
-                efi_print_ascii("  Network: ready\r\n");
-            } else {
-                efi_print_ascii("  Network: unavailable\r\n");
-            }
-            continue;
-        }
-
-        /* serve [port] — start HTTP server */
-        if (str_eq(line, "serve") || str_starts_with(line, "serve ")) {
-            if (!efi_net_available()) {
-                efi_print_ascii("  Network not available\r\n");
-                continue;
-            }
-            if (!ensure_model_loaded()) continue;
-
-            uint16_t port = 8080;
-            if (line[5] == ' ') {
-                const char *p = line + 6;
-                while (*p == ' ') p++;
-                if (*p >= '1' && *p <= '9') {
-                    int v = 0;
-                    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
-                    if (v > 0 && v < 65536) port = (uint16_t)v;
-                }
-            }
-            if (ba_mdns_init() == EFI_SUCCESS) ba_mdns_announce();
-            ba_http_serve(port);
-            ba_mdns_stop();
-            continue;
-        }
-
-        /* fetch <url> */
-        if (str_starts_with(line, "fetch ")) {
-            const char *url = line + 6;
-            /* Skip leading spaces */
-            while (*url == ' ') url++;
-
-            if (*url == '\0') {
-                efi_print_ascii("  Usage: fetch <url>\r\n");
-                continue;
-            }
-
-            if (!efi_net_available()) {
-                efi_print_ascii("  Network not available\r\n");
-                continue;
-            }
-
-            efi_print_ascii("  Fetching: ");
-            efi_print_ascii(url);
-            efi_print_ascii("\r\n");
-
-            UINTN out_size = 0;
-            EFI_STATUS status = efi_http_get(url, response, sizeof(response), &out_size);
-
-            if (status == EFI_SUCCESS && out_size > 0) {
-                efi_print_ascii("\r\n--- Response (");
-                /* Print size */
-                char size_str[12];
-                int si = 0;
-                UINTN sv = out_size;
-                if (sv == 0) {
-                    size_str[si++] = '0';
-                } else {
-                    char tmp[12];
-                    int ti = 0;
-                    while (sv > 0) {
-                        tmp[ti++] = '0' + (int)(sv % 10);
-                        sv /= 10;
-                    }
-                    while (ti > 0) size_str[si++] = tmp[--ti];
-                }
-                size_str[si] = '\0';
-                efi_print_ascii(size_str);
-                efi_print_ascii(" bytes) ---\r\n");
-
-                /* Truncate for display */
-                if (out_size > DISPLAY_MAX) {
-                    response[DISPLAY_MAX] = '\0';
-                    out_size = DISPLAY_MAX;
-                }
-
-                /* Print response, converting \n to \r\n */
-                for (UINTN i = 0; i < out_size; i++) {
-                    if (response[i] == '\n') {
-                        efi_print_ascii("\r\n");
-                    } else if (response[i] == '\r') {
-                        /* skip — we handle \n above */
-                    } else if (response[i] >= 0x20 && response[i] < 0x7F) {
-                        CHAR16 ch[2] = { (CHAR16)(unsigned char)response[i], 0 };
-                        efi_print(ch);
-                    }
-                }
-
-                efi_print_ascii("\r\n--- End ---\r\n");
-
-                if (out_size == DISPLAY_MAX) {
-                    efi_print_ascii("  (truncated to 2KB for display)\r\n");
-                }
-            } else {
-                efi_print_ascii("  Fetch failed or empty response\r\n");
-            }
-            continue;
-        }
-
-        /* wifi — WiFi management commands */
-        if (str_eq(line, "wifi")) {
-            efi_wifi_status();
-            continue;
-        }
-        if (str_eq(line, "wifi scan")) {
-            efi_wifi_scan();
-            continue;
-        }
-        if (str_eq(line, "wifi disconnect")) {
-            efi_wifi_disconnect();
-            continue;
-        }
-        if (str_starts_with(line, "wifi save")) {
-            const char *ssid = line + 9;
-            while (*ssid == ' ') ssid++;
-            if (*ssid == '\0') {
-                efi_print_ascii("  Usage: wifi save <SSID> [password]\r\n");
-                continue;
-            }
-            /* Check if password is provided after SSID (space-separated) */
-            const char *pw = ssid;
-            while (*pw && *pw != ' ') pw++;
-            if (*pw == ' ') {
-                /* Split SSID and password */
-                char save_ssid[64];
-                int slen = (int)(pw - ssid);
-                if (slen > 63) slen = 63;
-                for (int i = 0; i < slen; i++) save_ssid[i] = ssid[i];
-                save_ssid[slen] = '\0';
-                pw++;
-                while (*pw == ' ') pw++;
-                efi_wifi_save(save_ssid, pw);
-            } else {
-                efi_wifi_save(ssid, "");
-            }
-            continue;
-        }
-        if (str_starts_with(line, "wifi connect ")) {
-            const char *ssid = line + 13;
-            while (*ssid == ' ') ssid++;
-            if (*ssid == '\0') {
-                efi_print_ascii("  Usage: wifi connect <SSID>\r\n");
-                continue;
-            }
-            /* Prompt for password */
-            efi_print_ascii("  Password: ");
-            char password[128];
-            int plen = efi_read_line(password, sizeof(password));
-            if (plen < 0) plen = 0;
-            password[plen] = '\0';
-
-            EFI_STATUS ws = efi_wifi_connect(ssid, password);
-            if (ws == EFI_SUCCESS) {
-                efi_print_ascii("  Save to wifi.conf? (y/n) ");
-                char yn[8];
-                efi_read_line(yn, sizeof(yn));
-                if (yn[0] == 'y' || yn[0] == 'Y') {
-                    efi_wifi_save(ssid, password);
-                }
-            }
-            continue;
-        }
-
-        /* mdns — manual mDNS test */
-        if (str_eq(line, "mdns")) {
-            if (!efi_net_available()) {
-                efi_print_ascii("  Network not available\r\n");
-                continue;
-            }
-            if (ba_mdns_init() == EFI_SUCCESS) {
-                ba_mdns_announce();
-                efi_print_ascii("  mDNS running. Press any key to stop.\r\n");
-                for (;;) {
-                    ba_mdns_poll();
-                    gBS->Stall(100000);
-                    EFI_INPUT_KEY k;
-                    if (efi_read_key(&k) == EFI_SUCCESS) break;
-                }
-                ba_mdns_stop();
-            }
-            continue;
-        }
-
-        /* iwn — PCI probe for Intel WiFi */
-        if (str_eq(line, "iwn")) {
-            iwn_probe();
-            continue;
-        }
-
-        /* iwn scan — scan for WiFi networks (Phase 3) */
-        if (str_eq(line, "iwn scan")) {
-            iwn_scan_cmd();
-            continue;
-        }
-
-        /* iwn connect <SSID> — connect to a WiFi network (Phase 4b) */
-        if (str_starts_with(line, "iwn connect ")) {
-            const char *ssid = line + 12;
-            while (*ssid == ' ') ssid++;
-            if (*ssid) {
-                iwn_connect_cmd(ssid);
-            } else {
-                efi_print_ascii("  Usage: iwn connect <SSID>\r\n");
-            }
-            continue;
-        }
-
-        /* iwn pass <password> — set WPA2 password (Phase 4b) */
-        if (str_starts_with(line, "iwn pass ")) {
-            const char *pw = line + 9;
-            while (*pw == ' ') pw++;
-            if (*pw) {
-                iwn_set_password(pw);
-            } else {
-                efi_print_ascii("  Usage: iwn pass <password>\r\n");
-            }
-            continue;
-        }
-
-        /* iwn ping — ARP ping to test data path (Phase 4d) */
-        if (str_eq(line, "iwn ping")) {
-            iwn_ping_cmd();
-            continue;
-        }
-
-        /* netdiag — enumerate network protocols */
-        if (str_eq(line, "netdiag")) {
-            efi_net_diag();
-            continue;
-        }
-
-        /* tensor — run tensor self-test */
-        if (str_eq(line, "tensor")) {
-            tensor_self_test();
-            continue;
-        }
-
-        /* Default: echo back */
-        efi_print_ascii("  ");
-        efi_print_line(line);
+        if (ba_exec_cmd(line) == -1) break;  /* "exit" */
     }
 }
 
@@ -670,8 +805,8 @@ EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_T
     /* Clear screen */
     efi_clear_screen();
 
-    /* Initialize memory */
-    efi_memory_init();
+    /* Initialize memory — reclaim mistyped BS Code/Data regions */
+    ba_mem_init();
 
     /* Allocate 2MB stack for tensor operations */
     #define APP_STACK_PAGES 512  /* 512 * 4KB = 2MB */
@@ -699,6 +834,18 @@ static void __attribute__((used)) app_main(void) {
         efi_print_ascii("  Filesystem: ready\r\n");
     } else {
         efi_print_ascii("  Filesystem: unavailable\r\n");
+    }
+
+    /* Report reclaimed memory */
+    if (ba_mem_pool_regions() > 0) {
+        char num[24];
+        efi_print_ascii("  Memory: reclaimed ");
+        u64_to_str(num, ba_mem_pool_total() / (1024 * 1024));
+        efi_print_ascii(num);
+        efi_print_ascii(" MB from ");
+        u64_to_str(num, ba_mem_pool_regions());
+        efi_print_ascii(num);
+        efi_print_ascii(" BS region(s)\r\n");
     }
 
     /* Load third-party UEFI drivers from \drivers\ */

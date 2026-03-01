@@ -69,6 +69,16 @@ typedef enum {
     EfiMaxMemoryType
 } EFI_MEMORY_TYPE;
 
+/* Memory descriptor (returned by GetMemoryMap) */
+typedef struct {
+    uint32_t Type;
+    uint32_t _pad;
+    uint64_t PhysicalStart;
+    uint64_t VirtualStart;
+    uint64_t NumberOfPages;
+    uint64_t Attribute;
+} EFI_MEMORY_DESCRIPTOR;
+
 /* IPv4 address */
 typedef struct { uint8_t Addr[4]; } EFI_IPv4_ADDRESS;
 
@@ -725,6 +735,8 @@ EFI_STATUS efi_list_dir(const char *path);
 
 /* Log file (tees console output to \bootai.log on USB) */
 void efi_log_flush(void);
+UINTN efi_log_pos(void);
+const char *efi_log_buf(void);
 
 /* Networking */
 EFI_STATUS efi_net_init(void);
@@ -754,8 +766,19 @@ void       tcp4_close(tcp4_conn_t *conn);
 /* HTTP server */
 void ba_http_serve(uint16_t port);
 
-/* Memory — JACLibc malloc wired to UEFI AllocatePool */
-void efi_memory_init(void);
+/* Command execution (used by REPL and management API) */
+int ba_exec_cmd(const char *line);
+
+/* API token from wifi.conf */
+const char *efi_get_api_token(void);
+
+/* Memory — pool manager + reclaimed BS Code/Data regions */
+void     ba_mem_init(void);
+void    *ba_mem_alloc(uint64_t size);
+uint64_t ba_mem_pool_total(void);
+uint64_t ba_mem_pool_used(void);
+uint64_t ba_mem_pool_free(void);
+int      ba_mem_pool_regions(void);
 
 /* Driver loading */
 void efi_load_drivers(void);

@@ -567,22 +567,30 @@ typedef struct {
     uint64_t magic;   /* corruption guard */
 } alloc_header_t;     /* 24 bytes on x86_64 */
 
-#define ALLOC_MAGIC 0xBABECAFE00C0FFEEULL
+#define ALLOC_MAGIC      0xBABECAFE00C0FFEEULL
+#define ALLOC_MAGIC_POOL 0xBABECAFE00DEADULL  /* allocated from reclaimed pool */
 
 void* uefi_malloc(size_t n) {
     if (!gBS || n == 0) return (void *)0;
 
     size_t total = n + sizeof(alloc_header_t) + 16;
     void *raw = (void *)0;
+    int from_pool = 0;
+
     EFI_STATUS status = gBS->AllocatePool(EfiLoaderData, total, &raw);
-    if (status != EFI_SUCCESS || !raw) return (void *)0;
+    if (status != EFI_SUCCESS || !raw) {
+        /* AllocatePool failed — try reclaimed memory pool */
+        raw = ba_mem_alloc(total);
+        if (!raw) return (void *)0;
+        from_pool = 1;
+    }
 
     uintptr_t user = ((uintptr_t)raw + sizeof(alloc_header_t) + 15) & ~(uintptr_t)15;
 
     alloc_header_t *hdr = ((alloc_header_t *)user) - 1;
     hdr->raw = raw;
     hdr->size = n;
-    hdr->magic = ALLOC_MAGIC;
+    hdr->magic = from_pool ? ALLOC_MAGIC_POOL : ALLOC_MAGIC;
 
     return (void *)user;
 }
@@ -604,7 +612,7 @@ void* uefi_realloc(void *ptr, size_t n) {
     if (n == 0) { uefi_free(ptr); return (void *)0; }
 
     alloc_header_t *hdr = ((alloc_header_t *)ptr) - 1;
-    if (hdr->magic != ALLOC_MAGIC) return (void *)0;
+    if (hdr->magic != ALLOC_MAGIC && hdr->magic != ALLOC_MAGIC_POOL) return (void *)0;
 
     size_t old_size = hdr->size;
 
@@ -624,9 +632,15 @@ void uefi_free(void *ptr) {
     if (!ptr || !gBS) return;
 
     alloc_header_t *hdr = ((alloc_header_t *)ptr) - 1;
-    if (hdr->magic != ALLOC_MAGIC) return;
-    hdr->magic = 0;
-    gBS->FreePool(hdr->raw);
+    if (hdr->magic == ALLOC_MAGIC) {
+        hdr->magic = 0;
+        gBS->FreePool(hdr->raw);
+    } else if (hdr->magic == ALLOC_MAGIC_POOL) {
+        /* Bump allocator — can't free individual allocations.
+         * Memory stays allocated until reboot. Fine for model
+         * weights, KV cache, and other long-lived buffers. */
+        hdr->magic = 0;
+    }
 }
 
 /* ================================================================= */

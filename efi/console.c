@@ -19,6 +19,9 @@ void efi_log_flush(void) {
     efi_write_file("bootai.log", log_buf, log_pos);
 }
 
+UINTN efi_log_pos(void) { return log_pos; }
+const char *efi_log_buf(void) { return log_buf; }
+
 /* x86 port I/O for serial debug output */
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
