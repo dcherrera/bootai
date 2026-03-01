@@ -51,19 +51,44 @@ void *stderr = &_stderr_stub;
 /* Freestanding libc: memcpy/memset/memmove/memcmp                   */
 /* GCC may emit calls to these even with -ffreestanding.             */
 /* Must be non-inline so the linker can resolve them.                */
+/* SSE-accelerated: 16 bytes/iteration for the bulk, scalar tail.    */
 /* ================================================================= */
+
+typedef float __v4sf_mem __attribute__((__vector_size__(16)));
 
 void *memcpy(void *dest, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dest;
     const uint8_t *s = (const uint8_t *)src;
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
+
+    /* SSE bulk: 16 bytes at a time (unaligned loads/stores) */
+    size_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        __v4sf_mem v = __builtin_ia32_loadups((const float *)(s + i));
+        __builtin_ia32_storeups((float *)(d + i), v);
+    }
+    /* Scalar tail */
+    for (; i < n; i++) d[i] = s[i];
     return dest;
 }
 
 void *memset(void *dest, int c, size_t n) {
     uint8_t *d = (uint8_t *)dest;
     uint8_t val = (uint8_t)c;
-    for (size_t i = 0; i < n; i++) d[i] = val;
+
+    /* SSE bulk: splat byte to all 16 positions, store 16 at a time */
+    if (n >= 16) {
+        /* Build 4-byte pattern, then splat to 128-bit */
+        uint32_t pat = (uint32_t)val | ((uint32_t)val << 8) |
+                       ((uint32_t)val << 16) | ((uint32_t)val << 24);
+        union { uint32_t u[4]; __v4sf_mem v; } fill;
+        fill.u[0] = fill.u[1] = fill.u[2] = fill.u[3] = pat;
+        size_t i = 0;
+        for (; i + 15 < n; i += 16)
+            __builtin_ia32_storeups((float *)(d + i), fill.v);
+        for (; i < n; i++) d[i] = val;
+    } else {
+        for (size_t i = 0; i < n; i++) d[i] = val;
+    }
     return dest;
 }
 

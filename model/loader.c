@@ -13,6 +13,11 @@
 void *memcpy(void *dest, const void *src, size_t n);
 void *memset(void *dest, int c, size_t n);
 
+/* Math declarations for RoPE cache precomputation */
+float sqrtf(float x);
+float sinf(float x);
+float cosf(float x);
+
 /* .btw file header — 128 bytes */
 typedef struct __attribute__((packed)) {
     char     magic[4];     /* "BTAI" */
@@ -63,6 +68,33 @@ void ba_workspace_init(ba_workspace *ws, ba_model_config *cfg) {
     ws->ffn_out    = (float *)uefi_calloc(c, sizeof(float));
     ws->logits     = (float *)uefi_calloc(vocab, sizeof(float));
     ws->q8_buf     = (int8_t *)uefi_calloc(buf_dim, sizeof(int8_t));
+
+    /* Precompute RoPE sin/cos lookup table — eliminates sinf/cosf per token */
+    int half = cfg->head_dim / 2;
+    int max_seq = cfg->max_seq_len;
+    ws->rope_half_dim = half;
+    ws->rope_max_seq = max_seq;
+    ws->rope_cos = (float *)uefi_malloc((size_t)max_seq * half * sizeof(float));
+    ws->rope_sin = (float *)uefi_malloc((size_t)max_seq * half * sizeof(float));
+
+    if (ws->rope_cos && ws->rope_sin) {
+        /* Compute theta_step = theta^(1/half) via iterated sqrt (same as rope.c) */
+        float theta_step = cfg->rope_theta;
+        for (int p = half; p > 1; p >>= 1)
+            theta_step = sqrtf(theta_step);
+
+        for (int pos = 0; pos < max_seq; pos++) {
+            float inv_freq = 1.0f;
+            float *cos_row = &ws->rope_cos[pos * half];
+            float *sin_row = &ws->rope_sin[pos * half];
+            for (int i = 0; i < half; i++) {
+                float angle = (float)pos * inv_freq;
+                cos_row[i] = cosf(angle);
+                sin_row[i] = sinf(angle);
+                inv_freq /= theta_step;
+            }
+        }
+    }
 }
 
 void ba_workspace_free(ba_workspace *ws) {
@@ -79,6 +111,8 @@ void ba_workspace_free(ba_workspace *ws) {
     uefi_free(ws->ffn_out);
     uefi_free(ws->logits);
     uefi_free(ws->q8_buf);
+    uefi_free(ws->rope_cos);
+    uefi_free(ws->rope_sin);
 }
 
 ba_model* ba_model_load(const char *path) {

@@ -44,3 +44,24 @@ void ba_rope_apply(float *vec, int n_heads, int head_dim, int pos, float theta) 
         }
     }
 }
+
+/* Cached version: table lookups instead of sinf/cosf.
+ * cos_cache/sin_cache are [max_seq * half_dim], precomputed at init. */
+void ba_rope_apply_cached(float *vec, int n_heads, int head_dim, int pos,
+                          const float *cos_cache, const float *sin_cache,
+                          int half_dim) {
+    const float *cos_row = &cos_cache[pos * half_dim];
+    const float *sin_row = &sin_cache[pos * half_dim];
+
+    for (int h = 0; h < n_heads; h++) {
+        float *head = &vec[h * head_dim];
+        for (int i = 0; i < half_dim; i++) {
+            float cos_a = cos_row[i];
+            float sin_a = sin_row[i];
+            float x0 = head[i];
+            float x1 = head[i + half_dim];
+            head[i]            = x0 * cos_a - x1 * sin_a;
+            head[i + half_dim] = x1 * cos_a + x0 * sin_a;
+        }
+    }
+}

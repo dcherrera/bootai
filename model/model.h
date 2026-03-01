@@ -109,6 +109,11 @@ typedef struct {
     float *ffn_out;       /* [n_embd] */
     float *logits;        /* [vocab_size] */
     int8_t *q8_buf;       /* [max(n_embd, ffn_dim)] quantized input buffer */
+    /* RoPE precomputed sin/cos cache — avoids sinf/cosf per token */
+    float *rope_cos;      /* [max_seq_len * half_dim] */
+    float *rope_sin;      /* [max_seq_len * half_dim] */
+    int rope_half_dim;    /* head_dim / 2 */
+    int rope_max_seq;     /* max_seq_len used for cache */
 } ba_workspace;
 
 /* ---- Top-level model struct ---- */
@@ -197,6 +202,9 @@ float* ba_qwen_forward(ba_model *m, int token);
 /* ---- RoPE ---- */
 
 void ba_rope_apply(float *vec, int n_heads, int head_dim, int pos, float theta);
+void ba_rope_apply_cached(float *vec, int n_heads, int head_dim, int pos,
+                          const float *cos_cache, const float *sin_cache,
+                          int half_dim);
 
 /* ---- Tokenizer ---- */
 
