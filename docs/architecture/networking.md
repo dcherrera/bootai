@@ -16,7 +16,7 @@ BootAI has two networking paths, selected automatically based on hardware capabi
                 ┌───────────┴───────────────┐
                 ↓                           ↓
         UEFI TCP4/UDP4/IP4           Custom ns_* Stack
-        (QEMU, wired Ethernet)       (Dell E6510 WiFi)
+        (QEMU with OVMF)            (Dell E6510)
                 ↓                           ↓
         IP4Config2 (DHCP)           ns_tcp.c (TCP state machine)
         ConnectController           ns_udp.c (UDP send/recv)
@@ -24,21 +24,26 @@ BootAI has two networking paths, selected automatically based on hardware capabi
          Ip4Dxe → Tcp4Dxe          ns_arp.c (ARP table/resolve)
                 ↓                   ns_dhcp.c (DHCP client)
                 ↓                   ns_net.c (frame dispatch)
-        EFI_SIMPLE_NETWORK_PROTOCOL (SNP)
-                ↓                           ↓
-        ┌────────────────┬──────────────────┐
-        │ QEMU/wired     │ Dell E6510 WiFi  │
-        │ VirtioNetDxe   │ IWN SNP wrapper  │
-        │ (built into    │ (iwn_snp.c)      │
-        │  firmware)     │      ↓           │
-        │                │ iwn driver       │
-        │                │ (802.11 + CCMP)  │
-        └────────────────┴──────────────────┘
+        EFI_SIMPLE_NETWORK_PROTOCOL           ↓
+                ↓                    ns_net.c driver dispatch
+        ┌────────────────┐     ┌─────────────┴──────────────┐
+        │ QEMU           │     │ e1000e (preferred)  │ IWN  │
+        │ VirtioNetDxe   │     │ e1000e_hw.c         │ iwn_ │
+        │ (built into    │     │ raw Ethernet DMA    │ snp  │
+        │  firmware)     │     │ 82577LM on Dell     │ .c   │
+        └────────────────┘     └─────────────────────┴──────┘
 ```
 
 **QEMU path** (left): UEFI firmware includes full IP stack DXE drivers. `ConnectController` binds MnpDxe → ArpDxe → Ip4Dxe → Tcp4Dxe automatically. Existing code runs unchanged.
 
-**Dell path** (right): Firmware lacks IP stack drivers. Custom `ns_*` stack implements ARP, DHCP, IPv4, UDP, and TCP directly on raw SNP frames. Callers never change — `net.c` dispatches based on which path is available.
+**Dell path** (right): Firmware lacks IP stack drivers. Custom `ns_*` stack implements ARP, DHCP, IPv4, UDP, and TCP directly on raw frames. The ns_* stack dispatches to the underlying driver via a `driver` field in `ns_state`:
+
+| Priority | Driver | Transport | Hardware |
+|----------|--------|-----------|----------|
+| 1 | `NS_DRIVER_E1000E` | Raw Ethernet DMA | Intel 82577LM wired |
+| 2 | `NS_DRIVER_IWN` | 802.11 + CCMP via SNP | Intel 6200 WiFi |
+
+e1000e is preferred over IWN when both are available (wired > WiFi). Callers never change — `net.c` dispatches based on which path is available.
 
 ## DHCP
 
@@ -369,9 +374,15 @@ A complete ARP/DHCP/IPv4/UDP/TCP stack built on raw `EFI_SIMPLE_NETWORK_PROTOCOL
 │            │    ns_ip.c  (~145 lines)    │  IPv4 build/parse/checksum
 │            │    ns_arp.c (~130 lines)    │  ARP table/resolve/reply
 │            │    ns_dhcp.c (~280 lines)   │  DHCP discover/offer/request/ack
-│            │    ns_net.c (~105 lines)    │  Frame dispatch + raw TX
+│            │    ns_net.c (~105 lines)    │  Frame dispatch + driver select
 ├────────────┴─────────────────────────────┤
-│              SNP (iwn_snp.c)             │  Layer 2
+│        Layer 2 driver dispatch           │  ns_state.driver
+│  ┌──────────────────┬──────────────────┐ │
+│  │ NS_DRIVER_E1000E │ NS_DRIVER_IWN    │ │
+│  │ e1000e_hw.c      │ iwn_snp.c        │ │
+│  │ raw Ethernet DMA │ 802.11 + CCMP    │ │
+│  │ (preferred)      │ (WiFi fallback)  │ │
+│  └──────────────────┴──────────────────┘ │
 └──────────────────────────────────────────┘
 ```
 
@@ -421,9 +432,9 @@ The custom path activates when `ns_is_ready()` returns true — which only happe
 
 #### ns_net.c — Core Frame Dispatch
 
-- **`ns_init(snp)`**: Stores SNP pointer, copies MAC from `snp->Mode->CurrentAddress`, ensures SNP is INITIALIZED (calls Start+Initialize if needed)
-- **`ns_raw_send(dst_mac, ethertype, payload, len)`**: Builds 14-byte Ethernet header + payload, calls `snp->Transmit()` with HeaderSize=0, recycles TX buffer via `GetStatus()`
-- **`ns_poll()`**: Calls `snp->Receive()`, dispatches by EtherType:
+- **`ns_init(snp)`**: Auto-detects driver: e1000e preferred over IWN. Sets `g_ns.driver` to `NS_DRIVER_E1000E` or `NS_DRIVER_IWN`. Gets MAC from the detected driver.
+- **`ns_raw_send(dst_mac, ethertype, payload, len)`**: Dispatches to `e1000e_snp_direct_tx()` or `iwn_snp_direct_tx()` based on `g_ns.driver`.
+- **`ns_poll()`**: Dispatches to `e1000e_snp_direct_rx()` or `iwn_snp_direct_rx()` based on `g_ns.driver`. On frame receipt, dispatches by EtherType:
   - `0x0806` → `ns_arp_handle()`
   - `0x0800` → `ns_ip_handle()`
 
@@ -501,16 +512,25 @@ The custom stack activates automatically during `efi_net_init()`:
 
 ```
 efi_net_init()
+  ├── Skip ConnectController if e1000e or IWN is installed
   ├── Try UEFI IP4Config2 (existing code)
-  ├── If found → UEFI path (QEMU, wired Ethernet)
-  └── If not found AND iwn_snp_is_installed()
-      ├── ns_init(iwn_snp_get_protocol())
-      ├── ns_dhcp_run()
-      ├── If DHCP succeeds → net_available = 1
-      └── efi_get_local_ip() reads from ns_state
+  ├── If found → UEFI path (QEMU)
+  └── If not found:
+      ├── Try e1000e first (wired Ethernet preferred)
+      │   ├── e1000e_snp_is_installed()?
+      │   ├── ns_init(NULL)  ← detects e1000e, sets driver=E1000E
+      │   └── ns_dhcp_run()
+      └── Fall back to IWN (WiFi)
+          ├── iwn_snp_get_protocol()?
+          ├── ns_init(snp)   ← detects IWN, sets driver=NS_DRIVER_IWN
+          └── ns_dhcp_run()
 ```
 
-On QEMU (where UEFI IP4Config2 exists), the custom stack is never initialized.
+On Dell with Ethernet cable: e1000e auto-probed before `efi_net_init()`, custom stack uses e1000e driver.
+
+On Dell without cable (or WiFi-only): e1000e probe succeeds but `link_up=0`, so `e1000e_snp_is_installed()` returns false. Falls through to IWN WiFi.
+
+On QEMU (where UEFI IP4Config2 exists): the custom stack is never initialized.
 
 ---
 

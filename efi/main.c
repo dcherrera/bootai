@@ -593,6 +593,19 @@ int ba_exec_cmd(const char *line) {
         return 0;
     }
 
+    /* e1000e poll — live frame capture (interactive — blocked from API) */
+    if (str_eq(line, "e1000e poll")) {
+        if (g_api_context) return -2;
+        e1000e_poll_cmd();
+        return 0;
+    }
+
+    /* e1000e arp — send gratuitous ARP broadcast */
+    if (str_eq(line, "e1000e arp")) {
+        e1000e_arp_cmd();
+        return 0;
+    }
+
     /* e1000e — PCI probe for Intel Ethernet */
     if (str_eq(line, "e1000e")) {
         e1000e_probe();
@@ -760,7 +773,7 @@ static void command_repl(void) {
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
     efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
-    efi_print_ascii("            e1000e, netdiag, meminfo, tensor, exit\r\n");
+    efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, tensor, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -850,6 +863,9 @@ static void __attribute__((used)) app_main(void) {
 
     /* Load third-party UEFI drivers from \drivers\ */
     efi_load_drivers();
+
+    /* Auto-probe wired Ethernet (before network init so DHCP can use it) */
+    e1000e_probe();
 
     /* Initialize networking (wired Ethernet + DHCP) */
     efi_print_ascii("  Initializing network...\r\n");

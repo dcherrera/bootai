@@ -491,24 +491,23 @@ static int parse_wifi_conf(const char *data, UINTN size, wifi_network_entry *ent
 }
 
 void efi_wifi_auto_connect(void) {
-    efi_wifi_init();
-
-    if (!g_wifi2) return; /* No adapter — silently skip */
-
-    /* Read wifi.conf */
+    /* Read wifi.conf first — always parse api_token regardless of WiFi adapter */
     void *buf = 0;
     UINTN size = 0;
     EFI_STATUS status = efi_read_file("\\wifi.conf", &buf, &size);
-    if (status != EFI_SUCCESS || !buf || size == 0) {
-        /* No config file — silently skip */
-        return;
+
+    wifi_network_entry entries[MAX_WIFI_NETWORKS];
+    int n_entries = 0;
+
+    if (status == EFI_SUCCESS && buf && size > 0) {
+        wifi_memset(entries, 0, sizeof(entries));
+        n_entries = parse_wifi_conf((const char *)buf, size, entries, MAX_WIFI_NETWORKS);
+        gBS->FreePool(buf);
     }
 
-    /* Parse config */
-    wifi_network_entry entries[MAX_WIFI_NETWORKS];
-    wifi_memset(entries, 0, sizeof(entries));
-    int n_entries = parse_wifi_conf((const char *)buf, size, entries, MAX_WIFI_NETWORKS);
-    gBS->FreePool(buf);
+    /* Now check for WiFi adapter — api_token is already loaded above */
+    efi_wifi_init();
+    if (!g_wifi2) return; /* No adapter — silently skip WiFi connect */
 
     if (n_entries == 0) {
         efi_print_ascii("  WiFi: no networks configured in wifi.conf\r\n");

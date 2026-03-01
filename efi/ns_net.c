@@ -33,8 +33,14 @@ void ns_init(EFI_SIMPLE_NETWORK_PROTOCOL *snp) {
     ns_memset(&g_ns, 0, sizeof(g_ns));
     g_ns.snp = snp;
 
-    /* Get MAC directly from IWN device (bypasses SNP function pointers) */
-    iwn_snp_get_mac(g_ns.mac);
+    /* Detect driver: e1000e preferred over IWN (wired > WiFi) */
+    if (e1000e_snp_is_installed()) {
+        g_ns.driver = NS_DRIVER_E1000E;
+        e1000e_snp_get_mac(g_ns.mac);
+    } else {
+        g_ns.driver = NS_DRIVER_IWN;
+        iwn_snp_get_mac(g_ns.mac);
+    }
 
     efi_print_ascii("  ns: init MAC ");
     /* Print MAC */
@@ -66,12 +72,10 @@ void ns_get_mac(uint8_t *mac) {
 
 void ns_raw_send(const uint8_t *dst_mac, uint16_t ethertype,
                  const uint8_t *payload, int len) {
-    if (!g_ns.snp) return;
-
-    /* Send directly via IWN (bypasses SNP Transmit function pointer).
-     * iwn_snp_direct_tx() calls iwn_encap_tx() which handles
-     * Ethernet→802.11 encapsulation + LLC/SNAP + CCMP. */
-    iwn_snp_direct_tx(dst_mac, ethertype, payload, len);
+    if (g_ns.driver == NS_DRIVER_E1000E)
+        e1000e_snp_direct_tx(dst_mac, ethertype, payload, len);
+    else if (g_ns.driver == NS_DRIVER_IWN)
+        iwn_snp_direct_tx(dst_mac, ethertype, payload, len);
 }
 
 /* ---- Frame receive + dispatch ---- */
@@ -81,15 +85,17 @@ static int g_ns_rx_count = 0;
 int ns_poll_rx_count(void) { return g_ns_rx_count; }
 
 void ns_poll(void) {
-    if (!g_ns.snp) return;
-
     uint8_t frame[1518];
     int frame_len = 0;
+    int ret;
 
-    /* Receive directly via IWN (bypasses SNP Receive function pointer).
-     * iwn_snp_direct_rx() calls iwn_rx_poll() + iwn_rx_dequeue()
-     * which returns decapsulated Ethernet frames. */
-    int ret = iwn_snp_direct_rx(frame, (int)sizeof(frame), &frame_len);
+    if (g_ns.driver == NS_DRIVER_E1000E)
+        ret = e1000e_snp_direct_rx(frame, (int)sizeof(frame), &frame_len);
+    else if (g_ns.driver == NS_DRIVER_IWN)
+        ret = iwn_snp_direct_rx(frame, (int)sizeof(frame), &frame_len);
+    else
+        return;
+
     if (ret != 0) return;
 
     if (frame_len < 14) return;

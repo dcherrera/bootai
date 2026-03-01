@@ -114,7 +114,11 @@ static int mgmt_auth_check(const char *auth_header, int auth_len) {
     if (!token || !token[0]) return 0;  /* No token configured = locked out */
     if (!auth_header || auth_len < 8) return 0;
     if (mgmt_strncmp(auth_header, "Bearer ", 7) != 0) return 0;
-    return mgmt_streq(auth_header + 7, token);
+    /* auth_header is NOT null-terminated — use length-bounded compare */
+    int token_len = mgmt_strlen(token);
+    int value_len = auth_len - 7;
+    if (value_len != token_len) return 0;
+    return mgmt_strncmp(auth_header + 7, token, token_len) == 0;
 #endif
 }
 

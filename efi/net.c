@@ -208,7 +208,7 @@ EFI_STATUS efi_net_init(void) {
      * On QEMU: binds built-in virtio-net → MnpDxe → IP stack.
      * On Dell E6510: skip entirely — loaded DXE drivers (MnpDxe etc.)
      * hang inside ConnectController. IWN uses custom network stack. */
-    if (!iwn_snp_is_installed() && !efi_drivers_were_loaded()) {
+    if (!iwn_snp_is_installed() && !e1000e_snp_is_installed() && !efi_drivers_were_loaded()) {
         connect_all_controllers();
         connect_all_controllers();
     }
@@ -231,10 +231,22 @@ EFI_STATUS efi_net_init(void) {
         if (status != EFI_SUCCESS) {
             ip4_config2 = 0;
 
-            /* No UEFI IP stack — try custom network stack on IWN SNP */
+            /* No UEFI IP stack — try custom network stack */
+            if (e1000e_snp_is_installed()) {
+                efi_print_ascii("  No UEFI IP stack — using e1000e custom stack\r\n");
+                ns_init(NULL);
+                if (ns_dhcp_run() == 0) {
+                    net_available = 1;
+                    return EFI_SUCCESS;
+                }
+                efi_print_ascii("  Custom DHCP failed\r\n");
+                return EFI_DEVICE_ERROR;
+            }
+
+            /* Try IWN SNP fallback */
             EFI_SIMPLE_NETWORK_PROTOCOL *snp = iwn_snp_get_protocol();
             if (snp) {
-                efi_print_ascii("  No UEFI IP stack — using custom network stack\r\n");
+                efi_print_ascii("  No UEFI IP stack — using IWN custom stack\r\n");
                 ns_init(snp);
                 if (ns_dhcp_run() == 0) {
                     net_available = 1;

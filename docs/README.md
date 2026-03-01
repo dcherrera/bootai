@@ -15,6 +15,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [Inference on Bare Metal](architecture/inference-on-bare-metal.md) — Model conversion, disk image creation, running SmolLM2-135M
 - [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions
 - [WiFi & Driver Loader](architecture/wifi-and-drivers.md) — UEFI driver loading from disk, WiFi scan/connect via WiFi2 protocol, wifi.conf auto-connect
+- [e1000e Ethernet Driver](architecture/e1000e-ethernet-driver.md) — Native Intel 82577LM wired Ethernet driver: PCI probe, DMA descriptor rings, raw TX/RX, ns_* stack integration
 - [IWN WiFi Driver](architecture/iwn-wifi-driver.md) — Native Intel 6200 WiFi driver ported from OpenBSD: PCI probe, MMIO/EEPROM, DMA/firmware, scanning, auth/assoc, WPA2 EAPOL, data TX/RX, SNP integration
 - [Console Logging](architecture/console-logging.md) — Tee all console output to `\bootai.log` on USB for post-session debugging
 - [PROD Build](architecture/prod-build.md) — `PROD=1` flag to skip boot menu and boot straight into chat inference
@@ -50,6 +51,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | Custom stack core | `../efi/ns_net.c`, `ns_arp.c`, `ns_ip.c`, `ns_udp.c`, `ns_dhcp.c`, `ns_tcp.c` |
 | Network diagnostics | `../efi/net_diag.c` |
 | mDNS responder | `../efi/mdns.c` |
+| e1000e driver | `../e1000e/e1000e_hw.c` |
 | WiFi management | `../efi/wifi.c` |
 | Driver loader | `../efi/drivers.c` |
 | HTTP server | `../efi/http_server.c` |

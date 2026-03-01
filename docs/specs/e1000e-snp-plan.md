@@ -10,10 +10,10 @@
 |-------|-------------|-------|------------|-------------|
 | 0 | PCI probe — find Intel 82577LM on bus | `e1000e.h`, `e1000e_regs.h`, `e1000e_hw.c` | ~200 | **DONE** — Dell confirmed |
 | 1 | MMIO + Reset + MAC — PCI IO register access, reset, read MAC | `e1000e_hw.c`, `e1000e_regs.h`, `e1000e.h` | ~80 | **DONE** — Dell confirmed |
-| 2 | RX ring — allocate DMA, set up receive descriptors, receive frames | `e1000e_ring.c` | ~150 | QEMU (ping) |
-| 3 | TX ring — set up transmit descriptors, send frames | `e1000e_ring.c` | ~100 | QEMU (ARP reply) |
-| 4 | SNP + ns_* integration — install SNP, wire into custom stack, DHCP | `e1000e_snp.c`, `ns_net.c` | ~250 | QEMU (curl) |
-| 5 | Dell hardware test — real hardware bring-up and debug | (fixes only) | ~50 | Dell |
+| 2 | Link + RX ring — link detect, DMA RX ring, poll-based frame receive | `e1000e_hw.c`, `e1000e.h`, `main.c` | ~180 | **DONE** — builds clean |
+| 3 | TX ring + ARP — DMA TX ring, transmit, send, gratuitous ARP | `e1000e_hw.c`, `e1000e.h`, `main.c` | ~120 | **DONE** — builds clean |
+| 4 | SNP + ns_* integration — wire into custom stack, DHCP | `e1000e_hw.c`, `ns_net.c`, `net.c`, `main.c` | ~70 | **DONE** — Dell confirmed |
+| 5 | Dell hardware test — real hardware bring-up and debug | (fixes only) | ~50 | **DONE** — Dell confirmed |
 | 6 | REPL commands + polish — `e1000e` status, priority over WiFi | `main.c` | ~50 | Both |
 
 **Total: ~900 lines across 5 new files + minor edits to 3 existing files.**
@@ -238,358 +238,338 @@ e1000e: PCI probe OK
 
 ---
 
-## Phase 2: RX Ring
+## Phase 2: Link Up + RX Ring
 
-**Goal:** Set up receive descriptors and receive raw Ethernet frames.
+**Goal:** Add link detection, DMA-based RX ring, and poll-based frame receive. After this phase, `e1000e` brings up the link and prints speed, and `e1000e poll` receives and displays live Ethernet frames.
 
-### Implementation in `e1000e_ring.c`
+### Design Decisions
 
-**Constants:**
-```c
-#define E1000E_RX_RING_COUNT  64
-#define E1000E_RX_BUF_SIZE    2048
-```
+1. **Single file** — all code in `e1000e_hw.c` (no new `.c` files, no Makefile change).
+2. **Contiguous buffer allocation** — one DMA alloc for 64x2048=128KB buffer pool (32 pages), carved by offset. Plus one alloc for the 64-entry descriptor ring (1 page). Two `AllocatePages` calls total.
+3. **Direct RX** — no software FIFO. The hardware descriptor ring IS the queue. `e1000e_rx_poll()` checks DD bit directly.
+4. **Link failure is non-fatal** — if no cable, print warning, still set up RX ring, return success.
 
-**DMA allocation (following IWN pattern):**
+### Implementation in `e1000e_hw.c` (~180 new lines)
+
+**New structs:**
 ```c
 typedef struct {
     uint64_t paddr;
     void    *vaddr;
     uint32_t size;
-} e1000e_dma;
+} e1000e_dma_info;
 
-static int e1000e_dma_alloc(e1000e_dma *dma, uint32_t size) {
-    UINTN pages = (size + 4095) / 4096;
-    uint64_t addr = 0xFFFFFFFF;  /* below 4GB */
-    EFI_STATUS st = gBS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &addr);
-    if (st != EFI_SUCCESS) return -1;
-    dma->paddr = addr;
-    dma->vaddr = (void *)(uintptr_t)addr;
-    dma->size = (uint32_t)(pages * 4096);
-    /* zero-fill */
-    uint8_t *p = dma->vaddr;
-    for (uint32_t i = 0; i < dma->size; i++) p[i] = 0;
-    return 0;
-}
+#define E1000E_RX_DESC_COUNT  64
+#define E1000E_RX_BUF_SIZE    2048
+
+typedef struct {
+    e1000e_dma_info  desc_dma;   /* descriptor ring: 64 x 16 = 1024 bytes */
+    e1000e_dma_info  buf_dma;    /* buffer pool: 64 x 2048 = 131072 bytes */
+    e1000e_rx_desc  *descs;      /* == desc_dma.vaddr */
+    uint32_t         tail;       /* software tail index */
+} e1000e_rx_ring;
 ```
 
-**RX ring setup:**
-```c
-int e1000e_rx_init(void) {
-    /* Allocate descriptor ring: 64 * 16 = 1024 bytes */
-    e1000e_dma_alloc(&g_dev.rx_ring_dma, E1000E_RX_RING_COUNT * sizeof(e1000e_rx_desc));
+**Extended `e1000e_dev`** with `link_speed` and `rx` ring state.
 
-    /* Allocate 64 frame buffers (2KB each) */
-    for (int i = 0; i < E1000E_RX_RING_COUNT; i++) {
-        e1000e_dma_alloc(&g_dev.rx_buf[i], E1000E_RX_BUF_SIZE);
-        /* Point descriptor at buffer */
-        g_dev.rx_descs[i].buffer_addr = g_dev.rx_buf[i].paddr;
-        g_dev.rx_descs[i].status = 0;
-    }
+**New functions:**
 
-    /* Program registers */
-    e1000e_write(RDBAL, (uint32_t)(g_dev.rx_ring_dma.paddr & 0xFFFFFFFF));
-    e1000e_write(RDBAH, (uint32_t)(g_dev.rx_ring_dma.paddr >> 32));
-    e1000e_write(RDLEN, E1000E_RX_RING_COUNT * sizeof(e1000e_rx_desc));
-    e1000e_write(RDH, 0);
-    e1000e_write(RDT, E1000E_RX_RING_COUNT - 1);
+| Function | Visibility | Lines | Purpose |
+|----------|-----------|-------|---------|
+| `e1000e_dma_alloc()` | static | 15 | AllocatePages below 4GB, zero-fill (IWN pattern) |
+| `e1000e_dma_free()` | static | 8 | FreePages cleanup |
+| `e1000e_link_up()` | static | 30 | Set SLU+ASDE in CTRL, poll STATUS.LU for 5s, print speed/duplex |
+| `e1000e_rx_init()` | static | 40 | Alloc desc ring + buffer pool, fill descs, program RDBAL/RDBAH/RDLEN/RDH/RDT, enable RCTL |
+| `e1000e_rx_poll()` | public | 25 | Check DD bit, copy frame, recycle descriptor, advance RDT |
+| `e1000e_poll_cmd()` | public | 40 | REPL handler: poll loop, print ethertype/length/src-MAC, exit on keypress |
 
-    /* Enable receiver */
-    e1000e_write(RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC);
+**Modified `e1000e_init()`** — calls `e1000e_link_up()` + `e1000e_rx_init()` after MAC print, before "reset OK".
 
-    g_dev.rx_cur = 0;
-    return 0;
-}
+### Changes to Other Files
+
+**`e1000e/e1000e.h`** (+4 lines) — declared `e1000e_rx_poll()` and `e1000e_poll_cmd()`.
+
+**`efi/main.c`** (+6 lines) — added `e1000e poll` command (before existing `e1000e` check, blocked from API), updated help text to `e1000e [poll]`.
+
+### Expected Output
+
+**Dell with cable:**
+```
+> e1000e
+  e1000e: 82577LM [0x10ea] at 0:25.0
+  e1000e: MAC 5c:26:0a:02:83:22
+  e1000e: waiting for link.... UP 1000 Mbps full-duplex
+  e1000e: RX ring ready (64 descs, 2048B bufs)
+  e1000e: reset OK
+  e1000e: PCI probe OK
+> e1000e poll
+  e1000e: polling for frames (press any key to stop)...
+  RX #1: 60 bytes, ethertype=0x0806 (ARP), src=aa:bb:cc:dd:ee:ff
+  RX #2: 342 bytes, ethertype=0x0800 (IPv4), src=aa:bb:cc:dd:ee:ff
+  e1000e: stopped. 2 frames received.
 ```
 
-**Receive (poll-based):**
-```c
-int e1000e_receive(uint8_t *buf, int buf_size, int *frame_len) {
-    e1000e_rx_desc *desc = &g_dev.rx_descs[g_dev.rx_cur];
-
-    if (!(desc->status & E1000_RXD_STAT_DD))
-        return -1;  /* no frame */
-
-    int len = desc->length;
-    if (len > buf_size) len = buf_size;
-
-    /* Copy frame from DMA buffer to caller */
-    uint8_t *src = (uint8_t *)g_dev.rx_buf[g_dev.rx_cur].vaddr;
-    for (int i = 0; i < len; i++) buf[i] = src[i];
-    *frame_len = len;
-
-    /* Recycle descriptor */
-    desc->status = 0;
-    int prev = g_dev.rx_cur;
-    g_dev.rx_cur = (g_dev.rx_cur + 1) % E1000E_RX_RING_COUNT;
-    e1000e_write(RDT, prev);  /* return buffer to HW */
-
-    return 0;
-}
+**Dell without cable:**
 ```
-
-**Link up:**
-```c
-int e1000e_link_up(void) {
-    /* Set Link Up + Auto-Speed Detection */
-    uint32_t ctrl = e1000e_read(CTRL);
-    ctrl |= E1000_CTRL_SLU | E1000_CTRL_ASDE;
-    ctrl &= ~(E1000_CTRL_FRCSPD | E1000_CTRL_FRCDPX);  /* let autoneg work */
-    e1000e_write(CTRL, ctrl);
-
-    /* Poll for link up (5 second timeout) */
-    for (int i = 0; i < 50; i++) {
-        gBS->Stall(100000);  /* 100ms */
-        if (e1000e_read(STATUS) & E1000_STATUS_LU) {
-            /* Print speed */
-            uint32_t status = e1000e_read(STATUS);
-            int speed = (status & E1000_STATUS_SPEED_1000) ? 1000 :
-                        (status & E1000_STATUS_SPEED_100) ? 100 : 10;
-            efi_print_ascii("e1000e: link up at ");
-            /* print speed */
-            efi_print_ascii(" Mbps\r\n");
-            return 0;
-        }
-    }
-    efi_print_ascii("e1000e: link timeout (no cable?)\r\n");
-    return -1;
-}
-```
-
-### Test
-
-**QEMU:** After link up, the QEMU host will send ARP/DHCP traffic. We can verify frames arrive by adding a temporary debug print in `e1000e_receive()` that shows frame length and ethertype.
-
-Add a temporary `e1000e poll` REPL command:
-```c
-/* Poll and print one received frame (debug) */
-uint8_t frame[2048];
-int frame_len;
-if (e1000e_receive(frame, sizeof(frame), &frame_len) == 0) {
-    /* print ethertype, length */
-}
+> e1000e
+  e1000e: 82577LM [0x10ea] at 0:25.0
+  e1000e: MAC 5c:26:0a:02:83:22
+  e1000e: waiting for link.......... NO LINK (no cable?)
+  e1000e: RX ring ready (64 descs, 2048B bufs)
+  e1000e: reset OK
+  e1000e: PCI probe OK
 ```
 
 ### Exit Criteria
 
 - DMA allocation succeeds (no OOM)
-- Link comes up within 5 seconds (QEMU: instant, Dell: 2-5s with cable)
-- Frames received from network (ARP broadcasts from router, etc.)
+- Link comes up within 5 seconds (Dell: 2-5s with cable)
+- `e1000e poll` receives frames from network (ARP broadcasts from router, etc.)
 - No memory leaks (all DMA freed on error paths)
+- Zero new warnings in build
+
+### Results (2026-03-01)
+
+**Status: DONE** (builds clean, awaiting Dell hardware test)
+
+- All code in single file `e1000e_hw.c` — no new files, no Makefile change
+- DMA follows proven IWN pattern: `AllocatePages(AllocateMaxAddress)` below 4GB, byte-by-byte zero-fill
+- Contiguous buffer pool: 1 alloc for 64x2048 buffers (32 pages) + 1 alloc for descriptor ring (1 page)
+- Link detection: SLU+ASDE, polls 50x100ms, prints speed/duplex or "NO LINK"
+- RX ring: RDLEN=1024 (128-byte aligned), RDH=0, RDT=63, RCTL=EN|BAM|SECRC|BSIZE_2K
+- RX poll: checks `(tail+1) % 64`, DD bit, copies frame, recycles descriptor, writes RDT
+- Poll command: non-blocking key check loop, prints ethertype labels (IPv4/ARP/IPv6), src MAC
+- `e1000e poll` blocked from management API (interactive command)
+- Zero new warnings in `make clean && make efi`
+- ~180 lines added to `e1000e_hw.c`, 4 lines to `e1000e.h`, 6 lines to `main.c`
 
 ---
 
-## Phase 3: TX Ring
+## Phase 3: TX Ring + ARP
 
-**Goal:** Set up transmit descriptors and send raw Ethernet frames.
+**Goal:** Add DMA-based TX ring and transmit capability. `e1000e_transmit()` sends raw Ethernet frames, `e1000e_send()` builds Ethernet headers, and `e1000e arp` sends a gratuitous ARP broadcast verifiable on the network.
 
-### Implementation in `e1000e_ring.c`
+### Design Decisions
 
-**TX ring setup:**
+1. **Single file** — continue in `e1000e_hw.c`, no new files, no Makefile change.
+2. **Single TX buffer** — unlike RX (64 contiguous buffers), TX uses one 2048-byte DMA buffer. TX is synchronous (copy frame, kick doorbell, poll DD, return), so only one descriptor is active at a time.
+3. **Descriptor ring still 64 entries** — rotate through them to keep the ring valid. All point to the same buffer; only the active one matters.
+
+### Implementation in `e1000e_hw.c` (~120 new lines)
+
+**New structs:**
 ```c
-#define E1000E_TX_RING_COUNT  64
+#define E1000E_TX_DESC_COUNT  64
 #define E1000E_TX_BUF_SIZE    2048
 
-int e1000e_tx_init(void) {
-    /* Allocate descriptor ring */
-    e1000e_dma_alloc(&g_dev.tx_ring_dma, E1000E_TX_RING_COUNT * sizeof(e1000e_tx_desc));
-
-    /* Allocate shared TX buffer */
-    e1000e_dma_alloc(&g_dev.tx_buf, E1000E_TX_BUF_SIZE);
-
-    /* Program registers */
-    e1000e_write(TDBAL, (uint32_t)(g_dev.tx_ring_dma.paddr & 0xFFFFFFFF));
-    e1000e_write(TDBAH, (uint32_t)(g_dev.tx_ring_dma.paddr >> 32));
-    e1000e_write(TDLEN, E1000E_TX_RING_COUNT * sizeof(e1000e_tx_desc));
-    e1000e_write(TDH, 0);
-    e1000e_write(TDT, 0);
-
-    /* Inter-packet gap: standard value */
-    e1000e_write(TIPG, 0x0060200A);
-
-    /* Enable transmitter */
-    e1000e_write(TCTL, E1000_TCTL_EN | E1000_TCTL_PSP |
-                       (0x10 << 4) |   /* CT = 0x10 */
-                       (0x40 << 12));   /* COLD = 0x40 */
-
-    g_dev.tx_cur = 0;
-    return 0;
-}
+typedef struct {
+    e1000e_dma_info  desc_dma;   /* descriptor ring: 64 x 16 = 1024 bytes */
+    e1000e_dma_info  buf_dma;    /* single TX buffer: 2048 bytes */
+    e1000e_tx_desc  *descs;      /* == desc_dma.vaddr */
+    uint32_t         cur;        /* current descriptor index */
+} e1000e_tx_ring;
 ```
 
-**Transmit:**
-```c
-int e1000e_transmit(const uint8_t *frame, int len) {
-    if (len < 14 || len > E1000E_TX_BUF_SIZE) return -1;
+**Extended `e1000e_dev`** with `e1000e_tx_ring tx` field.
 
-    /* Copy frame to DMA buffer */
-    uint8_t *dst = (uint8_t *)g_dev.tx_buf.vaddr;
-    for (int i = 0; i < len; i++) dst[i] = frame[i];
+**New functions:**
 
-    /* Fill TX descriptor */
-    e1000e_tx_desc *desc = &g_dev.tx_descs[g_dev.tx_cur];
-    desc->buffer_addr = g_dev.tx_buf.paddr;
-    desc->length = (uint16_t)len;
-    desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
-    desc->status = 0;
+| Function | Visibility | Lines | Purpose |
+|----------|-----------|-------|---------|
+| `e1000e_tx_init()` | static | 30 | Alloc desc ring + single buffer, program TDBAL/TDBAH/TDLEN/TDH/TDT, set TIPG, enable TCTL |
+| `e1000e_transmit()` | public | 25 | Copy frame to DMA buf, fill descriptor (EOP+IFCS+RS), kick TDT, poll DD (1ms timeout) |
+| `e1000e_send()` | public | 15 | Build Ethernet header (dst+src MAC, ethertype), copy payload, call transmit |
+| `e1000e_arp_cmd()` | public | 30 | Build+send gratuitous ARP broadcast, print result |
 
-    /* Kick doorbell */
-    int next = (g_dev.tx_cur + 1) % E1000E_TX_RING_COUNT;
-    e1000e_write(TDT, next);
+**Modified `e1000e_init()`** — calls `e1000e_tx_init()` after `e1000e_rx_init()`.
 
-    /* Poll for completion (1ms timeout) */
-    for (int i = 0; i < 100; i++) {
-        if (desc->status & E1000_TXD_STAT_DD) break;
-        gBS->Stall(10);  /* 10us */
-    }
+**TX init details:** TIPG = `0x0060200A` (standard inter-packet gap for copper). TCTL = EN | PSP | CT=0x10 | COLD=0x40 (standard full-duplex). TDH = 0, TDT = 0 (ring starts empty, unlike RX where all descs are available to HW).
 
-    g_dev.tx_cur = next;
-    return 0;
-}
+**Transmit details:** Copy frame to `tx.buf_dma.vaddr`, fill descriptor at `tx.cur`: addr = `tx.buf_dma.paddr`, length = frame len, cmd = EOP|IFCS|RS, status = 0. Write `(cur+1) % 64` to TDT. Poll DD (100 iterations x 10us = 1ms timeout). Advance `tx.cur`. Return 0 on success, -1 on timeout or invalid length.
+
+**Gratuitous ARP:** 28-byte ARP payload (hardware type=1, proto=0x0800, hlen=6, plen=4, opcode=1 request). Sender MAC = our MAC, sender IP = 0.0.0.0 (no DHCP yet). Target MAC = 00:00:00:00:00:00, target IP = 0.0.0.0. Dst Ethernet = FF:FF:FF:FF:FF:FF (broadcast). Ethertype = 0x0806.
+
+### Changes to Other Files
+
+**`e1000e/e1000e.h`** (+4 lines) — declared `e1000e_transmit()`, `e1000e_send()`, `e1000e_arp_cmd()`.
+
+**`efi/main.c`** (+6 lines) — added `e1000e arp` command (before existing `e1000e` check), updated help text to `e1000e [poll|arp]`.
+
+### Expected Output
+
 ```
-
-**Higher-level send (builds Ethernet header):**
-```c
-int e1000e_send(const uint8_t *dst_mac, uint16_t ethertype,
-                const uint8_t *payload, int payload_len) {
-    uint8_t *buf = (uint8_t *)g_dev.tx_buf.vaddr;
-    int total = 14 + payload_len;
-    if (total > E1000E_TX_BUF_SIZE) return -1;
-
-    /* Build Ethernet header */
-    for (int i = 0; i < 6; i++) buf[i] = dst_mac[i];         /* dst */
-    for (int i = 0; i < 6; i++) buf[6 + i] = g_dev.mac[i];   /* src */
-    buf[12] = (uint8_t)(ethertype >> 8);
-    buf[13] = (uint8_t)(ethertype & 0xFF);
-
-    /* Copy payload */
-    for (int i = 0; i < payload_len; i++) buf[14 + i] = payload[i];
-
-    return e1000e_transmit(buf, total);
-}
-```
-
-### Test
-
-**QEMU ARP test:**
-1. Initialize e1000e (Phase 0-2 + Phase 3)
-2. Receive an ARP request from the QEMU host
-3. Build and send an ARP reply
-4. Verify with tcpdump on host: `sudo tcpdump -i bridge0 -n arp`
-
-Or simpler: send a gratuitous ARP broadcast announcing our MAC, verify it appears on the host.
-
-**Temporary REPL command:**
-```
+> e1000e
+  e1000e: 82577LM [0x10ea] at 0:25.0
+  e1000e: MAC 5c:26:0a:02:83:22
+  e1000e: waiting for link.... UP 1000 Mbps full-duplex
+  e1000e: RX ring ready (64 descs, 2048B bufs)
+  e1000e: TX ring ready (64 descs, 2048B buf)
+  e1000e: reset OK
+  e1000e: PCI probe OK
 > e1000e arp
-e1000e: sent gratuitous ARP (00:24:e8:xx:xx:xx → broadcast)
+  e1000e: sending gratuitous ARP...
+  e1000e: ARP sent (28 bytes, src=5c:26:0a:02:83:22)
 ```
+
+Verify on Mac: `sudo tcpdump -i en0 -n arp` should show the gratuitous ARP from Dell's MAC.
 
 ### Exit Criteria
 
 - TX descriptor written and completed (DD set by hardware)
 - Frame appears on the wire (verified via tcpdump or QEMU monitor)
 - No TX timeout or hang
+- `e1000e poll` still works
+- Zero new warnings in build
+
+### Results (2026-03-01)
+
+**Status: DONE** (builds clean, awaiting Dell hardware test)
+
+- All code in single file `e1000e_hw.c` — no new files, no Makefile change
+- TX ring: single 2048-byte DMA buffer shared across 64 descriptors, synchronous send
+- TX init: TDLEN=1024, TDH=0, TDT=0, TIPG=0x0060200A, TCTL=EN|PSP|CT=0x10|COLD=0x40
+- Transmit: copies frame to DMA buf, fills descriptor (EOP+IFCS+RS), kicks TDT, polls DD with 1ms timeout
+- Send: builds 14-byte Ethernet header in DMA buf (dst MAC, src MAC, ethertype big-endian), copies payload, calls transmit
+- Gratuitous ARP: 28-byte ARP request, sender=our MAC, IP=0.0.0.0, broadcast destination
+- `e1000e arp` REPL command added, not blocked from API (non-interactive)
+- Zero new warnings in `make clean && make efi`
+- ~120 lines added to `e1000e_hw.c`, 4 lines to `e1000e.h`, 6 lines to `main.c`
 
 ---
 
 ## Phase 4: SNP + ns_* Stack Integration
 
-**Goal:** Install SNP, wire into the custom network stack, get DHCP, run HTTP server.
+**Goal:** Wire e1000e into the custom network stack so DHCP + HTTP server works on Dell hardware over wired Ethernet.
+
+### Key Design Decision: No Separate SNP File
+
+Unlike IWN, e1000e does **not** need a separate `e1000e_snp.c`:
+
+- IWN's `iwn_snp.c` (422 lines) wraps 802.11 as Ethernet — handles encapsulation, CCMP, TX recycling, WaitForPacket, full SNP function pointer table
+- e1000e is already raw Ethernet. `e1000e_send()` and `e1000e_rx_poll()` directly send/receive Ethernet frames
+- On Dell, SNP function pointers **hang** (PE relocation issue). The ns_* stack bypasses SNP via `direct_tx/rx` functions
+- Only 4 thin wrappers in `e1000e_hw.c` (~15 lines) needed to match the IWN direct API pattern
+
+### Architecture: Driver Dispatch in ns_net.c
+
+Added a `driver` field to `ns_state` with enum constants:
+
+```c
+#define NS_DRIVER_NONE   0
+#define NS_DRIVER_IWN    1
+#define NS_DRIVER_E1000E 2
+```
+
+Priority: **e1000e > IWN** (wired Ethernet preferred over WiFi).
 
 ### Implementation
 
-**`e1000e/e1000e_snp.c`** — SNP protocol wrapper (~250 lines)
-
-Following the exact pattern from `iwn_snp.c`:
-
-1. **SNP mode struct** — MAC, sizes, capabilities
-2. **SNP callbacks** — Start, Initialize, Transmit, Receive, GetStatus, etc.
-3. **Protocol install** — `gBS->InstallProtocolInterface()` for SNP + DevicePath
-4. **WaitForPacket event** — `gBS->CreateEvent(EVT_NOTIFY_WAIT, ...)`
-5. **Direct bypass functions:**
-   ```c
-   void e1000e_snp_get_mac(uint8_t *mac);
-   int  e1000e_snp_direct_tx(const uint8_t *dst_mac, uint16_t ethertype,
-                              const uint8_t *payload, int len);
-   int  e1000e_snp_direct_rx(uint8_t *buf, int buf_size, int *frame_len);
-   int  e1000e_snp_is_installed(void);
-   ```
-
-**`efi/ns_net.c`** — Add e1000e dispatch
-
-Current code calls `iwn_snp_direct_*` directly. Add e1000e as a higher-priority path:
+**`e1000e/e1000e_hw.c`** — 4 thin SNP wrappers (+15 lines):
 
 ```c
-/* In ns_init(): */
-if (e1000e_snp_is_installed()) {
-    e1000e_snp_get_mac(g_ns.mac);
-    g_ns.driver = DRIVER_E1000E;
-} else if (iwn_snp_is_installed()) {
-    iwn_snp_get_mac(g_ns.mac);
-    g_ns.driver = DRIVER_IWN;
+int e1000e_snp_is_installed(void) {
+    return g_e1000e_found && g_e1000e.link_up;
 }
 
-/* In ns_raw_send(): */
-if (g_ns.driver == DRIVER_E1000E)
-    e1000e_snp_direct_tx(dst_mac, ethertype, payload, len);
-else
-    iwn_snp_direct_tx(dst_mac, ethertype, payload, len);
+void e1000e_snp_get_mac(uint8_t *mac) {
+    for (int i = 0; i < 6; i++) mac[i] = g_e1000e.mac[i];
+}
 
-/* In ns_poll(): */
-if (g_ns.driver == DRIVER_E1000E)
-    ret = e1000e_snp_direct_rx(frame, sizeof(frame), &frame_len);
-else
-    ret = iwn_snp_direct_rx(frame, sizeof(frame), &frame_len);
-```
+int e1000e_snp_direct_tx(const uint8_t *dst_mac, uint16_t ethertype,
+                          const uint8_t *payload, int len) {
+    return e1000e_send(dst_mac, ethertype, payload, len);
+}
 
-**`efi/net.c`** — Trigger custom stack for e1000e
-
-The existing `efi_net_init()` tries the UEFI IP4 stack first (works on QEMU), then falls back to the custom ns_* stack. For e1000e, add detection:
-
-```c
-/* In efi_net_init(), after UEFI stack attempt: */
-if (!net_ready && e1000e_snp_is_installed()) {
-    efi_print_ascii("  Using e1000e with custom network stack\r\n");
-    ns_init(NULL);   /* NULL SNP — ns_net uses direct functions */
-    ns_dhcp_start();
-    /* poll until DHCP completes or timeout */
+int e1000e_snp_direct_rx(uint8_t *buf, int buf_size, int *frame_len) {
+    return e1000e_rx_poll(buf, buf_size, frame_len) ? 0 : -1;
 }
 ```
 
-**`efi/main.c`** — Startup integration
+Note: `direct_rx` inverts the return value — `e1000e_rx_poll()` returns 1=got frame/0=nothing, but the ns_* convention is 0=got frame/-1=nothing.
 
-```c
-/* Near existing iwn_probe(): */
-if (e1000e_probe() == 0) {
-    if (e1000e_init() == 0) {
-        efi_print_ascii("  e1000e: ready\r\n");
-    }
-}
+**`efi/ns_net.h`** — Driver enum + field in `ns_state` (+5 lines)
+
+**`efi/ns_net.c`** — Driver dispatch (~25 lines changed):
+
+- `ns_init()`: auto-detect e1000e vs IWN (e1000e preferred)
+- `ns_raw_send()`: dispatch to `e1000e_snp_direct_tx()` or `iwn_snp_direct_tx()`
+- `ns_poll()`: dispatch to `e1000e_snp_direct_rx()` or `iwn_snp_direct_rx()`
+- Removed `if (!g_ns.snp) return;` guards — replaced with driver enum checks
+
+**`efi/net.c`** — e1000e custom stack path (~10 lines changed):
+
+- Added `e1000e_snp_is_installed()` to ConnectController guard (skip on Dell with e1000e)
+- Added e1000e custom stack path before IWN fallback in `efi_net_init()`
+
+**`efi/main.c`** — Auto-probe e1000e at startup (~3 lines):
+
+- `e1000e_probe()` called before `efi_net_init()` in `app_main()`, after `efi_load_drivers()`
+
+### Startup Flow (Dell with Ethernet)
+
+```
+efi_main() → app_main()
+  → efi_fs_init()
+  → ba_mem_init()
+  → efi_load_drivers()
+  → e1000e_probe()          ← PCI probe + init + link + RX/TX
+  → efi_net_init()
+      → try UEFI IP4 stack  ← fails on Dell (no DXE drivers)
+      → e1000e_snp_is_installed()?  ← YES (found + link up)
+      → ns_init(NULL)       ← detects e1000e, sets driver=E1000E
+      → ns_dhcp_run()       ← DHCP over e1000e
+      → net_available = 1
+  → efi_wifi_auto_connect() ← skipped or secondary
+  → tensor_self_test()
+  → command_repl()
 ```
 
-### Test
+### Files Changed
 
-**QEMU with `-device e1000e`:**
+| File | Change | Lines |
+|------|--------|-------|
+| `e1000e/e1000e_hw.c` | 4 SNP wrapper functions | +15 |
+| `e1000e/e1000e.h` | Declare 4 wrappers | +5 |
+| `efi/efi.h` | Declare e1000e SNP functions | +6 |
+| `efi/ns_net.h` | Driver enum + field in ns_state | +5 |
+| `efi/ns_net.c` | Driver dispatch in init/send/poll | ~25 changed |
+| `efi/net.c` | e1000e custom stack path + guard | ~10 changed |
+| `efi/main.c` | Auto-probe e1000e before net init | ~3 changed |
+| **Total** | | ~70 new/changed lines |
 
-1. Build: `make clean && make efi`
-2. User runs: `make run` (with e1000e device in QEMU flags)
-3. At REPL: `serve 8080`
-4. From Mac: `curl http://localhost:8080/api/health`
+### Results (2026-03-01)
 
-Expected: DHCP assigns IP, HTTP server responds, management API works.
+**Status: DONE — verified on Dell E6510 hardware**
 
-**Note:** May need to remove OVMF's built-in e1000 driver binding. If OVMF claims the device first, our driver won't find it via PCI. Options:
-- Use QEMU `-device e1000e` without OVMF network stack (remove network-enabled OVMF)
-- Or just test on Dell where there's no competing driver
+Dell E6510 boot log:
+```
+e1000e: 82577LM [0x10ea] at 0:25.0
+e1000e: MAC 5c:26:0a:02:83:22
+e1000e: waiting for link UP 10 Mbps full-duplex
+e1000e: RX ring ready (64 descs, 2048B bufs)
+e1000e: TX ring ready (64 descs, 2048B buf)
+e1000e: reset OK
+e1000e: PCI probe OK
+Initializing network...
+No UEFI IP stack — using e1000e custom stack
+ns: init MAC 5C:26:0A:02:83:22
+DHCP: starting...
+DHCP: DISCOVER (250 bytes)
+DHCP: TX done
+DHCP: OFFER 192.168.0.101 from 192.168.0.1
+DHCP: REQUEST
+DHCP: ACK — IP 192.168.0.101 GW 192.168.0.1 Mask 255.255.255.0
+Network: ready
+```
 
-### Exit Criteria
+- e1000e auto-probed at startup, link came up at 10 Mbps full-duplex
+- Custom ns_* stack detected e1000e driver, got MAC, ran DHCP successfully
+- IP 192.168.0.101 assigned, HTTP server (`serve 8080`) functional
+- `curl http://192.168.0.101:8080/api/health` returns JSON (auth required — needs `wifi.conf` token)
+- Zero new warnings in build
+- ~70 lines new/changed across 7 files — no new `.c` files, no Makefile changes
 
-- DHCP completes successfully over e1000e
-- `serve 8080` serves HTTP responses
-- `curl http://localhost:8080/api/health` returns valid JSON
-- `curl -X POST http://localhost:8080/api/cmd -d '{"cmd":"ls"}'` executes and returns output
-- `curl http://localhost:8080/api/log` returns log buffer
+**Note:** Link speed shows 10 Mbps (expected 1000 Mbps). The 82577LM may need auto-negotiation time or the cable/switch is limiting. Functionally correct — DHCP and HTTP work fine at 10 Mbps.
 
 ---
 

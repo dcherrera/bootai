@@ -10,10 +10,17 @@
 
 #include "efi.h"
 
+/* ---- Driver selection ---- */
+
+#define NS_DRIVER_NONE   0
+#define NS_DRIVER_IWN    1
+#define NS_DRIVER_E1000E 2
+
 /* ---- Network state ---- */
 
 typedef struct {
     EFI_SIMPLE_NETWORK_PROTOCOL *snp;
+    int     driver;           /* NS_DRIVER_* */
     uint8_t mac[6];           /* Our MAC */
     uint8_t ip[4];            /* Our IP (from DHCP) */
     uint8_t gateway[4];       /* Gateway IP */

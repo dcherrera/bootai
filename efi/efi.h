@@ -823,6 +823,13 @@ int  iwn_snp_direct_rx(uint8_t *buf, int buf_size, int *frame_len);
 /* Debug: dump HW state (tx_ok, HW RX ring index, sw buffer) */
 void iwn_snp_debug_state(void);
 
+/* e1000e direct data path (same pattern as IWN) */
+int  e1000e_snp_is_installed(void);
+void e1000e_snp_get_mac(uint8_t *mac);
+int  e1000e_snp_direct_tx(const uint8_t *dst_mac, uint16_t ethertype,
+                           const uint8_t *payload, int len);
+int  e1000e_snp_direct_rx(uint8_t *buf, int buf_size, int *frame_len);
+
 /* Debug: RX frame type diagnostics (enable/disable + print summary) */
 void iwn_rx_set_debug(int on);
 void iwn_rx_print_debug(void);

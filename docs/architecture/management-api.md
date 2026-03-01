@@ -1,23 +1,39 @@
 # Remote Management API
 
-BootAI includes a remote management API for debugging over Ethernet. Instead of the manual flash-boot-read-log cycle (~5 min/round), you can execute REPL commands and stream logs in real time from your Mac.
+BootAI includes a remote management API for remote command execution and debugging over Ethernet. Instead of the manual flash-boot-read-log cycle (~5 min/round), you can execute REPL commands and stream logs in real time from your Mac.
+
+**Status:** Verified working on Dell E6510 over e1000e wired Ethernet (2026-03-01).
 
 ## Quick Start
 
-```bash
-# Build with debug mode (no auth required)
-make clean && make DEBUG_REMOTE=1 efi
+### Production (with auth)
 
-# Flash USB, boot Dell, enter REPL, start server:
+```bash
+# 1. Build
+make clean && make efi
+
+# 2. Create wifi.conf on USB root with your token:
+#    api_token=bootai
+
+# 3. Flash USB, boot Dell, enter REPL, start server:
 > serve 8080
 
-# From Mac:
-curl http://<dell-ip>:8080/api/health
-curl -X POST http://<dell-ip>:8080/api/cmd -d '{"cmd":"iwn scan"}'
-curl http://<dell-ip>:8080/api/log
+# 4. From Mac:
+curl -H "Authorization: Bearer bootai" http://192.168.0.101:8080/api/health
+curl -H "Authorization: Bearer bootai" -d '{"cmd":"meminfo"}' http://192.168.0.101:8080/api/cmd
+curl -H "Authorization: Bearer bootai" http://192.168.0.101:8080/api/log
 ```
 
-In QEMU (port-forwarded):
+### Debug (no auth)
+
+```bash
+make clean && make DEBUG_REMOTE=1 efi
+
+# No Authorization header needed:
+curl http://<dell-ip>:8080/api/health
+```
+
+### QEMU (port-forwarded)
 
 ```bash
 curl http://localhost:8080/api/health
@@ -240,6 +256,24 @@ POST /api/cmd {"cmd":"iwn scan"}
 **Shared response buffer** — `mgmt_api.c` uses a single 32KB static buffer (`cmd_output_buf`) for building JSON responses. This is safe because the HTTP server is single-threaded.
 
 **Two-layer auth** — Debug mode (`DEBUG_REMOTE=1`) is a compile-time flag that removes all auth code. This avoids accidentally shipping an open API, while making local debugging frictionless.
+
+## Dell E6510 Verification (2026-03-01)
+
+Tested over e1000e wired Ethernet (Intel 82577LM) with production auth:
+
+```
+$ curl -s -H "Authorization: Bearer bootai" http://192.168.0.101:8080/api/health
+{"status":"ok","wifi":"none","network":"ready","ip":"192.168.0.101","log_pos":2124}
+
+$ curl -s -H "Authorization: Bearer bootai" -d '{"cmd":"meminfo"}' http://192.168.0.101:8080/api/cmd
+{"ok":true,"output":"\r\n  Installed RAM:  8157 MB\r\n  ..."}
+```
+
+### Bugs Fixed During Bring-Up
+
+1. **api_token not loaded on e1000e-only systems** — `parse_wifi_conf()` was only called from `efi_wifi_auto_connect()`, which early-returned if no UEFI WiFi2 adapter was found (`!g_wifi2`). On Dell E6510 (no WiFi2 protocol — IWN is a custom driver), the token was never parsed. Fix: read and parse `wifi.conf` before the WiFi adapter check, so `api_token` is always loaded.
+
+2. **Bearer token comparison failed on non-null-terminated header** — `mgmt_auth_check()` used `mgmt_streq()` (null-terminated compare) on the `auth_header` pointer, which points into the raw HTTP buffer and is NOT null-terminated (bounded by `auth_header_len`). The header value `"bootai\r\n..."` never matched `"bootai\0"`. Fix: switched to length-bounded `mgmt_strncmp()` with exact length check.
 
 ## Limitations
 
