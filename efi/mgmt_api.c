@@ -363,6 +363,38 @@ static void mgmt_api_health(http_request *req, http_response *resp) {
                          cmd_output_buf, ji);
 }
 
+/* ---- CRC32 for firmware verification ---- */
+
+static uint32_t mgmt_crc32_table[256];
+static int mgmt_crc32_ready = 0;
+
+static void mgmt_crc32_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c >> 1) ^ ((c & 1) ? 0xEDB88320u : 0);
+        mgmt_crc32_table[i] = c;
+    }
+    mgmt_crc32_ready = 1;
+}
+
+static uint32_t mgmt_crc32_update(uint32_t crc, const void *data, int len) {
+    if (!mgmt_crc32_ready) mgmt_crc32_init();
+    const uint8_t *p = (const uint8_t *)data;
+    for (int i = 0; i < len; i++)
+        crc = (crc >> 8) ^ mgmt_crc32_table[(crc ^ p[i]) & 0xFF];
+    return crc;
+}
+
+static void mgmt_hex32(uint32_t val, char *out) {
+    const char *hex = "0123456789abcdef";
+    for (int i = 7; i >= 0; i--) {
+        out[i] = hex[val & 0xF];
+        val >>= 4;
+    }
+    out[8] = '\0';
+}
+
 /* ---- POST /api/update — streaming firmware update ---- */
 
 #define UPDATE_CHUNK_SIZE 4096
@@ -432,9 +464,11 @@ void mgmt_handle_update(tcp4_conn_t *client, const char *auth_header,
 
     /* 7. Write body bytes already in request buffer */
     int total_written = 0;
+    uint32_t crc = 0xFFFFFFFF;
     if (body_bytes_read > 0) {
         UINTN ws = (UINTN)body_bytes_read;
         file->Write(file, &ws, (void *)body_start);
+        crc = mgmt_crc32_update(crc, body_start, body_bytes_read);
         total_written += body_bytes_read;
     }
 
@@ -447,6 +481,7 @@ void mgmt_handle_update(tcp4_conn_t *client, const char *auth_header,
         if (got <= 0) break;
         UINTN ws = (UINTN)got;
         file->Write(file, &ws, chunk);
+        crc = mgmt_crc32_update(crc, chunk, (int)got);
         total_written += (int)got;
     }
 
@@ -465,13 +500,47 @@ void mgmt_handle_update(tcp4_conn_t *client, const char *auth_header,
     }
     efi_print_ascii(" bytes)\r\n");
 
-    /* 11. Send response */
+    /* 11. Finalize CRC32 */
+    crc ^= 0xFFFFFFFF;
+    char crc_hex[9];
+    mgmt_hex32(crc, crc_hex);
+
+    /* 12. Send response */
     if (total_written == content_length) {
-        const char *r = "HTTP/1.0 200 OK\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: 38\r\n\r\n"
-                        "{\"ok\":true,\"message\":\"firmware updated\"}";
-        tcp4_send(client, r, (UINTN)mgmt_strlen(r));
+        /* Build: {"ok":true,"message":"firmware updated","crc32":"ABCDEF01","size":N} */
+        int ji = 0;
+        const char *s = "{\"ok\":true,\"message\":\"firmware updated\",\"crc32\":\"";
+        while (*s) cmd_output_buf[ji++] = *s++;
+        for (int k = 0; k < 8; k++) cmd_output_buf[ji++] = crc_hex[k];
+        s = "\",\"size\":";
+        while (*s) cmd_output_buf[ji++] = *s++;
+        /* Append size as int */
+        {
+            char num[12]; int ni = 0; int v = total_written;
+            if (v == 0) { num[ni++] = '0'; }
+            else { char t[12]; int ti = 0; while (v > 0) { t[ti++] = '0' + v % 10; v /= 10; } while (ti > 0) num[ni++] = t[--ti]; }
+            for (int k = 0; k < ni; k++) cmd_output_buf[ji++] = num[k];
+        }
+        cmd_output_buf[ji++] = '}';
+        cmd_output_buf[ji] = '\0';
+
+        /* Send with computed Content-Length */
+        char hdr[256];
+        int hi = 0;
+        s = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+        while (*s) hdr[hi++] = *s++;
+        {
+            char num[12]; int ni = 0; int v = ji;
+            if (v == 0) { num[ni++] = '0'; }
+            else { char t[12]; int ti = 0; while (v > 0) { t[ti++] = '0' + v % 10; v /= 10; } while (ti > 0) num[ni++] = t[--ti]; }
+            for (int k = 0; k < ni; k++) hdr[hi++] = num[k];
+        }
+        hdr[hi++] = '\r'; hdr[hi++] = '\n';
+        hdr[hi++] = '\r'; hdr[hi++] = '\n';
+        hdr[hi] = '\0';
+
+        tcp4_send(client, hdr, (UINTN)hi);
+        tcp4_send(client, cmd_output_buf, (UINTN)ji);
     } else {
         const char *r = "HTTP/1.0 500 Internal Server Error\r\n"
                         "Content-Type: application/json\r\n"

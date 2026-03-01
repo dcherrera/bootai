@@ -108,9 +108,10 @@ static void tcp_send_segment(ns_tcp_conn *conn, uint8_t flags,
     /* Data offset (header length / 4) + flags */
     seg[12] = (uint8_t)((hdr_len / 4) << 4);
     seg[13] = flags;
-    /* Window size: 8192 */
-    seg[14] = (uint8_t)(NS_TCP_RX_BUF_SIZE >> 8);
-    seg[15] = (uint8_t)(NS_TCP_RX_BUF_SIZE);
+    /* Window size: advertise actual free space (flow control) */
+    uint16_t window = (uint16_t)(NS_TCP_RX_BUF_SIZE - conn->rx_len);
+    seg[14] = (uint8_t)(window >> 8);
+    seg[15] = (uint8_t)(window);
     /* Checksum: filled below */
     /* Urgent pointer: 0 */
 
@@ -359,8 +360,9 @@ void ns_tcp_handle(const uint8_t *ip_payload, int len,
                     tcp_memcpy(c->rx_buf + c->rx_len, data, copy);
                     c->rx_len += copy;
                 }
-                c->ack = seq + (uint32_t)data_len;
-                /* Send ACK */
+                /* Only ACK bytes actually stored — sender retransmits the rest */
+                c->ack = seq + (uint32_t)copy;
+                /* Send ACK (window field signals free space for flow control) */
                 tcp_send_segment(c, TCP_ACK, (void *)0, 0);
             }
             if (flags & TCP_FIN) {

@@ -21,6 +21,11 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [PROD Build](architecture/prod-build.md) — `PROD=1` flag to skip boot menu and boot straight into chat inference
 - [Management API](architecture/management-api.md) — Remote debugging over Ethernet: execute commands, stream logs, health check (`/api/cmd`, `/api/log`, `/api/health`)
 - [Memory Diagnostics](architecture/memory-diagnostics.md) — `meminfo` REPL command: UEFI memory map breakdown by type (loader, firmware, free)
+- [HD Install](architecture/hd-install.md) — Install to hard drive: GPT partitioning, FAT32 ESP, raw data partition with BTAI TOC for unlimited model sizes, boot path model loading via Block IO
+
+## Guides
+
+- [Connecting to BootAI](guides/connecting-to-bootai.md) — Connect from OpenCode, curl, Python, Open WebUI, or any OpenAI-compatible tool over Ethernet
 
 ## Research
 
@@ -57,5 +62,6 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 | HTTP server | `../efi/http_server.c` |
 | API handlers | `../efi/api.c` |
 | Management API | `../efi/mgmt_api.c` |
+| HD installer | `../efi/install.c` |
 | Entry point | `../efi/main.c` |
 | Project guidelines | `../CLAUDE.md` |

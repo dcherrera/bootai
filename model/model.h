@@ -154,6 +154,9 @@ typedef struct {
 /* Load model from .btw file */
 ba_model* ba_model_load(const char *path);
 
+/* Load model from pre-allocated buffer (takes ownership of data) */
+ba_model* ba_model_load_buffer(void *data, uint64_t size);
+
 /* Get model architecture */
 ba_model_arch ba_model_arch_of(const ba_model *m);
 

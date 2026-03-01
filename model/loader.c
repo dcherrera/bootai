@@ -115,24 +115,8 @@ void ba_workspace_free(ba_workspace *ws) {
     uefi_free(ws->rope_sin);
 }
 
-ba_model* ba_model_load(const char *path) {
-    /* Initialize filesystem if needed */
-    if (efi_fs_init() != EFI_SUCCESS) {
-        efi_print_ascii("  ERROR: filesystem init failed\r\n");
-        return 0;
-    }
-
-    /* Read entire file */
-    void *data = 0;
-    UINTN file_size = 0;
-    EFI_STATUS status = efi_read_file(path, &data, &file_size);
-    if (status != EFI_SUCCESS || !data) {
-        efi_print_ascii("  ERROR: cannot read weight file\r\n");
-        return 0;
-    }
-
-    /* Validate header */
-    UINTN file_pages = (file_size + 4095) / 4096;
+ba_model* ba_model_load_buffer(void *data, uint64_t file_size) {
+    UINTN file_pages = ((UINTN)file_size + 4095) / 4096;
 
     if (file_size < sizeof(btw_header)) {
         efi_print_ascii("  ERROR: file too small for header\r\n");
@@ -249,7 +233,7 @@ ba_model* ba_model_load(const char *path) {
     m->ln_out_w = (float *)advance(&cursor, c * sizeof(float));
 
     /* LM head: [vocab * c] f16 — may or may not be present */
-    size_t remaining = file_size - (size_t)(cursor - (uint8_t *)data);
+    size_t remaining = (size_t)file_size - (size_t)(cursor - (uint8_t *)data);
     size_t lm_head_size = (size_t)vocab * c * sizeof(uint16_t);
     if (remaining >= lm_head_size) {
         m->lm_head = (uint16_t *)advance(&cursor, lm_head_size);
@@ -273,6 +257,25 @@ ba_model* ba_model_load(const char *path) {
     m->position = 0;
 
     return m;
+}
+
+ba_model* ba_model_load(const char *path) {
+    /* Initialize filesystem if needed */
+    if (efi_fs_init() != EFI_SUCCESS) {
+        efi_print_ascii("  ERROR: filesystem init failed\r\n");
+        return 0;
+    }
+
+    /* Read entire file */
+    void *data = 0;
+    UINTN file_size = 0;
+    EFI_STATUS status = efi_read_file(path, &data, &file_size);
+    if (status != EFI_SUCCESS || !data) {
+        efi_print_ascii("  ERROR: cannot read weight file\r\n");
+        return 0;
+    }
+
+    return ba_model_load_buffer(data, file_size);
 }
 
 ba_model_arch ba_model_arch_of(const ba_model *m) {

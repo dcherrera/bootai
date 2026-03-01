@@ -41,7 +41,7 @@ typedef struct {
 
 /* ---- TCP connection ---- */
 
-#define NS_TCP_RX_BUF_SIZE 8192
+#define NS_TCP_RX_BUF_SIZE 65536
 
 struct ns_tcp_conn {
     uint8_t  remote_ip[4];

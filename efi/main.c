@@ -25,6 +25,11 @@ EFI_GUID gEfiSimpleFileSystemProtocolGuid = {
     {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
 };
 
+EFI_GUID gEfiBlockIoProtocolGuid = {
+    0x964e5b21, 0x6459, 0x11d2,
+    {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
+};
+
 EFI_GUID gEfiGraphicsOutputProtocolGuid = {
     0x9042a9de, 0x23dc, 0x4a38,
     {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}
@@ -190,8 +195,19 @@ static int ensure_model_loaded(void) {
     }
 
     if (!g_model) {
-        efi_print_ascii("  Loading model from " MODEL_PATH "...\r\n");
-        g_model = ba_model_load(MODEL_PATH);
+        /* Try raw data partition first (HD install stores model there) */
+        void *raw_data = 0;
+        UINTN raw_size = 0;
+        if (ba_raw_read_entry("model.btw", &raw_data, &raw_size) == EFI_SUCCESS) {
+            g_model = ba_model_load_buffer(raw_data, raw_size);
+        }
+
+        /* Fall back to filesystem (USB boot has model as file) */
+        if (!g_model) {
+            efi_print_ascii("  Loading model from " MODEL_PATH "...\r\n");
+            g_model = ba_model_load(MODEL_PATH);
+        }
+
         if (!g_model) {
             efi_print_ascii("  ERROR: failed to load model\r\n");
             return 0;
@@ -935,10 +951,9 @@ static void __attribute__((used)) app_main(void) {
             command_repl();
             break;
         case '2':
-            efi_print_ascii("\r\n  Install not yet implemented.\r\n");
+            ba_install_to_hd();
             efi_print_ascii("  Press any key to return to menu...\r\n");
             efi_wait_key();
-            /* Drain the key */
             efi_read_key(&key);
             break;
         case '3':

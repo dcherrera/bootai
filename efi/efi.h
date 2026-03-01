@@ -51,6 +51,8 @@ typedef struct {
 #define EFI_DEVICE_ERROR         EFI_ERROR(7)
 #define EFI_NOT_FOUND            EFI_ERROR(14)
 #define EFI_NO_MAPPING           EFI_ERROR(17)
+#define EFI_WRITE_PROTECTED      EFI_ERROR(8)
+#define EFI_VOLUME_FULL          EFI_ERROR(11)
 #define EFI_TIMEOUT              EFI_ERROR(18)
 #define EFI_CONNECTION_FIN       EFI_ERROR(104)
 #define EFI_CONNECTION_RESET     EFI_ERROR(105)
@@ -314,6 +316,34 @@ struct EFI_PCI_IO_PROTOCOL {
     void *RomImage;
 };
 
+/* ---- Block IO Protocol ---- */
+
+typedef struct {
+    uint32_t MediaId;
+    BOOLEAN  RemovableMedia;
+    BOOLEAN  MediaPresent;
+    BOOLEAN  LogicalPartition;
+    BOOLEAN  ReadOnly;
+    BOOLEAN  WriteCaching;
+    uint8_t  _pad[3];
+    uint32_t BlockSize;
+    uint32_t IoAlign;
+    uint64_t LastBlock;
+} EFI_BLOCK_IO_MEDIA;
+
+typedef struct EFI_BLOCK_IO_PROTOCOL {
+    uint64_t Revision;
+    EFI_BLOCK_IO_MEDIA *Media;
+    EFI_STATUS (EFIAPI *Reset)(struct EFI_BLOCK_IO_PROTOCOL *This, BOOLEAN ExtendedVerification);
+    EFI_STATUS (EFIAPI *ReadBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This,
+                                     uint32_t MediaId, uint64_t LBA,
+                                     UINTN BufferSize, void *Buffer);
+    EFI_STATUS (EFIAPI *WriteBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This,
+                                      uint32_t MediaId, uint64_t LBA,
+                                      UINTN BufferSize, void *Buffer);
+    EFI_STATUS (EFIAPI *FlushBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This);
+} EFI_BLOCK_IO_PROTOCOL;
+
 /* IP4Config2 data types */
 #define IP4_CONFIG2_DATA_TYPE_INTERFACEINFO 0
 #define IP4_CONFIG2_DATA_TYPE_POLICY        1
@@ -486,7 +516,7 @@ struct EFI_BOOT_SERVICES {
 
     /* Driver support */
     EFI_STATUS (EFIAPI *ConnectController)(EFI_HANDLE ControllerHandle, EFI_HANDLE *DriverImageHandle, void *RemainingDevicePath, BOOLEAN Recursive);
-    void *DisconnectController;
+    EFI_STATUS (EFIAPI *DisconnectController)(EFI_HANDLE ControllerHandle, EFI_HANDLE DriverImageHandle, EFI_HANDLE ChildHandle);
 
     /* Open/Close Protocol */
     void *OpenProtocol;
@@ -723,6 +753,7 @@ extern EFI_GUID gEfiWiFi2ProtocolGuid;
 extern EFI_GUID gEfiSupplicantProtocolGuid;
 extern EFI_GUID gEfiPciIoProtocolGuid;
 extern EFI_GUID gEfiSimpleNetworkProtocolGuid;
+extern EFI_GUID gEfiBlockIoProtocolGuid;
 extern EFI_GUID gEfiDevicePathProtocolGuid;
 
 /* Global system table + image handle — set in efi_main */
@@ -861,6 +892,12 @@ extern EFI_GUID gEfiMnpServiceBindingGuid;
 extern EFI_GUID gEfiArpServiceBindingGuid;
 extern EFI_GUID gEfiIp4ServiceBindingGuid;
 extern EFI_GUID gEfiDhcp4ServiceBindingGuid;
+
+/* Install to hard drive */
+void ba_install_to_hd(void);
+
+/* Read entry from raw data partition (for HD boot model loading) */
+EFI_STATUS ba_raw_read_entry(const char *name, void **buffer, UINTN *size);
 
 /* Reboot */
 void efi_reboot(void);
