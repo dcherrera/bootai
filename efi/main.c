@@ -719,6 +719,13 @@ static void __attribute__((used)) app_main(void) {
     /* Run tensor self-test at boot */
     tensor_self_test();
 
+#ifdef PROD
+    /* PROD mode: skip menu, boot straight into chat */
+    ensure_model_loaded();
+    command_chat();
+    efi_print_ascii("Goodbye.\r\n");
+    for (;;) __asm__ volatile("hlt");
+#else
     /* Main loop: boot menu → action → back to menu */
     for (;;) {
         show_boot_menu();
@@ -759,4 +766,5 @@ static void __attribute__((used)) app_main(void) {
 
         efi_clear_screen();
     }
+#endif
 }

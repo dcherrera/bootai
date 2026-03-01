@@ -81,6 +81,7 @@ int iwn_cmd(iwn_dev *dev, uint8_t code, const void *payload, uint32_t len);
 void iwn5000_post_alive(iwn_dev *dev);
 void iwn_replay_calibration(iwn_dev *dev);
 int iwn_hw_init(iwn_dev *dev);
+int iwn_fw_restart(iwn_dev *dev);
 
 /* ---- Command wait (iwn_scan.c, shared with iwn_assoc.c) ---- */
 
@@ -98,6 +99,11 @@ int iwn_connect(iwn_dev *dev, const char *ssid);
 /* ---- EAPOL (iwn_eapol.c) ---- */
 
 int iwn_eapol_handshake(iwn_dev *dev);
+
+/* ---- CCMP software decrypt (iwn_ccmp.c) ---- */
+
+void ccmp_self_test(void);
+int iwn_ccmp_decrypt(uint8_t *frame, int frame_len, const uint8_t *key);
 
 /* ---- Data TX/RX (iwn_data.c) ---- */
 

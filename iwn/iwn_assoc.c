@@ -179,7 +179,9 @@ static int iwn_auth(iwn_dev *dev) {
     }
     if (iwn_wait_cmd(dev, IWN_CMD_ADD_NODE, "ADD_NODE", 200) != 0)
         return -1;
-    efi_print_ascii("  ADD_NODE ok\r\n");
+    efi_print_ascii("  ADD_NODE ok (resp=0x");
+    print_hex8(dev->last_cmd_status);
+    efi_print_ascii(")\r\n");
 
     /* 4. LINK_QUALITY (broadcast, CCK 1 Mbps) */
     {
@@ -442,7 +444,14 @@ static int iwn_run(iwn_dev *dev) {
     rxon.flags = htole32(IWN_RXON_TSF | IWN_RXON_CTS_TO_SELF |
                          IWN_RXON_AUTO | IWN_RXON_24GHZ |
                          IWN_RXON_SHPREAMBLE | IWN_RXON_SHSLOT);
-    rxon.filter = htole32(IWN_FILTER_MULTICAST | IWN_FILTER_BSS);
+    /* NODECRYPT: firmware delivers raw encrypted frames. Software CCMP
+     * decryption in iwn_ccmp_decrypt() handles RX decrypt — the Intel 6000
+     * firmware's HW decrypt is broken (SEC_ENC_ERR on every frame, confirmed
+     * across 19 test rounds). EAPOL frames (Protected=0) pass through
+     * unaffected. TX encryption still works via firmware (CCMP security
+     * field in TX descriptor). */
+    rxon.filter = htole32(IWN_FILTER_MULTICAST | IWN_FILTER_BSS |
+                          IWN_FILTER_NODECRYPT);
     rxon.associd = htole16(dev->assoc_id | 0xC000);
 
     uint8_t chains = dev->rxchainmask;
@@ -477,7 +486,9 @@ static int iwn_run(iwn_dev *dev) {
     }
     if (iwn_wait_cmd(dev, IWN_CMD_ADD_NODE, "ADD_NODE(AP)", 200) != 0)
         return -1;
-    efi_print_ascii("  ADD_NODE(AP) ok\r\n");
+    efi_print_ascii("  ADD_NODE(AP) ok (resp=0x");
+    print_hex8(dev->last_cmd_status);
+    efi_print_ascii(")\r\n");
 
     /* 3. LINK_QUALITY for AP — full descending rate table */
     {
@@ -538,9 +549,10 @@ static int iwn_run(iwn_dev *dev) {
     }
 
     /* Note: broadcast node (id=15) was already added during iwn_auth()
-     * and survives RXON(assoc). Do NOT re-add it here — a duplicate
-     * ADD_NODE without IWN_NODE_UPDATE hangs the firmware. The node
-     * persists and GTK can be installed via UPDATE in iwn_install_keys(). */
+     * and survives RXON(assoc). Confirmed in rounds 9 and 13: a fresh
+     * ADD_NODE on existing node 15 hangs the Intel 6000 firmware permanently
+     * (INT=0x00000000). The node persists and GTK is installed via UPDATE
+     * in iwn_install_keys(). */
 
     dev->state = IWN_STATE_RUN;
     return 0;
@@ -610,10 +622,22 @@ int iwn_connect(iwn_dev *dev, const char *ssid) {
 
     /* Run the connection state machine with auto-retry.
      * Auth/assoc can fail intermittently due to RF contention
-     * or the AP not responding in time. Retry up to 3 times. */
+     * or the AP not responding in time. Retry up to 3 times.
+     * If firmware dies (INT=0x00000000), restart it before retrying. */
     int connected = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) {
+            /* Check if firmware is dead (INT=0 after a failed command
+             * means firmware stopped generating interrupts entirely).
+             * This happens after AP deauth during EAPOL (Round 17). */
+            uint32_t intr = iwn_read(dev, IWN_INT);
+            if (intr == 0x00000000 && dev->fw_loaded) {
+                efi_print_ascii("  Firmware unresponsive (INT=0x00000000)\r\n");
+                if (iwn_fw_restart(dev) != 0) {
+                    efi_print_ascii("  Firmware restart failed\r\n");
+                    return -1;
+                }
+            }
             efi_print_ascii("  Retry ");
             print_dec((uint32_t)attempt);
             efi_print_ascii("/3...\r\n");
@@ -648,6 +672,10 @@ int iwn_connect(iwn_dev *dev, const char *ssid) {
         }
         if (iwn_eapol_handshake(dev) != 0)
             return -1;
+
+        /* Note: RXON_ASSOC (round 15) does NOT re-enable the decrypt engine
+         * after NODECRYPT was set. Full RXON after key install hangs firmware
+         * (round 14). So we now run WITHOUT NODECRYPT from the start. */
     }
 
     /* Phase 5: Install SNP + start DHCP */

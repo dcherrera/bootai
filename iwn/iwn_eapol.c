@@ -456,8 +456,13 @@ static int parse_gtk_kde(const uint8_t *key_data, uint16_t key_data_len,
 static int iwn_install_keys(iwn_dev *dev, const uint8_t *tk,
                              const uint8_t *gtk, uint8_t gtk_kid,
                              const uint8_t *gtk_rsc) {
-    /* 1. Install pairwise key (TK) on AP node (id=0) */
-    efi_print_ascii("  Installing pairwise key...\r\n");
+    /* Install PTK into firmware for TX encryption (firmware CCMP encrypt
+     * works fine). Skip GTK install — HW RX decrypt is broken on Intel
+     * 6000 (SEC_ENC_ERR, confirmed rounds 8-19). RX group decrypt is
+     * handled in software by iwn_ccmp_decrypt() with NODECRYPT. */
+
+    /* 1. Install pairwise key (TK) on AP node for TX encryption */
+    efi_print_ascii("  Installing PTK for TX encrypt...\r\n");
     {
         struct iwn_node_info node;
         iwn_memset(&node, 0, sizeof(node));
@@ -465,76 +470,34 @@ static int iwn_install_keys(iwn_dev *dev, const uint8_t *tk,
         node.control = IWN_NODE_UPDATE;
         node.flags = IWN_FLAG_SET_KEY;
         iwn_memcpy(node.macaddr, dev->target_bssid, 6);
-        node.kflags = htole16(IWN_KFLAG_CCMP | IWN_KFLAG_MAP | IWN_KFLAG_KID(0));
+        node.kflags = htole16(IWN_KFLAG_CCMP | IWN_KFLAG_MAP |
+                              IWN_KFLAG_KID(0));
         iwn_memcpy(node.key, tk, 16);
-
-        /* Debug: print kflags and first 4 key bytes */
-        {
-            uint16_t kf = IWN_KFLAG_CCMP | IWN_KFLAG_MAP | IWN_KFLAG_KID(0);
-            efi_print_ascii("    kflags=0x");
-            print_hex8((uint8_t)(kf >> 8));
-            print_hex8((uint8_t)(kf));
-            efi_print_ascii(" key[0:4]=");
-            print_hex8(tk[0]); print_hex8(tk[1]);
-            print_hex8(tk[2]); print_hex8(tk[3]);
-            efi_print_ascii("\r\n");
-        }
         node.tsc = 0;
 
+        efi_print_ascii("    TK[0:4]=");
+        print_hex8(tk[0]); print_hex8(tk[1]);
+        print_hex8(tk[2]); print_hex8(tk[3]);
+        efi_print_ascii("\r\n");
+
         if (iwn_cmd(dev, IWN_CMD_ADD_NODE, &node, sizeof(node)) != 0) {
-            efi_print_ascii("  EAPOL: pairwise key install failed\r\n");
+            efi_print_ascii("  EAPOL: PTK install failed\r\n");
             return -1;
         }
         if (iwn_wait_cmd(dev, IWN_CMD_ADD_NODE,
-                         "ADD_NODE(pairwise)", 200) != 0)
+                         "ADD_NODE(PTK)", 200) != 0)
             return -1;
     }
 
-    /* 2. Install group key (GTK) on broadcast node (id=15) */
-    efi_print_ascii("  Installing group key...\r\n");
-    {
-        struct iwn_node_info node;
-        iwn_memset(&node, 0, sizeof(node));
-        node.id = IWN5000_ID_BROADCAST;
-        node.control = IWN_NODE_UPDATE;
-        node.flags = IWN_FLAG_SET_KEY;
-        iwn_memset(node.macaddr, 0xff, 6);
-        node.kflags = htole16(IWN_KFLAG_CCMP |
-                              IWN_KFLAG_KID(gtk_kid) |
-                              IWN_KFLAG_GROUP);
+    /* 2. GTK saved for software RX decrypt (no HW install) */
+    efi_print_ascii("  GTK saved for software decrypt: [0:4]=");
+    print_hex8(gtk[0]); print_hex8(gtk[1]);
+    print_hex8(gtk[2]); print_hex8(gtk[3]);
+    efi_print_ascii(" kid=");
+    print_dec((uint32_t)gtk_kid);
+    efi_print_ascii("\r\n");
 
-        /* Debug: print kflags and kid */
-        {
-            uint16_t kf = IWN_KFLAG_CCMP |
-                          IWN_KFLAG_KID(gtk_kid) | IWN_KFLAG_GROUP;
-            efi_print_ascii("    kflags=0x");
-            print_hex8((uint8_t)(kf >> 8));
-            print_hex8((uint8_t)(kf));
-            efi_print_ascii(" kid=");
-            print_dec((uint32_t)gtk_kid);
-            efi_print_ascii(" key[0:4]=");
-            print_hex8(gtk[0]); print_hex8(gtk[1]);
-            print_hex8(gtk[2]); print_hex8(gtk[3]);
-            efi_print_ascii("\r\n");
-        }
-        iwn_memcpy(node.key, gtk, 16);
-
-        /* Set RSC (replay counter) from M3 if provided */
-        if (gtk_rsc) {
-            uint64_t rsc = 0;
-            for (int i = 0; i < 8; i++)
-                rsc |= (uint64_t)gtk_rsc[i] << (i * 8);
-            node.tsc = rsc;
-        }
-
-        if (iwn_cmd(dev, IWN_CMD_ADD_NODE, &node, sizeof(node)) != 0) {
-            efi_print_ascii("  EAPOL: group key install failed\r\n");
-            return -1;
-        }
-        if (iwn_wait_cmd(dev, IWN_CMD_ADD_NODE,
-                         "ADD_NODE(group)", 200) != 0)
-            return -1;
-    }
+    (void)gtk_rsc;
 
     return 0;
 }
@@ -787,12 +750,72 @@ int iwn_eapol_handshake(iwn_dev *dev) {
                 efi_print_ascii("  EAPOL: M4 TX failed\r\n");
                 return -1;
             }
-            efi_print_ascii("  M4 sent\r\n");
 
-            /* Wait for M4 to actually transmit before installing keys.
-             * Without this delay, the AP may not have received M4 yet
-             * and will deauth us when we start sending encrypted data. */
-            gBS->Stall(200000);  /* 200 ms */
+            /* Wait for TX_DONE to confirm M4 was actually transmitted.
+             * The blind 200ms delay was insufficient — Round 18 showed
+             * the AP retransmitting M3, meaning M4 never arrived.
+             * Poll for TX_DONE notification and print firmware TX status
+             * (ACK count, retries) to diagnose whether M4 was transmitted
+             * and acknowledged at the 802.11 level. */
+            {
+                struct iwn_rx_status *rxstat =
+                    (struct iwn_rx_status *)dev->rxq.stat.vaddr;
+                int tx_done = 0;
+
+                for (int t = 0; t < 1000 && !tx_done; t++) {
+                    uint32_t hw_idx = rxstat->closed_count & 0x0fff;
+
+                    while ((uint32_t)dev->rxq.cur != hw_idx) {
+                        void *rxbuf =
+                            dev->rxq.buf[dev->rxq.cur].vaddr;
+                        struct iwn_rx_desc *rxd =
+                            (struct iwn_rx_desc *)rxbuf;
+
+                        if (rxd->type == IWN_TX_DONE) {
+                            struct iwn5000_tx_stat *txs =
+                                (struct iwn5000_tx_stat *)
+                                ((uint8_t *)rxbuf +
+                                 sizeof(struct iwn_rx_desc));
+
+                            uint32_t st = txs->stat.status & 0xff;
+                            efi_print_ascii("  M4 TX_DONE: status=0x");
+                            print_hex8((uint8_t)st);
+                            efi_print_ascii(" ack_fail=");
+                            print_dec((uint32_t)txs->ackfailcnt);
+                            efi_print_ascii(" rts_fail=");
+                            print_dec((uint32_t)txs->rtsfailcnt);
+                            efi_print_ascii("\r\n");
+
+                            if (st != 0x01 && st != 0x00) {
+                                efi_print_ascii(
+                                    "  WARNING: M4 TX may have"
+                                    " failed!\r\n");
+                            }
+                            tx_done = 1;
+                        }
+
+                        dev->rxq.cur = (dev->rxq.cur + 1) %
+                                       IWN_RX_RING_COUNT;
+                        iwn_write(dev, IWN_FH_RX_WPTR,
+                            ((dev->rxq.cur + IWN_RX_RING_COUNT - 1)
+                             % IWN_RX_RING_COUNT) & ~7);
+
+                        if (tx_done) break;
+                    }
+
+                    if (!tx_done)
+                        gBS->Stall(1000);  /* 1 ms */
+                }
+
+                if (!tx_done) {
+                    efi_print_ascii(
+                        "  WARNING: M4 TX_DONE not received"
+                        " (1s timeout)\r\n");
+                    /* Continue anyway — M4 may have been sent */
+                    gBS->Stall(200000);  /* 200 ms fallback */
+                }
+            }
+            efi_print_ascii("  M4 sent\r\n");
         }
 
         /* ──────────────────────────────────────────────────────────────

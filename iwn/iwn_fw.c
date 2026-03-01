@@ -846,11 +846,9 @@ int iwn_hw_init(iwn_dev *dev) {
 
     dev->fw_loaded = 1;
 
-    /* Free firmware raw buffer — no longer needed */
-    if (dev->fw_rawbuf) {
-        gBS->FreePool(dev->fw_rawbuf);
-        dev->fw_rawbuf = 0;
-    }
+    /* Keep fw_rawbuf alive — firmware section pointers (fw.main_text etc.)
+     * point into this buffer. If we need to restart firmware after a crash
+     * (iwn_fw_restart), we need these pointers to still be valid. */
 
     /* Free DMA scratch buffer */
     if (dev->fw_dma.vaddr) {
@@ -867,4 +865,147 @@ fail:
         dev->fw_rawbuf = 0;
     }
     return -1;
+}
+
+/* ---- Firmware restart (recover from firmware death) ---- */
+/*
+ * After certain events (AP deauth during EAPOL, firmware hang), the Intel
+ * 6000 firmware stops generating interrupts (INT=0x00000000) and becomes
+ * unresponsive. This function power-cycles the NIC and reloads the runtime
+ * firmware, reusing existing DMA buffers and saved calibration results.
+ *
+ * Equivalent to iwn_hw_init() steps 11-18 (power cycle + runtime load).
+ * Does NOT re-run init firmware or calibration -- replays saved results.
+ *
+ * Requires: fw_rawbuf still allocated (firmware section pointers valid),
+ *           calibration results saved from initial iwn_hw_init().
+ */
+
+int iwn_fw_restart(iwn_dev *dev) {
+    efi_print_ascii("  iwn: restarting firmware...\r\n");
+
+    /* Firmware lost all state -- reset our tracking */
+    dev->fw_loaded = 0;
+    dev->state = 0;
+    dev->keys_installed = 0;
+    dev->assoc_id = 0;
+
+    /* 1. Power cycle */
+    iwn_apm_stop(dev);
+    gBS->Stall(10000);  /* 10 ms settle */
+
+    if (iwn_apm_init(dev) != 0) {
+        efi_print_ascii("  iwn: APM re-init failed (restart)\r\n");
+        return -1;
+    }
+    iwn5000_nic_config(dev);
+
+    /* 2. Stop DMA and reset ring pointers (reuse existing DMA buffers) */
+    iwn_stop_fh_dma(dev);
+    iwn_reset_rx_ring(dev);
+    iwn_reset_tx_ring(dev, 4);
+    iwn_reset_tx_ring(dev, 0);
+
+    /* 3. Re-program ring addresses in hardware */
+    iwn_program_rings(dev);
+
+    /* 4. Clear interrupts */
+    iwn_write(dev, IWN_INT_MASK, 0);
+    iwn_write(dev, IWN_INT, 0xffffffff);
+    iwn_write(dev, IWN_FH_INT, 0xffffffff);
+
+    /* 5. Verify firmware sections are still available */
+    if (!dev->fw.main_text || !dev->fw.main_data) {
+        efi_print_ascii("  iwn: firmware sections unavailable (fw_rawbuf freed?)\r\n");
+        return -1;
+    }
+
+    /* 6. Load RUNTIME firmware (init already ran, calibration saved) */
+    if (iwn5000_load_firmware(dev,
+            dev->fw.main_text, dev->fw.main_text_len,
+            dev->fw.main_data, dev->fw.main_data_len) != 0) {
+        efi_print_ascii("  iwn: runtime firmware load failed (restart)\r\n");
+        return -1;
+    }
+
+    /* 7. Wait for UC_READY */
+    if (iwn_poll_rx(dev, IWN_UC_READY, 5000) != 0) {
+        uint32_t intr = iwn_read(dev, IWN_INT);
+        efi_print_ascii("  iwn: UC_READY timeout (restart, INT=0x");
+        print_hex8((uint8_t)(intr >> 24));
+        print_hex8((uint8_t)(intr >> 16));
+        print_hex8((uint8_t)(intr >> 8));
+        print_hex8((uint8_t)intr);
+        efi_print_ascii(")\r\n");
+        return -1;
+    }
+    efi_print_ascii("  Runtime firmware alive (restart)!\r\n");
+
+    /* 8. Post-alive scheduler setup (same as iwn_hw_init steps 17-18) */
+    iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
+    iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
+    iwn_write(dev, IWN_UCODE_GP1_CLR, IWN_UCODE_GP1_RFKILL);
+
+    if (iwn_nic_lock(dev) == 0) {
+        uint32_t sched_base = iwn_prph_read(dev, IWN_SCHED_SRAM_ADDR);
+
+        iwn_mem_set_region_4(dev, sched_base + IWN5000_SCHED_CTX_OFF, 0,
+                             IWN5000_SCHED_CTX_LEN / 4);
+        iwn_prph_write(dev, IWN5000_SCHED_DRAM_ADDR,
+                       (uint32_t)(dev->sched.paddr >> 10));
+        iwn_prph_write(dev, IWN5000_SCHED_CHAINEXT_EN, 0);
+        iwn_setbits(dev, IWN_FH_TX_CHICKEN, IWN_FH_TX_CHICKEN_SCHED_RETRY);
+        iwn_prph_write(dev, IWN5000_SCHED_QCHAIN_SEL, 0xfffef);
+        iwn_prph_write(dev, IWN5000_SCHED_AGGR_SEL, 0);
+
+        for (int qid = 0; qid < IWN5000_NTXQUEUES; qid++) {
+            iwn_prph_write(dev, IWN5000_SCHED_QUEUE_RDPTR(qid), 0);
+            iwn_write(dev, IWN_HBUS_TARG_WRPTR, (qid << 8) | 0);
+            iwn_mem_write(dev, sched_base + IWN5000_SCHED_QUEUE_OFFSET(qid), 0);
+            iwn_mem_write(dev, sched_base + IWN5000_SCHED_QUEUE_OFFSET(qid) + 4,
+                          (IWN_SCHED_LIMIT << 16) | IWN_SCHED_WINSZ);
+        }
+
+        iwn_prph_write(dev, IWN5000_SCHED_INTR_MASK, 0xfffff);
+        iwn_prph_write(dev, IWN5000_SCHED_TXFACT, 0xff);
+
+        static const uint8_t qid2fifo[] = { 3, 2, 1, 0, 7, 5, 6 };
+        for (int qid = 0; qid < 7; qid++) {
+            iwn_prph_write(dev, IWN5000_SCHED_QUEUE_STATUS(qid),
+                           IWN5000_TXQ_STATUS_ACTIVE | qid2fifo[qid]);
+        }
+
+        iwn_nic_unlock(dev);
+    }
+
+    gBS->Stall(2000);  /* 2 ms settle */
+
+    /* 9. WiMAX coex + crystal calib + replay saved calibration */
+    {
+        struct iwn5000_wimax_coex wimax;
+        iwn_memset(&wimax, 0, sizeof(wimax));
+        iwn_cmd(dev, IWN5000_CMD_WIMAX_COEX, &wimax, sizeof(wimax));
+    }
+    {
+        struct iwn5000_phy_calib_crystal crystal;
+        iwn_memset(&crystal, 0, sizeof(crystal));
+        crystal.code = IWN5000_PHY_CALIB_CRYSTAL;
+        crystal.ngroups = 1;
+        crystal.isvalid = 1;
+        crystal.cap_pin[0] = (uint8_t)(dev->eeprom_crystal & 0xff);
+        crystal.cap_pin[1] = (uint8_t)((dev->eeprom_crystal >> 16) & 0xff);
+        iwn_cmd(dev, IWN_CMD_PHY_CALIB, &crystal, sizeof(crystal));
+    }
+
+    iwn_replay_calibration(dev);
+
+    /* Free DMA scratch buffer (will be re-allocated if needed) */
+    if (dev->fw_dma.vaddr) {
+        gBS->FreePages(dev->fw_dma.paddr, dev->fw_dma.size / 4096);
+        dev->fw_dma.vaddr = 0;
+    }
+
+    dev->fw_loaded = 1;
+    efi_print_ascii("  Firmware restart complete\r\n");
+    return 0;
 }

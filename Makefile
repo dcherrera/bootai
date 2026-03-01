@@ -11,6 +11,10 @@ CFLAGS = -O3 -ftree-vectorize -msse4.2 \
          -Wall -Wextra -std=c11 \
          -I .
 
+ifdef PROD
+CFLAGS += -DPROD
+endif
+
 # Shim headers: declaration-only libc for bare-metal foundry (no __builtin_* wrappers)
 SHIM_CFLAGS = -I shim
 
@@ -50,7 +54,7 @@ OVMF_CODE ?= ovmf-code.fd
 OVMF_VARS ?= ovmf-vars.fd
 
 # Targets
-.PHONY: phase1 phase3 phase4 efi run clean usb img test-iwn-crypto
+.PHONY: phase1 phase3 phase4 efi run run-prod clean usb img release test-iwn-crypto
 
 # Model files (source paths)
 MODEL_BTW ?= ../models/base/SmolLM2-135M-Instruct/model.btw
@@ -121,10 +125,57 @@ img: bootai-p4.efi
 	mcopy -i bootai.img $(MODEL_BTV) ::rwkvos/vocab.btv
 	@echo "bootai.img ready ($$(ls -lh bootai.img | awk '{print $$5}'))"
 
+# GPT release image — flashable with balenaEtcher or dd
+# Creates a proper GPT disk with an EFI System Partition (ESP)
+# Requires: brew install gptfdisk
+release:
+	$(MAKE) clean
+	$(MAKE) PROD=1 efi
+	@echo "Creating GPT release image..."
+	@fat_bytes=$$(( $$(stat -f%z $(MODEL_BTW)) + $$(stat -f%z $(MODEL_BTV)) + 52428800 )); \
+	fat_mb=$$(( (fat_bytes + 1048575) / 1048576 )); \
+	fat_sectors=$$(( fat_mb * 2048 )); \
+	total_sectors=$$(( fat_sectors + 2048 + 34 )); \
+	dd if=/dev/zero of=bootai-release.img bs=512 count=$$total_sectors 2>/dev/null; \
+	sgdisk --clear \
+	       --new=1:2048:$$((2048 + fat_sectors - 1)) \
+	       --typecode=1:EF00 \
+	       --change-name=1:BOOTAI \
+	       bootai-release.img; \
+	esp_offset=$$(( 2048 * 512 )); \
+	mformat -i bootai-release.img@@$$esp_offset -F -v BOOTAI ::; \
+	mmd -i bootai-release.img@@$$esp_offset ::EFI ::EFI/BOOT ::rwkvos ::workspace ::drivers; \
+	mcopy -i bootai-release.img@@$$esp_offset all_bootai.efi ::EFI/BOOT/BOOTX64.EFI; \
+	mcopy -i bootai-release.img@@$$esp_offset wifi.conf.template ::wifi.conf; \
+	mcopy -i bootai-release.img@@$$esp_offset $(MODEL_BTW) ::rwkvos/model.btw; \
+	mcopy -i bootai-release.img@@$$esp_offset $(MODEL_BTV) ::rwkvos/vocab.btv; \
+	echo "bootai-release.img ready ($$(ls -lh bootai-release.img | awk '{print $$5}'))"
+
 # Run in QEMU (phase 4)
 # Uses bootai.img (FAT32 disk image built with mtools)
 run: bootai-p4.efi
 	mcopy -o -i bootai.img bootai-p4.efi ::EFI/BOOT/BOOTX64.EFI
+	mkdir -p esp
+	cp $(OVMF_VARS) esp/ovmf-vars-session.fd
+	qemu-system-x86_64 \
+		-accel tcg,thread=multi,tb-size=2048 \
+		-cpu max \
+		-smp 2 \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=esp/ovmf-vars-session.fd \
+		-drive file=bootai.img,format=raw,if=virtio \
+		-m 8G \
+		-display none \
+		-serial stdio \
+		-netdev user,id=net0,hostfwd=tcp::8080-:8080 \
+		-device virtio-net-pci,netdev=net0 \
+		-device virtio-rng-pci
+
+# Run PROD build in QEMU (boots straight into chat, no menu)
+run-prod:
+	$(MAKE) clean
+	$(MAKE) PROD=1 efi
+	mcopy -o -i bootai.img all_bootai.efi ::EFI/BOOT/BOOTX64.EFI
 	mkdir -p esp
 	cp $(OVMF_VARS) esp/ovmf-vars-session.fd
 	qemu-system-x86_64 \
@@ -192,5 +243,5 @@ test-iwn-crypto: iwn/iwn_crypto.c iwn/test_crypto.c
 
 clean:
 	rm -f $(ALL_OBJ) $(PHASE1_OBJ) $(PHASE3_OBJ) $(PHASE4_OBJ) \
-	      bootai.elf bootai.so bootai.efi bootai-p4.efi
+	      bootai.elf bootai.so bootai.efi bootai-p4.efi bootai-release.img
 	rm -rf esp/

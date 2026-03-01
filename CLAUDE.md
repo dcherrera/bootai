@@ -2,6 +2,22 @@
 
 UEFI application that boots directly into AI inference with tool use. No kernel, no OS — runs entirely in UEFI boot services mode.
 
+## Relationship to Echad
+
+BootAI is the **static core** of the Echad distributed cluster system (`../Echad/`). It is not a standalone product — it is the foundation every Echad node runs on. The cluster features (Raft consensus, distributed storage, state store) are built on top of BootAI.
+
+BootAI's code compiles for multiple targets via a platform HAL:
+
+| Target | HAL | Binary | Boot |
+|--------|-----|--------|------|
+| Tier 1 (UEFI node) | `efi/` | `all_bootai.efi` | UEFI direct |
+| GPU node | `linux/` (to be built) | `echad-daemon` | Minimal Linux kernel (EFISTUB) |
+| Tier 2 (Desktop) | `app/` (to be built) | Desktop app | User's OS |
+
+Platform-independent code (`model/`, `tokenizer/`, `tools/`, `foundry/`) compiles for all targets. Platform-specific code (`efi/`, `linux/`, `app/`) implements the same HAL interface with different backends.
+
+See `../Echad/Echad.md` for the full architecture.
+
 ## Project Structure
 
 ```
@@ -57,13 +73,22 @@ bootai/
 ## Build Commands
 
 ```bash
-make efi              # Build all_bootai.efi (full build)
+make efi              # Build all_bootai.efi (full build — boots into menu)
+make PROD=1 efi       # Build production EFI (boots straight into chat)
+make release          # Build PROD + GPT disk image (flashable with balenaEtcher/dd)
 make run              # Run in QEMU with OVMF (interactive — do NOT run from Claude)
+make run-prod         # Clean build PROD + run in QEMU (straight to chat — do NOT run from Claude)
 make clean            # Clean build artifacts
 
 # Model export
 python3 tools/export_weights.py --model Qwen/Qwen2.5-Coder-7B-Instruct --quant q4_k_m --output model.bin
 ```
+
+### Build Flags
+
+| Flag | What | When |
+|------|------|------|
+| `PROD=1` | Skip boot menu and REPL, boot straight into chat inference | Production/demo builds |
 
 ## Flashing USB
 

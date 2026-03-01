@@ -4,8 +4,9 @@
  * Phase 4d: Ethernet-to-802.11 encapsulation (TX) and 802.11-to-Ethernet
  * decapsulation (RX), plus a software receive buffer for Phase 5 (SNP).
  *
- * The firmware handles CCMP encrypt/decrypt after keys are installed
- * (Phase 4c). We just set the security field in the TX descriptor.
+ * TX: firmware handles CCMP encryption (security field in TX descriptor).
+ * RX: software CCMP decryption via iwn_ccmp_decrypt() — the Intel 6000
+ * firmware's HW decrypt is broken (SEC_ENC_ERR on every frame).
  *
  * Reference: OpenBSD sys/dev/pci/if_iwn.c (ISC license)
  */
@@ -246,6 +247,8 @@ int iwn_encap_tx(iwn_dev *dev, const uint8_t *dst_mac,
  * ===================================================================== */
 
 int iwn_rx_poll(iwn_dev *dev) {
+    ccmp_self_test();
+
     struct iwn_rx_status *stat = (struct iwn_rx_status *)dev->rxq.stat.vaddr;
     uint32_t hw_idx = stat->closed_count & 0x0fff;
     int queued = 0;
@@ -286,14 +289,53 @@ int iwn_rx_poll(iwn_dev *dev) {
 
                 /* Data frame: type=2, subtype=0 (data) or 8 (QoS data) */
                 if (type == 2 && (subtype == 0 || subtype == 8)) {
-                    /* Debug: dump data frame bytes at offset 24-39 */
+                    /* Read MPDU tail flags (uint32_t after frame data).
+                     * Contains decrypt status bits:
+                     *   IWN_RX_DECRYPT_OK (0x1800) = decrypt succeeded
+                     *   IWN_RX_MPDU_DEC   (0x0800) = decrypt attempted
+                     *   IWN_RX_CIPHER_CCMP(0x0200) = CCMP cipher detected
+                     *   IWN_RX_NOERROR    (0x0003) = no CRC/overflow error */
+                    uint32_t tail_flags = 0;
+                    if (flen + 4 <= IWN_RBUF_SIZE - 64) {
+                        uint32_t *tail = (uint32_t *)(frame + flen);
+                        tail_flags = letoh32(*tail);
+                    }
+
+                    /* Debug: dump data frame info + tail flags */
                     if (iwn_rx_dbg_on) {
                         iwn_rx_dbg_data++;
-                        efi_print_ascii("  RX DATA: fc=");
+                        /* Classify: unicast (Addr1=our MAC) or broadcast */
+                        int is_uc = 1;
+                        if (flen >= 10) {
+                            if (frame[4] == 0xff && frame[5] == 0xff)
+                                is_uc = 0;  /* broadcast */
+                            else {
+                                /* Compare Addr1 (bytes 4-9) with our MAC */
+                                for (int m = 0; m < 6; m++) {
+                                    if (frame[4 + m] != dev->mac_addr[m]) {
+                                        is_uc = 0;  /* not for us */
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        efi_print_ascii(is_uc ? "  RX UC: " : "  RX BC: ");
+                        efi_print_ascii("fc=");
                         print_hex8(frame[0]);
                         print_hex8(frame[1]);
                         efi_print_ascii(" len=");
                         print_dec(flen);
+                        efi_print_ascii(" fl=0x");
+                        print_hex8((uint8_t)(tail_flags >> 24));
+                        print_hex8((uint8_t)(tail_flags >> 16));
+                        print_hex8((uint8_t)(tail_flags >> 8));
+                        print_hex8((uint8_t)tail_flags);
+                        if ((tail_flags & IWN_RX_DECRYPT_MASK) == IWN_RX_DECRYPT_OK)
+                            efi_print_ascii(" DEC_OK");
+                        else if (tail_flags & IWN_RX_MPDU_DEC)
+                            efi_print_ascii(" DEC_FAIL");
+                        else
+                            efi_print_ascii(" NO_DEC");
                         efi_print_ascii(" [");
                         int dend = 40;
                         if (dend > (int)flen) dend = (int)flen;
@@ -308,13 +350,25 @@ int iwn_rx_poll(iwn_dev *dev) {
                     if (subtype == 8)
                         hdr_len = 26;
 
-                    /* If Protected bit set: firmware decrypted the frame
-                     * but the 8-byte CCMP header (IV + ExtIV) remains
-                     * between the 802.11 header and LLC/SNAP payload.
-                     * Skip it. (Same as OpenBSD iwn_rx_done.) */
+                    /* If Protected bit set: CCMP-encrypted frame.
+                     * With NODECRYPT, firmware delivers raw encrypted
+                     * frames. Decrypt in software using PTK TK (unicast)
+                     * or GTK (broadcast/multicast). */
                     int ccmp_hdr = 0;
                     if (frame[1] & 0x40) {
                         ccmp_hdr = 8;
+                        /* Raw flen passed — iwn_ccmp_decrypt probes
+                         * the correct adjustment (FCS, phantom QoS) */
+                        if (dev->keys_installed) {
+                            const uint8_t *dkey;
+                            if (frame[4] & 0x01)  /* group bit in Addr1 */
+                                dkey = dev->gtk;
+                            else
+                                dkey = dev->ptk + 32;  /* TK = ptk[32:48] */
+                            if (iwn_ccmp_decrypt(frame, (int)flen,
+                                                 dkey) != 0)
+                                goto advance;  /* MIC failure — drop */
+                        }
                         hdr_len += 8;
                     }
 

@@ -95,7 +95,9 @@ int iwn_wait_cmd(iwn_dev *dev, uint8_t cmd_code, const char *cmd_name,
             struct iwn_rx_desc *desc = (struct iwn_rx_desc *)buf;
 
             if (desc->type == cmd_code) {
-                /* Got our command response */
+                /* Got our command response — save status byte */
+                uint8_t *resp_data = (uint8_t *)buf + sizeof(struct iwn_rx_desc);
+                dev->last_cmd_status = resp_data[0];
                 dev->rxq.cur = (dev->rxq.cur + 1) % IWN_RX_RING_COUNT;
                 iwn_write(dev, IWN_FH_RX_WPTR,
                     ((dev->rxq.cur + IWN_RX_RING_COUNT - 1) %

@@ -139,6 +139,7 @@ typedef struct iwn_dev {
     uint8_t  gtk[16];            /* Group Temporal Key */
     uint8_t  gtk_kid;            /* GTK key index (0-3) */
     uint8_t  keys_installed;     /* 1 after PTK+GTK installed */
+    uint8_t  last_cmd_status;   /* First byte of last command response */
 
     /* Phase 4d: Data frame RX buffer */
 #define IWN_RX_BUF_COUNT  16
