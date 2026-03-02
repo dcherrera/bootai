@@ -74,8 +74,8 @@ static uint32_t tcp_isn = 0x10000;
 
 /* ---- Build and send a TCP segment ---- */
 
-static void tcp_send_segment(ns_tcp_conn *conn, uint8_t flags,
-                             const uint8_t *data, int data_len) {
+static int tcp_send_segment(ns_tcp_conn *conn, uint8_t flags,
+                            const uint8_t *data, int data_len) {
     ns_state *ns = ns_get_state();
 
     /* TCP header: 20 bytes (no options), or 24 with MSS in SYN+ACK */
@@ -85,7 +85,7 @@ static void tcp_send_segment(ns_tcp_conn *conn, uint8_t flags,
 
     uint8_t seg[1480];
     int seg_len = hdr_len + data_len;
-    if (seg_len > (int)sizeof(seg)) return;
+    if (seg_len > (int)sizeof(seg)) return -1;
 
     tcp_memset(seg, 0, hdr_len);
 
@@ -132,13 +132,16 @@ static void tcp_send_segment(ns_tcp_conn *conn, uint8_t flags,
     seg[16] = (uint8_t)(csum >> 8);
     seg[17] = (uint8_t)(csum);
 
-    /* Update sequence number */
+    /* Send via IP layer — only advance seq on success */
+    if (ns_ip_send(conn->remote_ip, 6, seg, seg_len) != 0)
+        return -1;
+
+    /* Update sequence number after successful send */
     conn->seq += (uint32_t)data_len;
     if (flags & TCP_SYN) conn->seq++;
     if (flags & TCP_FIN) conn->seq++;
 
-    /* Send via IP layer */
-    ns_ip_send(conn->remote_ip, 6, seg, seg_len);
+    return 0;
 }
 
 /* Send a RST to reject unexpected packets */
@@ -216,7 +219,8 @@ int ns_tcp_send(ns_tcp_conn *conn, const void *data, int len) {
         if (chunk > 1460) chunk = 1460;
 
         uint8_t flags = TCP_ACK | TCP_PSH;
-        tcp_send_segment(conn, flags, p + sent, chunk);
+        if (tcp_send_segment(conn, flags, p + sent, chunk) != 0)
+            return sent > 0 ? sent : -1;  /* partial send or failure */
         sent += chunk;
 
         /* Brief stall to let remote process */
@@ -445,4 +449,74 @@ void ns_tcp_handle(const uint8_t *ip_payload, int len,
         tcp_send_rst(ns->ip, dst_port, src_ip, src_port,
                      rst_seq, rst_ack);
     }
+}
+
+/* ---- Diagnostics ---- */
+
+static const char *tcp_state_name(int state) {
+    switch (state) {
+    case NS_TCP_CLOSED:      return "CLOSED";
+    case NS_TCP_LISTEN:      return "LISTEN";
+    case NS_TCP_SYN_RCVD:    return "SYN_RCVD";
+    case NS_TCP_ESTABLISHED: return "ESTABLISHED";
+    case NS_TCP_FIN_WAIT_1:  return "FIN_WAIT_1";
+    case NS_TCP_FIN_WAIT_2:  return "FIN_WAIT_2";
+    case NS_TCP_CLOSING:     return "CLOSING";
+    case NS_TCP_TIME_WAIT:   return "TIME_WAIT";
+    default:                 return "UNKNOWN";
+    }
+}
+
+static void tcp_print_dec(uint32_t val) {
+    if (val == 0) { efi_print_ascii("0"); return; }
+    char buf[12];
+    int i = 11;
+    buf[i] = '\0';
+    while (val > 0) { buf[--i] = '0' + (int)(val % 10); val /= 10; }
+    efi_print_ascii(&buf[i]);
+}
+
+void ns_tcp_diag(void) {
+    efi_print_ascii("  TCP state:\r\n");
+    if (g_listener) {
+        efi_print_ascii("    Listener: port ");
+        tcp_print_dec(g_listener->local_port);
+        efi_print_ascii(", state=");
+        efi_print_ascii(tcp_state_name(g_listener->state));
+        efi_print_ascii("\r\n");
+    } else {
+        efi_print_ascii("    Listener: none\r\n");
+    }
+
+    if (g_client && g_client->state != NS_TCP_CLOSED) {
+        efi_print_ascii("    Client: ");
+        /* Print remote IP */
+        for (int j = 0; j < 4; j++) {
+            int v = g_client->remote_ip[j];
+            char d[4]; int di = 0;
+            if (v >= 100) d[di++] = '0' + v / 100;
+            if (v >= 10) d[di++] = '0' + (v / 10) % 10;
+            d[di++] = '0' + v % 10;
+            d[di] = '\0';
+            efi_print_ascii(d);
+            if (j < 3) efi_print_ascii(".");
+        }
+        efi_print_ascii(":");
+        tcp_print_dec(g_client->remote_port);
+        efi_print_ascii(" state=");
+        efi_print_ascii(tcp_state_name(g_client->state));
+        efi_print_ascii(" seq=");
+        tcp_print_dec(g_client->seq);
+        efi_print_ascii(" ack=");
+        tcp_print_dec(g_client->ack);
+        efi_print_ascii(" rx_buf=");
+        tcp_print_dec((uint32_t)g_client->rx_len);
+        efi_print_ascii("\r\n");
+    } else {
+        efi_print_ascii("    Client: none\r\n");
+    }
+
+    efi_print_ascii("    ISN: ");
+    tcp_print_dec(tcp_isn);
+    efi_print_ascii("\r\n");
 }

@@ -529,18 +529,26 @@ struct EFI_BOOT_SERVICES {
     EFI_STATUS (EFIAPI *LocateProtocol)(EFI_GUID *Protocol, void *Registration, void **Interface);
 };
 
-/* Runtime Services (minimal — only ResetSystem) */
+/* Runtime Services */
 #define EfiResetCold     0
 #define EfiResetWarm     1
 #define EfiResetShutdown 2
 
+/* NVRAM variable attributes */
+#define EFI_VARIABLE_NON_VOLATILE          0x00000001
+#define EFI_VARIABLE_BOOTSERVICE_ACCESS    0x00000002
+#define EFI_VARIABLE_RUNTIME_ACCESS        0x00000004
+
 typedef struct {
     char _hdr[24];    /* EFI_TABLE_HEADER */
-    char _pad[80];    /* 10 functions before ResetSystem (8 bytes each):
-                         GetTime, SetTime, GetWakeupTime, SetWakeupTime,
-                         SetVirtualAddressMap, ConvertPointer,
-                         GetVariable, GetNextVariableName, SetVariable,
-                         GetNextHighMonotonicCount */
+    char _pad1[48];   /* GetTime, SetTime, GetWakeupTime, SetWakeupTime,
+                         SetVirtualAddressMap, ConvertPointer */
+    EFI_STATUS (EFIAPI *GetVariable)(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+                                      uint32_t *Attributes, UINTN *DataSize, void *Data);
+    void *_GetNextVariableName;
+    EFI_STATUS (EFIAPI *SetVariable)(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+                                      uint32_t Attributes, UINTN DataSize, void *Data);
+    void *_GetNextHighMonotonicCount;
     void (EFIAPI *ResetSystem)(uint32_t ResetType, EFI_STATUS ResetStatus,
                                 UINTN DataSize, void *ResetData);
 } EFI_RUNTIME_SERVICES;
@@ -895,6 +903,7 @@ extern EFI_GUID gEfiDhcp4ServiceBindingGuid;
 
 /* Install to hard drive */
 void ba_install_to_hd(void);
+void ba_hdinfo(void);
 
 /* Read entry from raw data partition (for HD boot model loading) */
 EFI_STATUS ba_raw_read_entry(const char *name, void **buffer, UINTN *size);

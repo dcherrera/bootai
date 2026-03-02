@@ -31,7 +31,7 @@ typedef struct {
 
 /* ---- ARP table entry ---- */
 
-#define NS_ARP_TABLE_SIZE 16
+#define NS_ARP_TABLE_SIZE 64
 
 typedef struct {
     uint8_t ip[4];
@@ -85,6 +85,8 @@ void     ns_poll(void);           /* Process one pending frame */
 
 int      ns_arp_resolve(const uint8_t *ip, uint8_t *mac_out);
 void     ns_arp_handle(const uint8_t *frame, int len);
+void     ns_arp_learn(const uint8_t *ip, const uint8_t *mac);
+void     ns_arp_dump(void);  /* Print ARP table for diagnostics */
 
 /* ---- DHCP ---- */
 
@@ -92,7 +94,7 @@ int      ns_dhcp_run(void);  /* blocking: returns 0 on success */
 
 /* ---- IP ---- */
 
-void     ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
+int      ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
                     const uint8_t *payload, int len);
 void     ns_ip_handle(const uint8_t *frame, int len);
 
@@ -126,8 +128,9 @@ void     ns_raw_send(const uint8_t *dst_mac, uint16_t ethertype,
 
 ns_state *ns_get_state(void);
 
-/* ---- Debug: frame counters ---- */
+/* ---- Debug: frame counters + diagnostics ---- */
 
 int      ns_poll_rx_count(void);  /* Total frames received by ns_poll() */
+void     ns_tcp_diag(void);       /* Print TCP state for diagnostics */
 
 #endif /* BOOTAI_NS_NET_H */

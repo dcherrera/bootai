@@ -354,7 +354,7 @@ EFI_STATUS ba_mdns_init(void) {
 }
 
 void ba_mdns_announce(void) {
-    if (!mdns_running || !mdns_udp4) return;
+    if (!mdns_running) return;
 
     uint8_t pkt[64];
     int len = mdns_build_response(pkt, sizeof(pkt), MDNS_TTL);
@@ -367,8 +367,8 @@ void ba_mdns_announce(void) {
     gBS->Stall(1000000); /* 1 second */
     mdns_send(pkt, len);
 
-    /* Start listening for queries */
-    mdns_issue_receive();
+    /* Start listening for queries (UEFI path only — custom stack uses poll callback) */
+    if (mdns_udp4) mdns_issue_receive();
 }
 
 void ba_mdns_poll(void) {

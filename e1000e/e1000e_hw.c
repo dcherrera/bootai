@@ -294,6 +294,14 @@ static int e1000e_tx_init(void) {
     return 0;
 }
 
+/* ---- Phase 3: TX diagnostic counters ---- */
+
+static uint32_t tx_ok_count = 0;
+static uint32_t tx_fail_count = 0;
+
+uint32_t e1000e_tx_ok_count(void)   { return tx_ok_count; }
+uint32_t e1000e_tx_fail_count(void) { return tx_fail_count; }
+
 /* ---- Phase 3: Transmit raw Ethernet frame ---- */
 
 int e1000e_transmit(const uint8_t *frame, int len) {
@@ -301,6 +309,9 @@ int e1000e_transmit(const uint8_t *frame, int len) {
         return -1;
 
     e1000e_tx_ring *tx = &g_e1000e.tx;
+
+    /* Clear pending interrupt causes to prevent NIC stalls */
+    (void)e1000e_read(E1000_ICR);
 
     /* Copy frame to DMA buffer */
     uint8_t *dst = (uint8_t *)tx->buf_dma.vaddr;
@@ -325,13 +336,16 @@ int e1000e_transmit(const uint8_t *frame, int len) {
     for (int i = 0; i < 100; i++) {
         if (desc->status & E1000_TXD_STAT_DD) {
             tx->cur = next;
+            tx_ok_count++;
             return 0;
         }
         gBS->Stall(10);
     }
 
-    /* Timeout */
+    /* Timeout — try recovery: re-read ICR, check link status */
+    (void)e1000e_read(E1000_ICR);
     tx->cur = next;
+    tx_fail_count++;
     return -1;
 }
 

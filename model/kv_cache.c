@@ -24,6 +24,7 @@ void ba_kv_init(ba_kv_cache *kv, int n_layers, int max_len, int n_kv_heads, int 
         kv->layers[i].k_cache = (float *)uefi_malloc(cache_bytes);
         kv->layers[i].v_cache = (float *)uefi_malloc(cache_bytes);
         kv->layers[i].cache_len = 0;
+        kv->layers[i].cache_start = 0;
         kv->layers[i].max_len = max_len;
         memset(kv->layers[i].k_cache, 0, cache_bytes);
         memset(kv->layers[i].v_cache, 0, cache_bytes);
@@ -34,24 +35,25 @@ void ba_kv_append(ba_kv_cache *kv, int layer, const float *k, const float *v) {
     ba_kv_layer *l = &kv->layers[layer];
     int kv_dim = kv->kv_dim;
 
-    /* Evict oldest half if full */
-    if (l->cache_len >= l->max_len) {
-        int keep = l->max_len / 2;
-        int drop = l->cache_len - keep;
-        memmove(l->k_cache, &l->k_cache[drop * kv_dim], keep * kv_dim * sizeof(float));
-        memmove(l->v_cache, &l->v_cache[drop * kv_dim], keep * kv_dim * sizeof(float));
-        l->cache_len = keep;
+    if (l->cache_len < l->max_len) {
+        /* Buffer not full: append at (cache_start + cache_len) % max_len */
+        int pos = (l->cache_start + l->cache_len) % l->max_len;
+        memcpy(&l->k_cache[pos * kv_dim], k, kv_dim * sizeof(float));
+        memcpy(&l->v_cache[pos * kv_dim], v, kv_dim * sizeof(float));
+        l->cache_len++;
+    } else {
+        /* Buffer full: overwrite oldest entry at cache_start, advance start */
+        memcpy(&l->k_cache[l->cache_start * kv_dim], k, kv_dim * sizeof(float));
+        memcpy(&l->v_cache[l->cache_start * kv_dim], v, kv_dim * sizeof(float));
+        l->cache_start = (l->cache_start + 1) % l->max_len;
+        /* cache_len stays at max_len */
     }
-
-    int pos = l->cache_len;
-    memcpy(&l->k_cache[pos * kv_dim], k, kv_dim * sizeof(float));
-    memcpy(&l->v_cache[pos * kv_dim], v, kv_dim * sizeof(float));
-    l->cache_len = pos + 1;
 }
 
 void ba_kv_reset(ba_kv_cache *kv) {
     for (int i = 0; i < kv->n_layers; i++) {
         kv->layers[i].cache_len = 0;
+        kv->layers[i].cache_start = 0;
     }
 }
 

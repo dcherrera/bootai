@@ -45,10 +45,10 @@ static uint16_t ip_id_counter = 1;
 
 /* ---- Send IPv4 packet ---- */
 
-void ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
-                const uint8_t *payload, int len) {
+int ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
+               const uint8_t *payload, int len) {
     ns_state *ns = ns_get_state();
-    if (!ns->ip_ready) return;
+    if (!ns->ip_ready) return -1;
 
     /* Determine next-hop: on-subnet → dst directly, off-subnet → gateway */
     int on_subnet = 1;
@@ -81,7 +81,7 @@ void ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
             dst_mac[5] = dst_ip[3];
         } else {
             if (ns_arp_resolve(next_hop, dst_mac) != 0) {
-                return; /* ARP failed */
+                return -1; /* ARP failed */
             }
         }
     }
@@ -89,7 +89,7 @@ void ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
     /* Build IPv4 header (20 bytes, no options) */
     uint8_t pkt[1518];
     int total = 20 + len;
-    if (total > 1500) return; /* Too large */
+    if (total > 1500) return -1; /* Too large */
 
     ip_memset(pkt, 0, 20);
     pkt[0] = 0x45;                          /* Version=4, IHL=5 */
@@ -117,6 +117,7 @@ void ns_ip_send(const uint8_t *dst_ip, uint8_t protocol,
 
     /* Send as Ethernet frame with EtherType 0x0800 */
     ns_raw_send(dst_mac, 0x0800, pkt, total);
+    return 0;
 }
 
 /* ---- Handle incoming IPv4 frame ---- */
@@ -150,8 +151,9 @@ void ns_ip_handle(const uint8_t *frame, int len) {
         int is_bcast = (dst[0] == 255 && dst[1] == 255 &&
                         dst[2] == 255 && dst[3] == 255);
 
-        /* Also accept subnet broadcast (e.g. 192.168.1.255 on /24) */
-        if (!for_us && !is_bcast) {
+        /* Also accept multicast (224.0.0.0/4) and subnet broadcast */
+        int is_mcast = ((dst[0] & 0xF0) == 0xE0);
+        if (!for_us && !is_bcast && !is_mcast) {
             int subnet_bcast = 1;
             for (int i = 0; i < 4; i++) {
                 uint8_t expected = (ns->ip[i] & ns->subnet[i]) |

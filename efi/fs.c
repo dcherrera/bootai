@@ -26,14 +26,43 @@ static void ascii_to_ucs2(const char *src, CHAR16 *dst, int max_chars) {
 EFI_STATUS efi_fs_init(void) {
     if (fs_root) return EFI_SUCCESS;
 
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
-    EFI_STATUS status = gBS->LocateProtocol(&gEfiSimpleFileSystemProtocolGuid, 0, (void **)&fs);
-    if (status != EFI_SUCCESS || !fs) return status;
+    /* Enumerate ALL SimpleFileSystem handles and probe each.
+     * Dell E6510 has multiple volumes (HP Port Rep 126MB FAT16 +
+     * BOOTAI USB/HD). LocateProtocol finds the wrong one. */
+    UINTN n_fs = 0;
+    EFI_HANDLE *fs_handles = 0;
+    EFI_STATUS status = gBS->LocateHandleBuffer(
+        2 /* ByProtocol */, &gEfiSimpleFileSystemProtocolGuid, 0,
+        &n_fs, &fs_handles);
+    if (status != EFI_SUCCESS || n_fs == 0)
+        return EFI_NOT_FOUND;
 
-    status = fs->OpenVolume(fs, &fs_root);
-    if (status != EFI_SUCCESS) { fs_root = 0; return status; }
+    for (UINTN i = 0; i < n_fs; i++) {
+        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
+        status = gBS->HandleProtocol(fs_handles[i],
+            &gEfiSimpleFileSystemProtocolGuid, (void **)&fs);
+        if (status != EFI_SUCCESS || !fs) continue;
 
-    return EFI_SUCCESS;
+        EFI_FILE_PROTOCOL *vol = 0;
+        status = fs->OpenVolume(fs, &vol);
+        if (status != EFI_SUCCESS || !vol) continue;
+
+        /* Probe: try opening our EFI binary */
+        CHAR16 probe_path[32];
+        ascii_to_ucs2("\\EFI\\BOOT\\BOOTX64.EFI", probe_path, 32);
+        EFI_FILE_PROTOCOL *probe = 0;
+        status = vol->Open(vol, &probe, probe_path, EFI_FILE_MODE_READ, 0);
+        if (status == EFI_SUCCESS && probe) {
+            probe->Close(probe);
+            fs_root = vol;
+            gBS->FreePool(fs_handles);
+            return EFI_SUCCESS;
+        }
+        vol->Close(vol);
+    }
+
+    gBS->FreePool(fs_handles);
+    return EFI_NOT_FOUND;
 }
 
 EFI_STATUS efi_file_size(const char *path, UINTN *size_out) {

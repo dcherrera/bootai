@@ -6,6 +6,7 @@
  */
 
 #include "efi.h"
+#include "ns_net.h"
 #include "foundry/tensor/tensor.h"
 #include "model/model.h"
 #include "iwn/iwn.h"
@@ -60,8 +61,7 @@ static void show_boot_menu(void) {
     efi_print_ascii("  ==================\r\n");
     efi_print_ascii("\r\n");
     efi_print_ascii("  [1] Run Live\r\n");
-    efi_print_ascii("  [2] Install to Hard Drive\r\n");
-    efi_print_ascii("  [3] Settings\r\n");
+    efi_print_ascii("  [2] Settings\r\n");
     efi_print_ascii("\r\n");
     efi_print_ascii("  Select: ");
 }
@@ -782,9 +782,48 @@ int ba_exec_cmd(const char *line) {
         return 0;
     }
 
+    /* netstat — network stack diagnostics */
+    if (str_eq(line, "netstat")) {
+        efi_print_ascii("  Network stack diagnostics:\r\n");
+        /* e1000e TX/RX counters */
+        if (e1000e_snp_is_installed()) {
+            efi_print_ascii("  e1000e TX: ok=");
+            char num[12]; int ni;
+            uint32_t v = e1000e_tx_ok_count();
+            if (v == 0) { efi_print_ascii("0"); }
+            else { ni = 0; char t[12]; int ti = 0; while (v > 0) { t[ti++] = '0' + v % 10; v /= 10; } while (ti > 0) num[ni++] = t[--ti]; num[ni] = '\0'; efi_print_ascii(num); }
+            efi_print_ascii(", fail=");
+            v = e1000e_tx_fail_count();
+            if (v == 0) { efi_print_ascii("0"); }
+            else { ni = 0; char t[12]; int ti = 0; while (v > 0) { t[ti++] = '0' + v % 10; v /= 10; } while (ti > 0) num[ni++] = t[--ti]; num[ni] = '\0'; efi_print_ascii(num); }
+            efi_print_ascii(", RX frames=");
+            v = (uint32_t)ns_poll_rx_count();
+            if (v == 0) { efi_print_ascii("0"); }
+            else { ni = 0; char t[12]; int ti = 0; while (v > 0) { t[ti++] = '0' + v % 10; v /= 10; } while (ti > 0) num[ni++] = t[--ti]; num[ni] = '\0'; efi_print_ascii(num); }
+            efi_print_ascii("\r\n");
+        }
+        /* ARP table */
+        ns_arp_dump();
+        /* TCP state */
+        ns_tcp_diag();
+        return 0;
+    }
+
     /* tensor — run tensor self-test */
     if (str_eq(line, "tensor")) {
         tensor_self_test();
+        return 0;
+    }
+
+    /* install — install to hard drive */
+    if (str_eq(line, "install")) {
+        ba_install_to_hd();
+        return 0;
+    }
+
+    /* hdinfo — inspect hard drive contents */
+    if (str_eq(line, "hdinfo")) {
+        ba_hdinfo();
         return 0;
     }
 
@@ -811,7 +850,8 @@ static void command_repl(void) {
     efi_print_ascii("\r\n");
     efi_print_ascii("  Commands: chat, serve [port], ls [path], cat <file>, fetch <url>,\r\n");
     efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
-    efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, tensor, reboot, exit\r\n");
+    efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, tensor, install,\r\n");
+    efi_print_ascii("            hdinfo, reboot, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {
@@ -852,6 +892,12 @@ EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_T
     gST = SystemTable;
     gBS = SystemTable->BootServices;
     gImageHandle = ImageHandle;
+
+    /* Immediate debug output — proves the binary loaded and is running */
+    {
+        CHAR16 msg[] = { 'B','o','o','t','A','I',' ','O','K','\r','\n', 0 };
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, msg);
+    }
 
     /* Clear screen */
     efi_clear_screen();
@@ -927,44 +973,7 @@ static void __attribute__((used)) app_main(void) {
     efi_print_ascii("Goodbye.\r\n");
     for (;;) __asm__ volatile("hlt");
 #else
-    /* Main loop: boot menu → action → back to menu */
-    for (;;) {
-        show_boot_menu();
-
-        /* Wait for a menu selection key */
-        EFI_INPUT_KEY key;
-        for (;;) {
-            efi_wait_key();
-            EFI_STATUS status = efi_read_key(&key);
-            if (status == EFI_SUCCESS && key.UnicodeChar >= '1' && key.UnicodeChar <= '3') {
-                /* Echo the selection */
-                CHAR16 echo[2] = { key.UnicodeChar, 0 };
-                efi_print(echo);
-                efi_print_ascii("\r\n");
-                break;
-            }
-        }
-
-        switch (key.UnicodeChar) {
-        case '1':
-            /* Run Live — command REPL with networking */
-            command_repl();
-            break;
-        case '2':
-            ba_install_to_hd();
-            efi_print_ascii("  Press any key to return to menu...\r\n");
-            efi_wait_key();
-            efi_read_key(&key);
-            break;
-        case '3':
-            efi_print_ascii("\r\n  Settings not yet implemented.\r\n");
-            efi_print_ascii("  Press any key to return to menu...\r\n");
-            efi_wait_key();
-            efi_read_key(&key);
-            break;
-        }
-
-        efi_clear_screen();
-    }
+    /* Boot straight into REPL */
+    command_repl();
 #endif
 }

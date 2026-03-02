@@ -214,6 +214,21 @@ static void print_progress(uint64_t done, uint64_t total) {
     efi_print_ascii(buf);
 }
 
+static void print_hex8(uint8_t v) {
+    const char *hex = "0123456789ABCDEF";
+    char buf[3] = { hex[v >> 4], hex[v & 0xF], 0 };
+    efi_print_ascii(buf);
+}
+
+static void print_hex32(uint32_t v) {
+    efi_print_ascii("0x");
+    for (int i = 7; i >= 0; i--) {
+        const char *hex = "0123456789ABCDEF";
+        char c[2] = { hex[(v >> (i * 4)) & 0xF], 0 };
+        efi_print_ascii(c);
+    }
+}
+
 static EFI_GUID gEfiFileInfoGuid_install = EFI_FILE_INFO_GUID;
 
 /* ================================================================== */
@@ -230,18 +245,42 @@ static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
     if (status != EFI_SUCCESS || n_handles == 0)
         return EFI_NOT_FOUND;
 
+    /* Find the largest whole-disk device.
+     * Some firmware (Dell E6510) marks internal SATA as removable,
+     * so we skip the RemovableMedia check and pick by size instead. */
+    EFI_BLOCK_IO_PROTOCOL *best_bio = 0;
+    EFI_HANDLE best_handle = 0;
+    uint64_t best_size = 0;
+
     for (UINTN i = 0; i < n_handles; i++) {
         EFI_BLOCK_IO_PROTOCOL *bio = 0;
         status = gBS->HandleProtocol(handles[i], &gEfiBlockIoProtocolGuid, (void **)&bio);
         if (status != EFI_SUCCESS || !bio) continue;
         if (!bio->Media) continue;
         if (!bio->Media->MediaPresent) continue;
-        if (bio->Media->RemovableMedia) continue;
         if (bio->Media->LogicalPartition) continue;
         if (bio->Media->BlockSize != 512) continue;
+        if (bio->Media->ReadOnly) continue;
 
-        *disk_out = bio;
-        *handle_out = handles[i];
+        uint64_t sz = (bio->Media->LastBlock + 1) * 512ULL;
+
+        /* Debug: print candidate */
+        efi_print_ascii("    ");
+        print_size_human(sz);
+        efi_print_ascii(" disk (MediaId ");
+        print_dec64(bio->Media->MediaId);
+        efi_print_ascii(")\r\n");
+
+        if (sz > best_size) {
+            best_size = sz;
+            best_bio = bio;
+            best_handle = handles[i];
+        }
+    }
+
+    if (best_bio) {
+        *disk_out = best_bio;
+        *handle_out = best_handle;
         gBS->FreePool(handles);
         return EFI_SUCCESS;
     }
@@ -251,29 +290,78 @@ static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
 }
 
 /* ================================================================== */
-/* Write protective MBR (LBA 0)                                       */
+/* Write MBR with real partition entries (no GPT)                      */
+/*                                                                     */
+/* Old Dell UEFI firmware (E6510) doesn't boot from GPT disks.         */
+/* Using plain MBR with FAT32 + raw data partitions works because      */
+/* it's the same format as the USB drive (which boots fine).            */
 /* ================================================================== */
 
-static EFI_STATUS write_protective_mbr(EFI_BLOCK_IO_PROTOCOL *disk) {
+/* CHS encoding for MBR partition entries */
+static void lba_to_chs(uint32_t lba, uint8_t *chs) {
+    /* Use dummy geometry 255 heads, 63 sectors/track */
+    if (lba >= 255 * 63 * 1024) {
+        chs[0] = 0xFF; chs[1] = 0xFF; chs[2] = 0xFF;
+        return;
+    }
+    uint32_t s = (lba % 63) + 1;
+    uint32_t tmp = lba / 63;
+    uint32_t h = tmp % 255;
+    uint32_t c = tmp / 255;
+    chs[0] = (uint8_t)h;
+    chs[1] = (uint8_t)(s | ((c >> 2) & 0xC0));
+    chs[2] = (uint8_t)c;
+}
+
+static EFI_STATUS write_mbr(EFI_BLOCK_IO_PROTOCOL *disk) {
     uint8_t *mbr = 0;
     EFI_STATUS status = gBS->AllocatePool(EfiLoaderData, 512, (void **)&mbr);
     if (status != EFI_SUCCESS) return status;
     memset(mbr, 0, 512);
 
-    /* Partition entry 1 at offset 446 */
-    uint8_t *pe = &mbr[446];
-    pe[0] = 0x00;                                       /* Not bootable */
-    pe[1] = 0x00; pe[2] = 0x02; pe[3] = 0x00;          /* CHS start */
-    pe[4] = 0xEE;                                       /* GPT protective */
-    pe[5] = 0xFF; pe[6] = 0xFF; pe[7] = 0xFF;          /* CHS end */
-    pe[8] = 1; pe[9] = 0; pe[10] = 0; pe[11] = 0;     /* LBA start = 1 */
-
     uint64_t last = disk->Media->LastBlock;
-    uint32_t sz = (last > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)last;
-    pe[12] = (uint8_t)(sz);
-    pe[13] = (uint8_t)(sz >> 8);
-    pe[14] = (uint8_t)(sz >> 16);
-    pe[15] = (uint8_t)(sz >> 24);
+    uint32_t mid = disk->Media->MediaId;
+
+    /* Destroy any leftover GPT (LBA 1-33 + backup at end of disk).
+     * UEFI spec: firmware MUST prefer GPT over MBR if valid GPT exists.
+     * Old installs wrote GPT headers here — must be zeroed. */
+    {
+        UINTN wipe_bytes = 33 * 512;
+        uint8_t *zero = 0;
+        if (gBS->AllocatePool(EfiLoaderData, wipe_bytes, (void **)&zero) == EFI_SUCCESS) {
+            memset(zero, 0, wipe_bytes);
+            disk->WriteBlocks(disk, mid, 1, wipe_bytes, zero);
+            if (last > 33) {
+                disk->WriteBlocks(disk, mid, last - 32, wipe_bytes, zero);
+                disk->WriteBlocks(disk, mid, last, 512, zero);
+            }
+            gBS->FreePool(zero);
+        }
+    }
+
+    /* Disk signature (unique 32-bit ID at offset 440) */
+    *(uint32_t *)&mbr[440] = 0xB007A1DA;
+
+    /* Partition 1: FAT32 LBA, bootable, 100MB at LBA 2048 */
+    uint8_t *pe1 = &mbr[446];
+    pe1[0] = 0x80;                                      /* Bootable / active */
+    lba_to_chs(ESP_START_LBA, &pe1[1]);                 /* CHS start */
+    pe1[4] = 0xEF;                                      /* EFI System Partition */
+    uint32_t esp_end_lba = ESP_START_LBA + (uint32_t)ESP_SECTORS - 1;
+    lba_to_chs(esp_end_lba, &pe1[5]);                   /* CHS end */
+    *(uint32_t *)&pe1[8] = ESP_START_LBA;               /* LBA start */
+    *(uint32_t *)&pe1[12] = (uint32_t)ESP_SECTORS;      /* Sector count */
+
+    /* Partition 2: Raw data, rest of disk */
+    uint8_t *pe2 = &mbr[462];
+    pe2[0] = 0x00;                                      /* Not bootable */
+    lba_to_chs(RAW_START_LBA, &pe2[1]);                 /* CHS start */
+    pe2[4] = 0xDA;                                      /* Custom type (0xDA = BootAI data) */
+    uint32_t raw_end = (last > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)last;
+    lba_to_chs(raw_end, &pe2[5]);                       /* CHS end */
+    *(uint32_t *)&pe2[8] = RAW_START_LBA;               /* LBA start */
+    uint32_t raw_sectors = raw_end - RAW_START_LBA + 1;
+    *(uint32_t *)&pe2[12] = raw_sectors;                 /* Sector count */
 
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
@@ -291,6 +379,31 @@ static EFI_STATUS write_gpt(EFI_BLOCK_IO_PROTOCOL *disk) {
     uint64_t last_lba = disk->Media->LastBlock;
     uint32_t media_id = disk->Media->MediaId;
     EFI_STATUS status;
+
+    /* Write protective MBR at LBA 0 (required by GPT spec) */
+    {
+        uint8_t *mbr = 0;
+        status = gBS->AllocatePool(EfiLoaderData, 512, (void **)&mbr);
+        if (status != EFI_SUCCESS) return status;
+        memset(mbr, 0, 512);
+
+        /* Single partition entry covering entire disk, type 0xEE (GPT protective) */
+        uint8_t *pe = &mbr[446];
+        pe[0] = 0x00;            /* Not bootable */
+        pe[1] = 0x00; pe[2] = 0x02; pe[3] = 0x00;  /* CHS start: 0/0/2 */
+        pe[4] = 0xEE;            /* GPT protective */
+        pe[5] = 0xFF; pe[6] = 0xFF; pe[7] = 0xFF;  /* CHS end: max */
+        *(uint32_t *)&pe[8] = 1;  /* LBA start = 1 */
+        uint32_t mbr_size = (last_lba > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)last_lba;
+        *(uint32_t *)&pe[12] = mbr_size;  /* Sector count */
+
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+
+        status = disk->WriteBlocks(disk, media_id, 0, 512, mbr);
+        gBS->FreePool(mbr);
+        if (status != EFI_SUCCESS) return status;
+    }
 
     uint64_t esp_end = ESP_START_LBA + ESP_SECTORS - 1;
     uint64_t raw_end = last_lba - 33;
@@ -485,209 +598,38 @@ static EFI_STATUS format_fat32(EFI_BLOCK_IO_PROTOCOL *disk) {
     return EFI_SUCCESS;
 }
 
-/* ================================================================== */
-/* Write raw partition TOC + copy model data                           */
-/* ================================================================== */
-
-static EFI_STATUS copy_model_to_raw(EFI_BLOCK_IO_PROTOCOL *disk,
-                                     uint64_t raw_start_lba,
-                                     uint64_t raw_size_bytes) {
-    EFI_FILE_PROTOCOL *usb_root = efi_fs_root();
-    if (!usb_root) return EFI_NOT_FOUND;
-
-    /* Open model file on USB */
-    uint16_t wpath[32];
-    ascii_to_ucs2("rwkvos\\model.btw", wpath, 32);
-
-    EFI_FILE_PROTOCOL *src = 0;
-    EFI_STATUS status = usb_root->Open(usb_root, &src, wpath, EFI_FILE_MODE_READ, 0);
-    if (status != EFI_SUCCESS) return EFI_NOT_FOUND;
-
-    /* Get file size */
-    uint8_t info_buf[256];
-    UINTN info_size = sizeof(info_buf);
-    status = src->GetInfo(src, &gEfiFileInfoGuid_install, &info_size, info_buf);
-    if (status != EFI_SUCCESS) { src->Close(src); return status; }
-
-    EFI_FILE_INFO *info = (EFI_FILE_INFO *)info_buf;
-    uint64_t model_size = info->FileSize;
-
-    efi_print_ascii("        model.btw (");
-    print_size_human(model_size);
-    efi_print_ascii(")\r\n");
-
-    /* Check space */
-    if (BTAI_DATA_OFFSET + model_size > raw_size_bytes) {
-        efi_print_ascii("        ERROR: Not enough space. Need ");
-        print_size_human(BTAI_DATA_OFFSET + model_size);
-        efi_print_ascii(", have ");
-        print_size_human(raw_size_bytes);
-        efi_print_ascii("\r\n");
-        src->Close(src);
-        return EFI_VOLUME_FULL;
-    }
-
-    /* Allocate 1MB chunk buffer */
-    UINTN chunk_size = 1024 * 1024;
-    uint8_t *chunk = 0;
-    status = gBS->AllocatePool(EfiLoaderData, chunk_size, (void **)&chunk);
-    if (status != EFI_SUCCESS) { src->Close(src); return status; }
-
-    /* Copy model data to raw partition at BTAI_DATA_OFFSET */
-    uint32_t media_id = disk->Media->MediaId;
-    uint64_t data_lba = raw_start_lba + (BTAI_DATA_OFFSET / 512);
-    uint64_t written = 0;
-
-    while (written < model_size) {
-        UINTN to_read = chunk_size;
-        if (written + to_read > model_size)
-            to_read = (UINTN)(model_size - written);
-
-        status = src->Read(src, &to_read, chunk);
-        if (status != EFI_SUCCESS || to_read == 0) break;
-
-        /* Pad to sector boundary */
-        UINTN aligned = (to_read + 511) & ~(UINTN)511;
-        if (to_read < aligned)
-            memset(chunk + to_read, 0, aligned - to_read);
-
-        status = disk->WriteBlocks(disk, media_id, data_lba, aligned, chunk);
-        if (status != EFI_SUCCESS) {
-            efi_print_ascii("\r\n        Write failed at LBA ");
-            print_dec64(data_lba);
-            efi_print_ascii("\r\n");
-            break;
-        }
-
-        written += to_read;
-        data_lba += aligned / 512;
-        print_progress(written, model_size);
-    }
-
-    src->Close(src);
-    gBS->FreePool(chunk);
-
-    if (written < model_size)
-        return EFI_DEVICE_ERROR;
-
-    /* Write TOC header with model entry */
-    uint8_t *toc = 0;
-    status = gBS->AllocatePool(EfiLoaderData, BTAI_DATA_OFFSET, (void **)&toc);
-    if (status != EFI_SUCCESS) return status;
-    memset(toc, 0, BTAI_DATA_OFFSET);
-
-    btai_header *hdr = (btai_header *)toc;
-    hdr->magic = BTAI_MAGIC;
-    hdr->version = BTAI_VERSION;
-    hdr->entry_count = 1;
-    hdr->partition_size = raw_size_bytes;
-    hdr->data_offset = BTAI_DATA_OFFSET;
-    hdr->next_free = BTAI_DATA_OFFSET + model_size;
-
-    btai_entry *ent = (btai_entry *)(toc + sizeof(btai_header));
-    /* Copy name character by character */
-    const char *name = "model.btw";
-    for (int i = 0; name[i]; i++) ent->name[i] = name[i];
-    ent->offset = BTAI_DATA_OFFSET;
-    ent->size = model_size;
-    ent->flags = 0;
-
-    /* Write TOC (first 8 sectors of raw partition) */
-    status = disk->WriteBlocks(disk, media_id, raw_start_lba,
-                                BTAI_DATA_OFFSET, toc);
-    gBS->FreePool(toc);
-
-    disk->FlushBlocks(disk);
-    return status;
-}
+/* (Model copy is now done inline from pre-read buffer in ba_install_to_hd) */
 
 /* ================================================================== */
-/* Reconnect controllers and find the new FAT32 volume                */
+/* Direct FAT32 file writer via Block IO                               */
+/*                                                                     */
+/* Dell UEFI won't re-enumerate partitions after ConnectController,    */
+/* so we write files directly to the FAT32 sectors instead of relying  */
+/* on the UEFI filesystem driver to mount the new partition.           */
 /* ================================================================== */
 
-static EFI_STATUS reconnect_and_find_volume(EFI_HANDLE disk_handle,
-                                             EFI_FILE_PROTOCOL **vol_root) {
-    /* Disconnect all drivers from this controller */
-    gBS->DisconnectController(disk_handle, 0, 0);
-    gBS->Stall(500000);  /* 500ms */
+/* Pre-read file from USB into memory buffer */
+typedef struct {
+    void  *data;
+    UINTN  size;
+    UINTN  pages;
+} preread_file;
 
-    /* Reconnect recursively — UEFI will re-scan partitions */
-    gBS->ConnectController(disk_handle, 0, 0, 1);
-    gBS->Stall(2000000);  /* 2s for filesystem binding */
+static EFI_STATUS preread_usb_file(EFI_FILE_PROTOCOL *usb_root,
+                                    const char *path,
+                                    preread_file *out) {
+    out->data = 0;
+    out->size = 0;
+    out->pages = 0;
 
-    /* Find SimpleFileSystem on a non-removable logical partition */
-    UINTN n_handles = 0;
-    EFI_HANDLE *handles = 0;
-    EFI_STATUS status = gBS->LocateHandleBuffer(
-        2 /* ByProtocol */, &gEfiSimpleFileSystemProtocolGuid, 0,
-        &n_handles, &handles);
-    if (status != EFI_SUCCESS || n_handles == 0)
-        return EFI_NOT_FOUND;
-
-    for (UINTN i = 0; i < n_handles; i++) {
-        EFI_BLOCK_IO_PROTOCOL *bio = 0;
-        status = gBS->HandleProtocol(handles[i], &gEfiBlockIoProtocolGuid,
-                                      (void **)&bio);
-        if (status != EFI_SUCCESS || !bio) continue;
-        if (!bio->Media) continue;
-        if (bio->Media->RemovableMedia) continue;
-        if (!bio->Media->LogicalPartition) continue;
-
-        /* This is a non-removable partition with a filesystem — our ESP */
-        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
-        status = gBS->HandleProtocol(handles[i],
-                                      &gEfiSimpleFileSystemProtocolGuid,
-                                      (void **)&fs);
-        if (status != EFI_SUCCESS || !fs) continue;
-
-        status = fs->OpenVolume(fs, vol_root);
-        if (status == EFI_SUCCESS) {
-            gBS->FreePool(handles);
-            return EFI_SUCCESS;
-        }
-    }
-
-    gBS->FreePool(handles);
-    return EFI_NOT_FOUND;
-}
-
-/* ================================================================== */
-/* File operations on the new ESP volume                               */
-/* ================================================================== */
-
-static EFI_STATUS create_dir(EFI_FILE_PROTOCOL *root, const char *path) {
     uint16_t wpath[256];
     ascii_to_ucs2(path, wpath, 256);
 
-    EFI_FILE_PROTOCOL *dir = 0;
-    EFI_STATUS status = root->Open(root, &dir, wpath,
-        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
-        EFI_FILE_DIRECTORY);
-    if (status == EFI_SUCCESS && dir) dir->Close(dir);
-    return status;
-}
-
-static EFI_STATUS copy_file_to_esp(EFI_FILE_PROTOCOL *src_root,
-                                    const char *src_path,
-                                    EFI_FILE_PROTOCOL *dst_root,
-                                    const char *dst_path,
-                                    const char *display_name) {
-    uint16_t wsrc[256], wdst[256];
-    ascii_to_ucs2(src_path, wsrc, 256);
-    ascii_to_ucs2(dst_path, wdst, 256);
-
-    /* Open source */
     EFI_FILE_PROTOCOL *src = 0;
-    EFI_STATUS status = src_root->Open(src_root, &src, wsrc,
+    EFI_STATUS status = usb_root->Open(usb_root, &src, wpath,
                                         EFI_FILE_MODE_READ, 0);
-    if (status != EFI_SUCCESS) {
-        efi_print_ascii("        ");
-        efi_print_ascii(display_name);
-        efi_print_ascii(" — not found, skipped\r\n");
-        return EFI_SUCCESS;  /* Non-fatal */
-    }
+    if (status != EFI_SUCCESS) return EFI_NOT_FOUND;
 
-    /* Get size */
     uint8_t info_buf[256];
     UINTN info_size = sizeof(info_buf);
     status = src->GetInfo(src, &gEfiFileInfoGuid_install, &info_size, info_buf);
@@ -696,13 +638,6 @@ static EFI_STATUS copy_file_to_esp(EFI_FILE_PROTOCOL *src_root,
     EFI_FILE_INFO *info = (EFI_FILE_INFO *)info_buf;
     uint64_t file_size = info->FileSize;
 
-    efi_print_ascii("        ");
-    efi_print_ascii(display_name);
-    efi_print_ascii(" (");
-    print_size_human(file_size);
-    efi_print_ascii(")...");
-
-    /* Read entire file into memory */
     UINTN pages = ((UINTN)file_size + 4095) / 4096;
     if (pages == 0) pages = 1;
     uint64_t phys = 0;
@@ -716,27 +651,497 @@ static EFI_STATUS copy_file_to_esp(EFI_FILE_PROTOCOL *src_root,
 
     if (status != EFI_SUCCESS) {
         gBS->FreePages(phys, pages);
-        efi_print_ascii(" READ FAILED\r\n");
         return status;
     }
 
-    /* Create and write destination */
-    EFI_FILE_PROTOCOL *dst = 0;
-    status = dst_root->Open(dst_root, &dst, wdst,
-        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
-    if (status != EFI_SUCCESS) {
-        gBS->FreePages(phys, pages);
-        efi_print_ascii(" CREATE FAILED\r\n");
-        return status;
+    out->data = buf;
+    out->size = read_size;
+    out->pages = pages;
+    return EFI_SUCCESS;
+}
+
+static void preread_free(preread_file *f) {
+    if (f->data) {
+        gBS->FreePages((uint64_t)(UINTN)f->data, f->pages);
+        f->data = 0;
+    }
+}
+
+/* FAT32 layout state — matches values from format_fat32() */
+typedef struct {
+    EFI_BLOCK_IO_PROTOCOL *disk;
+    uint32_t media_id;
+    uint32_t spc;            /* sectors per cluster (8) */
+    uint32_t reserved;       /* reserved sectors (32) */
+    uint32_t fat_size;       /* FAT size in sectors */
+    uint64_t fat1_lba;       /* LBA of first FAT */
+    uint64_t fat2_lba;       /* LBA of second FAT */
+    uint64_t data_lba;       /* LBA of data region (cluster 2) */
+    uint32_t cluster_bytes;  /* spc * 512 */
+    uint32_t next_cluster;   /* next free cluster to allocate */
+    /* In-memory FAT (we keep a copy and flush both FAT1+FAT2 at end) */
+    uint32_t *fat;
+    uint32_t fat_entries;    /* max cluster entries */
+    UINTN    fat_bytes;
+} fat32_state;
+
+static void fat32_init(fat32_state *f, EFI_BLOCK_IO_PROTOCOL *disk) {
+    f->disk = disk;
+    f->media_id = disk->Media->MediaId;
+    f->spc = 8;
+    f->reserved = 32;
+    uint32_t total = (uint32_t)ESP_SECTORS;
+    f->fat_size = (total - f->reserved + 128 * f->spc + 1) / (128 * f->spc + 2);
+    f->fat1_lba = ESP_START_LBA + f->reserved;
+    f->fat2_lba = f->fat1_lba + f->fat_size;
+    f->data_lba = f->fat2_lba + f->fat_size;
+    f->cluster_bytes = f->spc * 512;
+    f->next_cluster = 3;  /* 0,1 reserved, 2 = root dir */
+    f->fat_bytes = (UINTN)f->fat_size * 512;
+    f->fat_entries = f->fat_bytes / 4;
+    f->fat = 0;
+}
+
+static EFI_STATUS fat32_load_fat(fat32_state *f) {
+    EFI_STATUS st = gBS->AllocatePool(EfiLoaderData, f->fat_bytes, (void **)&f->fat);
+    if (st != EFI_SUCCESS) return st;
+    /* Read existing FAT (has entries 0-2 set by format_fat32) */
+    return f->disk->ReadBlocks(f->disk, f->media_id, f->fat1_lba, f->fat_bytes, f->fat);
+}
+
+static EFI_STATUS fat32_flush_fat(fat32_state *f) {
+    EFI_STATUS st = f->disk->WriteBlocks(f->disk, f->media_id,
+                                          f->fat1_lba, f->fat_bytes, f->fat);
+    if (st != EFI_SUCCESS) return st;
+    return f->disk->WriteBlocks(f->disk, f->media_id,
+                                f->fat2_lba, f->fat_bytes, f->fat);
+}
+
+static void fat32_free(fat32_state *f) {
+    if (f->fat) { gBS->FreePool(f->fat); f->fat = 0; }
+}
+
+/* Get LBA for start of a cluster */
+static uint64_t cluster_lba(fat32_state *f, uint32_t cluster) {
+    return f->data_lba + (uint64_t)(cluster - 2) * f->spc;
+}
+
+/* Allocate N contiguous clusters, chain them in FAT, return first cluster */
+static uint32_t fat32_alloc(fat32_state *f, uint32_t n_clusters) {
+    uint32_t first = f->next_cluster;
+    for (uint32_t i = 0; i < n_clusters; i++) {
+        uint32_t c = first + i;
+        if (c >= f->fat_entries) return 0;  /* out of space */
+        f->fat[c] = (i + 1 < n_clusters) ? (c + 1) : 0x0FFFFFFF;
+    }
+    f->next_cluster = first + n_clusters;
+    return first;
+}
+
+/* Write a FAT32 8.3 directory entry */
+static void fat32_dir_entry(uint8_t *entry, const char *name83,
+                             uint8_t attr, uint32_t cluster, uint32_t size) {
+    memset(entry, 0, 32);
+    memcpy(entry, name83, 11);
+    entry[11] = attr;
+    /* First cluster high word */
+    entry[20] = (uint8_t)(cluster >> 16);
+    entry[21] = (uint8_t)(cluster >> 24);
+    /* First cluster low word */
+    entry[26] = (uint8_t)(cluster);
+    entry[27] = (uint8_t)(cluster >> 8);
+    /* File size */
+    *(uint32_t *)&entry[28] = size;
+}
+
+/* Write file data to allocated clusters via Block IO */
+static EFI_STATUS fat32_write_data(fat32_state *f, uint32_t cluster,
+                                    const void *data, UINTN size) {
+    const uint8_t *src = (const uint8_t *)data;
+    UINTN remaining = size;
+    uint32_t c = cluster;
+
+    while (remaining > 0 && c < f->fat_entries && c >= 2) {
+        UINTN chunk = remaining < f->cluster_bytes ? remaining : f->cluster_bytes;
+
+        /* Allocate a cluster-sized buffer (Block IO needs sector alignment) */
+        uint8_t *buf = 0;
+        EFI_STATUS st = gBS->AllocatePool(EfiLoaderData, f->cluster_bytes, (void **)&buf);
+        if (st != EFI_SUCCESS) return st;
+        memset(buf, 0, f->cluster_bytes);
+        memcpy(buf, src, chunk);
+
+        st = f->disk->WriteBlocks(f->disk, f->media_id,
+                                   cluster_lba(f, c), f->cluster_bytes, buf);
+        gBS->FreePool(buf);
+        if (st != EFI_SUCCESS) return st;
+
+        src += chunk;
+        remaining -= chunk;
+
+        /* Follow FAT chain */
+        uint32_t next = f->fat[c];
+        if (next >= 0x0FFFFFF8) break;
+        c = next;
+    }
+    return EFI_SUCCESS;
+}
+
+/* Create a directory in the FAT32 filesystem */
+static uint32_t fat32_mkdir(fat32_state *f, uint32_t parent_cluster,
+                             uint8_t *parent_dir, int *parent_idx,
+                             const char *name83) {
+    uint32_t dir_cluster = fat32_alloc(f, 1);
+    if (!dir_cluster) return 0;
+
+    /* Write directory entry in parent */
+    fat32_dir_entry(&parent_dir[*parent_idx * 32], name83, 0x10, dir_cluster, 0);
+    (*parent_idx)++;
+
+    /* Write . and .. in new directory */
+    uint8_t *dir = 0;
+    gBS->AllocatePool(EfiLoaderData, f->cluster_bytes, (void **)&dir);
+    if (!dir) return 0;
+    memset(dir, 0, f->cluster_bytes);
+
+    fat32_dir_entry(&dir[0],  ".          ", 0x10, dir_cluster, 0);
+    fat32_dir_entry(&dir[32], "..         ", 0x10, parent_cluster, 0);
+
+    f->disk->WriteBlocks(f->disk, f->media_id,
+                          cluster_lba(f, dir_cluster), f->cluster_bytes, dir);
+    gBS->FreePool(dir);
+    return dir_cluster;
+}
+
+/* Write all ESP files directly to FAT32 via Block IO.
+ * Layout:
+ *   Cluster 2: root dir -> EFI/, rwkvos/, workspace/, wifi.conf
+ *   Cluster 3: EFI/     -> BOOT/
+ *   Cluster 4: BOOT/    -> BOOTX64.EFI
+ *   Cluster 5: rwkvos/  -> vocab.btv
+ *   Cluster 6: workspace/ (empty)
+ *   Cluster 7+: file data
+ */
+static EFI_STATUS fat32_write_esp_files(EFI_BLOCK_IO_PROTOCOL *disk,
+                                         preread_file *efi_bin,
+                                         preread_file *vocab,
+                                         preread_file *wifi) {
+    fat32_state f;
+    fat32_init(&f, disk);
+
+    EFI_STATUS st = fat32_load_fat(&f);
+    if (st != EFI_SUCCESS) return st;
+
+    /* Root directory buffer (cluster 2, already allocated by format) */
+    uint8_t *root_dir = 0;
+    st = gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&root_dir);
+    if (st != EFI_SUCCESS) { fat32_free(&f); return st; }
+    memset(root_dir, 0, f.cluster_bytes);
+    int root_idx = 0;
+
+    /* Create EFI/ directory */
+    uint8_t *efi_dir = 0;
+    gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&efi_dir);
+    memset(efi_dir, 0, f.cluster_bytes);
+    int efi_idx = 2;  /* skip . and .. */
+
+    uint32_t efi_cluster = fat32_mkdir(&f, 2, root_dir, &root_idx, "EFI        ");
+
+    /* Create EFI/BOOT/ directory */
+    uint8_t *boot_dir = 0;
+    gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&boot_dir);
+    memset(boot_dir, 0, f.cluster_bytes);
+    int boot_idx = 2;  /* skip . and .. */
+
+    uint32_t boot_cluster = fat32_mkdir(&f, efi_cluster, efi_dir, &efi_idx, "BOOT       ");
+
+    /* Create rwkvos/ directory */
+    uint8_t *rwkvos_dir = 0;
+    gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&rwkvos_dir);
+    memset(rwkvos_dir, 0, f.cluster_bytes);
+    int rwkvos_idx = 2;  /* skip . and .. */
+
+    uint32_t rwkvos_cluster = fat32_mkdir(&f, 2, root_dir, &root_idx, "RWKVOS     ");
+
+    /* Create workspace/ directory */
+    fat32_mkdir(&f, 2, root_dir, &root_idx, "WORK       ");
+
+    /* Write BOOTX64.EFI */
+    if (efi_bin->data && efi_bin->size > 0) {
+        uint32_t n = (uint32_t)((efi_bin->size + f.cluster_bytes - 1) / f.cluster_bytes);
+        uint32_t fc = fat32_alloc(&f, n);
+        if (fc) {
+            fat32_dir_entry(&boot_dir[boot_idx * 32],
+                            "BOOTX64 EFI", 0x20, fc, (uint32_t)efi_bin->size);
+            boot_idx++;
+            st = fat32_write_data(&f, fc, efi_bin->data, efi_bin->size);
+            if (st == EFI_SUCCESS) {
+                efi_print_ascii("        BOOTX64.EFI (");
+                print_size_human(efi_bin->size);
+                efi_print_ascii(") OK\r\n");
+            } else {
+                efi_print_ascii("        BOOTX64.EFI WRITE FAILED\r\n");
+            }
+        }
+    } else {
+        efi_print_ascii("        BOOTX64.EFI -- not found on USB\r\n");
     }
 
-    UINTN write_size = read_size;
-    status = dst->Write(dst, &write_size, buf);
-    dst->Close(dst);
-    gBS->FreePages(phys, pages);
+    /* Write vocab.btv */
+    if (vocab->data && vocab->size > 0) {
+        uint32_t n = (uint32_t)((vocab->size + f.cluster_bytes - 1) / f.cluster_bytes);
+        uint32_t fc = fat32_alloc(&f, n);
+        if (fc) {
+            fat32_dir_entry(&rwkvos_dir[rwkvos_idx * 32],
+                            "VOCAB   BTV", 0x20, fc, (uint32_t)vocab->size);
+            rwkvos_idx++;
+            st = fat32_write_data(&f, fc, vocab->data, vocab->size);
+            if (st == EFI_SUCCESS) {
+                efi_print_ascii("        vocab.btv (");
+                print_size_human(vocab->size);
+                efi_print_ascii(") OK\r\n");
+            } else {
+                efi_print_ascii("        vocab.btv WRITE FAILED\r\n");
+            }
+        }
+    } else {
+        efi_print_ascii("        vocab.btv -- not found on USB\r\n");
+    }
 
-    efi_print_ascii(status == EFI_SUCCESS ? " OK\r\n" : " WRITE FAILED\r\n");
-    return status;
+    /* Write wifi.conf */
+    if (wifi->data && wifi->size > 0) {
+        uint32_t n = (uint32_t)((wifi->size + f.cluster_bytes - 1) / f.cluster_bytes);
+        uint32_t fc = fat32_alloc(&f, n);
+        if (fc) {
+            fat32_dir_entry(&root_dir[root_idx * 32],
+                            "WIFI    CON", 0x20, fc, (uint32_t)wifi->size);
+            root_idx++;
+            st = fat32_write_data(&f, fc, wifi->data, wifi->size);
+            if (st == EFI_SUCCESS) {
+                efi_print_ascii("        wifi.conf (");
+                print_size_human(wifi->size);
+                efi_print_ascii(") OK\r\n");
+            } else {
+                efi_print_ascii("        wifi.conf WRITE FAILED\r\n");
+            }
+        }
+    }
+
+    /* Write directory clusters to disk */
+    f.disk->WriteBlocks(f.disk, f.media_id,
+                         cluster_lba(&f, 2), f.cluster_bytes, root_dir);
+
+    /* Re-write EFI/ dir with BOOT entry */
+    {
+        /* Read what fat32_mkdir wrote, patch in BOOT entry */
+        uint8_t *buf = 0;
+        gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&buf);
+        memset(buf, 0, f.cluster_bytes);
+        fat32_dir_entry(&buf[0],  ".          ", 0x10, efi_cluster, 0);
+        fat32_dir_entry(&buf[32], "..         ", 0x10, 2, 0);
+        /* Copy entries from efi_dir starting at index 2 */
+        for (int i = 2; i < efi_idx; i++)
+            memcpy(&buf[i * 32], &efi_dir[i * 32], 32);
+        f.disk->WriteBlocks(f.disk, f.media_id,
+                             cluster_lba(&f, efi_cluster), f.cluster_bytes, buf);
+        gBS->FreePool(buf);
+    }
+
+    /* Re-write BOOT/ dir with BOOTX64.EFI entry */
+    {
+        uint8_t *buf = 0;
+        gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&buf);
+        memset(buf, 0, f.cluster_bytes);
+        fat32_dir_entry(&buf[0],  ".          ", 0x10, boot_cluster, 0);
+        fat32_dir_entry(&buf[32], "..         ", 0x10, efi_cluster, 0);
+        for (int i = 2; i < boot_idx; i++)
+            memcpy(&buf[i * 32], &boot_dir[i * 32], 32);
+        f.disk->WriteBlocks(f.disk, f.media_id,
+                             cluster_lba(&f, boot_cluster), f.cluster_bytes, buf);
+        gBS->FreePool(buf);
+    }
+
+    /* Re-write rwkvos/ dir with vocab entry */
+    {
+        uint8_t *buf = 0;
+        gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&buf);
+        memset(buf, 0, f.cluster_bytes);
+        fat32_dir_entry(&buf[0],  ".          ", 0x10, rwkvos_cluster, 0);
+        fat32_dir_entry(&buf[32], "..         ", 0x10, 2, 0);
+        for (int i = 2; i < rwkvos_idx; i++)
+            memcpy(&buf[i * 32], &rwkvos_dir[i * 32], 32);
+        f.disk->WriteBlocks(f.disk, f.media_id,
+                             cluster_lba(&f, rwkvos_cluster), f.cluster_bytes, buf);
+        gBS->FreePool(buf);
+    }
+
+    /* Flush FAT (both copies) */
+    fat32_flush_fat(&f);
+
+    /* Flush disk */
+    f.disk->FlushBlocks(f.disk);
+
+    gBS->FreePool(root_dir);
+    gBS->FreePool(efi_dir);
+    gBS->FreePool(boot_dir);
+    gBS->FreePool(rwkvos_dir);
+    fat32_free(&f);
+    return EFI_SUCCESS;
+}
+
+/* ================================================================== */
+/* Create UEFI NVRAM boot entry                                        */
+/*                                                                     */
+/* Writes a Boot0001 variable and updates BootOrder so the firmware    */
+/* knows to boot from our ESP on the HD. Without this, many machines   */
+/* (including Dell E6510) show "No bootable devices".                  */
+/* ================================================================== */
+
+/* EFI Global Variable GUID */
+static EFI_GUID gEfiGlobalVariableGuid = {
+    0x8BE4DF61, 0x93CA, 0x11d2,
+    {0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C}
+};
+
+/* Device path node header */
+typedef struct __attribute__((packed)) {
+    uint8_t  Type;
+    uint8_t  SubType;
+    uint16_t Length;
+} EFI_DP_NODE;
+
+/* Hard Drive device path node (42 bytes) */
+typedef struct __attribute__((packed)) {
+    EFI_DP_NODE Header;        /* Type=4, SubType=1, Length=42 */
+    uint32_t PartitionNumber;
+    uint64_t PartitionStart;
+    uint64_t PartitionSize;
+    uint8_t  Signature[16];    /* Partition GUID (mixed endian) */
+    uint8_t  MBRType;          /* 0x02 = GPT */
+    uint8_t  SignatureType;    /* 0x02 = GUID */
+} HD_DEVICE_PATH;
+
+static EFI_STATUS create_boot_entry(void) {
+    EFI_RUNTIME_SERVICES *gRT = gST->RuntimeServices;
+
+    /* Build the file path string in UCS-2 */
+    const char *fpath = "\\EFI\\BOOT\\BOOTX64.EFI";
+    int fpath_len = 0;
+    while (fpath[fpath_len]) fpath_len++;
+    uint16_t fpath_ucs2[32];
+    for (int i = 0; i <= fpath_len; i++)
+        fpath_ucs2[i] = (uint16_t)(unsigned char)fpath[i];
+
+    /* Device path:
+     *   HD node (42 bytes) + File node (4 + (fpath_len+1)*2) + End node (4) */
+    uint16_t file_node_len = (uint16_t)(4 + (fpath_len + 1) * 2);
+    uint16_t dp_total = 42 + file_node_len + 4;
+
+    /* Description "BootAI" in UCS-2 (7 uint16_t including null) */
+    uint16_t desc[] = { 'B','o','o','t','A','I', 0 };
+    uint16_t desc_bytes = 7 * 2;
+
+    /* Total EFI_LOAD_OPTION size */
+    UINTN opt_size = 4 + 2 + desc_bytes + dp_total;
+    uint8_t *opt = 0;
+    EFI_STATUS st = gBS->AllocatePool(EfiLoaderData, opt_size, (void **)&opt);
+    if (st != EFI_SUCCESS) return st;
+    memset(opt, 0, opt_size);
+
+    uint8_t *p = opt;
+
+    /* Attributes: LOAD_OPTION_ACTIVE */
+    *(uint32_t *)p = 0x00000001;
+    p += 4;
+
+    /* FilePathListLength */
+    *(uint16_t *)p = dp_total;
+    p += 2;
+
+    /* Description */
+    memcpy(p, desc, desc_bytes);
+    p += desc_bytes;
+
+    /* HD device path node */
+    HD_DEVICE_PATH *hd = (HD_DEVICE_PATH *)p;
+    hd->Header.Type = 0x04;      /* Media */
+    hd->Header.SubType = 0x01;   /* Hard Drive */
+    hd->Header.Length = 42;
+    hd->PartitionNumber = 1;
+    hd->PartitionStart = ESP_START_LBA;
+    hd->PartitionSize = ESP_SECTORS;
+    /* GPT partition GUID (mixed-endian as per UEFI spec) */
+    memcpy(hd->Signature, &esp_unique_guid, 16);
+    hd->MBRType = 0x02;          /* GPT */
+    hd->SignatureType = 0x02;    /* GUID signature */
+    p += 42;
+
+    /* File path device path node */
+    EFI_DP_NODE *fp = (EFI_DP_NODE *)p;
+    fp->Type = 0x04;             /* Media */
+    fp->SubType = 0x04;          /* File Path */
+    fp->Length = file_node_len;
+    memcpy(p + 4, fpath_ucs2, (fpath_len + 1) * 2);
+    p += file_node_len;
+
+    /* End device path node */
+    EFI_DP_NODE *end = (EFI_DP_NODE *)p;
+    end->Type = 0x7F;
+    end->SubType = 0xFF;
+    end->Length = 4;
+
+    /* Write Boot0001 variable */
+    uint16_t boot_name[] = { 'B','o','o','t','0','0','0','1', 0 };
+    uint32_t nv_attrs = EFI_VARIABLE_NON_VOLATILE |
+                        EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                        EFI_VARIABLE_RUNTIME_ACCESS;
+
+    st = gRT->SetVariable(boot_name, &gEfiGlobalVariableGuid, nv_attrs, opt_size, opt);
+    gBS->FreePool(opt);
+
+    if (st != EFI_SUCCESS) {
+        efi_print_ascii("        SetVariable Boot0001 failed: ");
+        print_dec64((uint64_t)st);
+        efi_print_ascii("\r\n");
+        return st;
+    }
+    efi_print_ascii("        Created Boot0001 NVRAM entry\r\n");
+
+    /* Update BootOrder: read existing, prepend 0x0001 */
+    uint16_t boot_order_name[] = { 'B','o','o','t','O','r','d','e','r', 0 };
+    uint8_t order_buf[256];
+    UINTN order_size = sizeof(order_buf);
+    uint32_t order_attrs = 0;
+
+    st = gRT->GetVariable(boot_order_name, &gEfiGlobalVariableGuid,
+                           &order_attrs, &order_size, order_buf);
+
+    uint8_t new_order[258];
+    *(uint16_t *)new_order = 0x0001;  /* Our entry first */
+    UINTN new_size = 2;
+
+    if (st == EFI_SUCCESS && order_size > 0) {
+        /* Append existing entries, skip any existing 0x0001 */
+        uint16_t *entries = (uint16_t *)order_buf;
+        int n = (int)(order_size / 2);
+        for (int i = 0; i < n && new_size < 256; i++) {
+            if (entries[i] != 0x0001) {
+                *(uint16_t *)(new_order + new_size) = entries[i];
+                new_size += 2;
+            }
+        }
+    }
+
+    st = gRT->SetVariable(boot_order_name, &gEfiGlobalVariableGuid, nv_attrs, new_size, new_order);
+    if (st != EFI_SUCCESS) {
+        efi_print_ascii("        SetVariable BootOrder failed: ");
+        print_dec64((uint64_t)st);
+        efi_print_ascii("\r\n");
+        return st;
+    }
+    efi_print_ascii("        Updated BootOrder (BootAI first)\r\n");
+
+    return EFI_SUCCESS;
 }
 
 /* ================================================================== */
@@ -779,109 +1184,685 @@ void ba_install_to_hd(void) {
         return;
     }
 
-    /* User confirmation */
-    efi_print_ascii("  WARNING: This will ERASE ALL DATA on the internal disk.\r\n");
-    efi_print_ascii("  All existing partitions and data will be destroyed.\r\n\r\n");
-    efi_print_ascii("  Type 'yes' to continue: ");
+    /* Step 1: Read ALL files from USB into memory FIRST.
+     * Don't rely on efi_fs_root() — Dell has multiple SimpleFileSystem
+     * volumes (HP Port Rep, BOOTAI USB) and LocateProtocol may find
+     * the wrong one. Enumerate all volumes and find ours. */
+    efi_print_ascii("  [1/6] Reading files from USB...\r\n");
 
-    char confirm[16];
-    int clen = efi_read_line(confirm, sizeof(confirm));
-    if (clen != 3 || confirm[0] != 'y' || confirm[1] != 'e' || confirm[2] != 's') {
-        efi_print_ascii("\r\n  Aborted.\r\n");
-        return;
-    }
-    efi_print_ascii("\r\n");
+    EFI_STATUS st;
+    EFI_FILE_PROTOCOL *usb_root = 0;
+    {
+        UINTN n_fs = 0;
+        EFI_HANDLE *fs_handles = 0;
+        st = gBS->LocateHandleBuffer(
+            2 /* ByProtocol */, &gEfiSimpleFileSystemProtocolGuid, 0,
+            &n_fs, &fs_handles);
+        if (st == EFI_SUCCESS) {
+            efi_print_ascii("        Found ");
+            print_dec64(n_fs);
+            efi_print_ascii(" filesystem(s), probing...\r\n");
 
-    /* Step 2: Write GPT */
-    efi_print_ascii("  [1/6] Writing GPT partition table...");
-    EFI_STATUS st = write_protective_mbr(disk);
-    if (st != EFI_SUCCESS) {
-        efi_print_ascii(" FAILED (MBR)\r\n");
-        return;
+            for (UINTN fi = 0; fi < n_fs; fi++) {
+                EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
+                st = gBS->HandleProtocol(fs_handles[fi],
+                    &gEfiSimpleFileSystemProtocolGuid, (void **)&fs);
+                if (st != EFI_SUCCESS || !fs) continue;
+
+                EFI_FILE_PROTOCOL *vol = 0;
+                st = fs->OpenVolume(fs, &vol);
+                if (st != EFI_SUCCESS || !vol) continue;
+
+                /* Probe: try opening our EFI binary */
+                uint16_t probe_path[32];
+                ascii_to_ucs2("\\EFI\\BOOT\\BOOTX64.EFI", probe_path, 32);
+                EFI_FILE_PROTOCOL *probe = 0;
+                st = vol->Open(vol, &probe, probe_path, EFI_FILE_MODE_READ, 0);
+                if (st == EFI_SUCCESS && probe) {
+                    probe->Close(probe);
+                    usb_root = vol;
+                    efi_print_ascii("        Found BOOTAI volume (fs ");
+                    print_dec64(fi);
+                    efi_print_ascii(")\r\n");
+                    break;
+                }
+                vol->Close(vol);
+            }
+            gBS->FreePool(fs_handles);
+        }
     }
+
+    preread_file pr_efi = {0}, pr_vocab = {0}, pr_wifi = {0};
+    if (usb_root) {
+        EFI_STATUS ps;
+        ps = preread_usb_file(usb_root, "\\EFI\\BOOT\\BOOTX64.EFI", &pr_efi);
+        efi_print_ascii("        BOOTX64.EFI: ");
+        if (pr_efi.data) { print_size_human(pr_efi.size); }
+        else { efi_print_ascii("not found ("); print_dec64((uint64_t)ps); efi_print_ascii(")"); }
+        efi_print_ascii("\r\n");
+
+        ps = preread_usb_file(usb_root, "\\rwkvos\\vocab.btv", &pr_vocab);
+        efi_print_ascii("        vocab.btv:   ");
+        if (pr_vocab.data) { print_size_human(pr_vocab.size); }
+        else { efi_print_ascii("not found ("); print_dec64((uint64_t)ps); efi_print_ascii(")"); }
+        efi_print_ascii("\r\n");
+
+        ps = preread_usb_file(usb_root, "\\wifi.conf", &pr_wifi);
+        efi_print_ascii("        wifi.conf:   ");
+        if (pr_wifi.data) { print_size_human(pr_wifi.size); }
+        else { efi_print_ascii("not found ("); print_dec64((uint64_t)ps); efi_print_ascii(")"); }
+        efi_print_ascii("\r\n");
+    } else {
+        efi_print_ascii("        ERROR: USB root is NULL\r\n");
+    }
+
+    /* Also pre-read model for raw partition copy */
+    preread_file pr_model = {0};
+    if (usb_root) {
+        preread_usb_file(usb_root, "\\rwkvos\\model.btw", &pr_model);
+        efi_print_ascii("        model.btw:   ");
+        if (pr_model.data) { print_size_human(pr_model.size); }
+        else { efi_print_ascii("not found"); }
+        efi_print_ascii("\r\n");
+    }
+
+    /* Step 2: Write GPT partition table + protective MBR.
+     * UEFI firmware on fixed/internal drives requires GPT — the removable
+     * media fallback path (\EFI\BOOT\BOOTX64.EFI) only auto-discovers on
+     * USB. Internal drives need GPT + NVRAM boot entries. */
+    efi_print_ascii("  [2/6] Writing GPT partition table...");
     st = write_gpt(disk);
     if (st != EFI_SUCCESS) {
-        efi_print_ascii(" FAILED (GPT)\r\n");
-        return;
+        efi_print_ascii(" FAILED\r\n");
+        goto cleanup;
     }
     efi_print_ascii(" OK\r\n");
 
     /* Step 3: Format ESP */
-    efi_print_ascii("  [2/6] Formatting FAT32 (100 MB ESP)...");
+    efi_print_ascii("  [3/6] Formatting FAT32 (100 MB ESP)...");
     st = format_fat32(disk);
     if (st != EFI_SUCCESS) {
         efi_print_ascii(" FAILED\r\n");
-        return;
+        goto cleanup;
     }
     efi_print_ascii(" OK\r\n");
 
     /* Step 4: Copy model to raw partition */
-    uint64_t raw_end = disk->Media->LastBlock - 33;
-    uint64_t raw_size = (raw_end - RAW_START_LBA + 1) * 512ULL;
+    {
+        uint64_t raw_end = disk->Media->LastBlock - 33; /* backup GPT entries */
+        uint64_t raw_size = (raw_end - RAW_START_LBA + 1) * 512ULL;
 
-    efi_print_ascii("  [3/6] Copying model to data partition (");
-    print_size_human(raw_size);
-    efi_print_ascii(" available)...\r\n");
+        efi_print_ascii("  [4/6] Copying model to data partition (");
+        print_size_human(raw_size);
+        efi_print_ascii(")...\r\n");
 
-    st = copy_model_to_raw(disk, RAW_START_LBA, raw_size);
-    if (st == EFI_SUCCESS) {
-        efi_print_ascii("\r\n        OK\r\n");
-    } else if (st == EFI_NOT_FOUND) {
-        efi_print_ascii("        model.btw not found on USB — skipped\r\n");
-    } else {
-        efi_print_ascii("\r\n        FAILED\r\n");
-        return;
+        if (pr_model.data && pr_model.size > 0) {
+            /* Write model from pre-read buffer */
+            efi_print_ascii("        model.btw (");
+            print_size_human(pr_model.size);
+            efi_print_ascii(")\r\n");
+
+            if (BTAI_DATA_OFFSET + pr_model.size > raw_size) {
+                efi_print_ascii("        ERROR: Not enough space\r\n");
+            } else {
+                uint32_t media_id = disk->Media->MediaId;
+                uint64_t data_lba = RAW_START_LBA + (BTAI_DATA_OFFSET / 512);
+                uint8_t *src = (uint8_t *)pr_model.data;
+                uint64_t written = 0;
+                UINTN chunk_size = 1024 * 1024;
+                uint8_t *chunk = 0;
+                gBS->AllocatePool(EfiLoaderData, chunk_size, (void **)&chunk);
+
+                while (written < pr_model.size && chunk) {
+                    UINTN to_copy = chunk_size;
+                    if (written + to_copy > pr_model.size)
+                        to_copy = (UINTN)(pr_model.size - written);
+                    UINTN aligned = (to_copy + 511) & ~(UINTN)511;
+                    memset(chunk, 0, aligned);
+                    memcpy(chunk, src + written, to_copy);
+                    st = disk->WriteBlocks(disk, media_id, data_lba, aligned, chunk);
+                    if (st != EFI_SUCCESS) break;
+                    written += to_copy;
+                    data_lba += aligned / 512;
+                    print_progress(written, pr_model.size);
+                }
+                if (chunk) gBS->FreePool(chunk);
+
+                if (written >= pr_model.size) {
+                    /* Write TOC */
+                    uint8_t *toc = 0;
+                    gBS->AllocatePool(EfiLoaderData, BTAI_DATA_OFFSET, (void **)&toc);
+                    if (toc) {
+                        memset(toc, 0, BTAI_DATA_OFFSET);
+                        btai_header *hdr = (btai_header *)toc;
+                        hdr->magic = BTAI_MAGIC;
+                        hdr->version = BTAI_VERSION;
+                        hdr->entry_count = 1;
+                        hdr->partition_size = raw_size;
+                        hdr->data_offset = BTAI_DATA_OFFSET;
+                        hdr->next_free = BTAI_DATA_OFFSET + pr_model.size;
+                        btai_entry *ent = (btai_entry *)(toc + sizeof(btai_header));
+                        const char *nm = "model.btw";
+                        for (int i = 0; nm[i]; i++) ent->name[i] = nm[i];
+                        ent->offset = BTAI_DATA_OFFSET;
+                        ent->size = pr_model.size;
+                        ent->flags = 0;
+                        disk->WriteBlocks(disk, media_id, RAW_START_LBA, BTAI_DATA_OFFSET, toc);
+                        gBS->FreePool(toc);
+                    }
+                    disk->FlushBlocks(disk);
+                    efi_print_ascii("\r\n        OK\r\n");
+                } else {
+                    efi_print_ascii("\r\n        WRITE FAILED\r\n");
+                }
+            }
+        } else {
+            efi_print_ascii("        model.btw not found on USB -- skipped\r\n");
+        }
     }
 
-    /* Step 5: Mount new ESP */
-    efi_print_ascii("  [4/6] Mounting new filesystem...");
-    EFI_FILE_PROTOCOL *hd_root = 0;
-    st = reconnect_and_find_volume(disk_handle, &hd_root);
+    /* Step 5: Write files directly to FAT32 via Block IO */
+    efi_print_ascii("  [5/6] Writing files to ESP:\r\n");
+
+    st = fat32_write_esp_files(disk, &pr_efi, &pr_vocab, &pr_wifi);
     if (st != EFI_SUCCESS) {
-        /* Retry once after longer delay */
-        efi_print_ascii(" retrying...");
-        gBS->Stall(3000000);
-        st = reconnect_and_find_volume(disk_handle, &hd_root);
+        efi_print_ascii("        FAT32 write FAILED\r\n");
+        goto cleanup;
     }
-    if (st != EFI_SUCCESS) {
-        efi_print_ascii(" FAILED\r\n");
-        efi_print_ascii("  Firmware could not mount the new partition.\r\n");
-        return;
+    /* Step 6: Verify data integrity (CRC32 hash comparison USB vs HD) */
+    efi_print_ascii("  [6/7] Verifying data integrity (CRC32)...\r\n");
+    {
+        fat32_state vf;
+        fat32_init(&vf, disk);
+        uint32_t mid = disk->Media->MediaId;
+
+        /* Track cluster offsets: dirs use 3,4,5,6; files start at 7 */
+        uint32_t next_file_cluster = 7;
+
+        /* --- BOOTX64.EFI --- */
+        if (pr_efi.data && pr_efi.size > 0) {
+            uint32_t usb_crc = crc32(pr_efi.data, (int)pr_efi.size);
+            efi_print_ascii("        BOOTX64.EFI  USB: ");
+            print_hex32(usb_crc);
+            efi_print_ascii("\r\n");
+
+            /* Read back from HD clusters (contiguous starting at cluster 7) */
+            uint32_t n_clusters = (uint32_t)((pr_efi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
+            UINTN read_total = (UINTN)n_clusters * vf.cluster_bytes;
+            uint64_t phys = 0;
+            UINTN pages = (read_total + 4095) / 4096;
+            st = gBS->AllocatePages(0, EfiLoaderData, pages, &phys);
+            if (st == EFI_SUCCESS) {
+                uint8_t *rb = (uint8_t *)(UINTN)phys;
+                st = disk->ReadBlocks(disk, mid,
+                                       cluster_lba(&vf, next_file_cluster),
+                                       read_total, rb);
+                if (st == EFI_SUCCESS) {
+                    uint32_t hd_crc = crc32(rb, (int)pr_efi.size);
+                    efi_print_ascii("        BOOTX64.EFI   HD: ");
+                    print_hex32(hd_crc);
+                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
+                    /* Also check MZ header */
+                    if (rb[0] != 'M' || rb[1] != 'Z')
+                        efi_print_ascii("        WARNING: No MZ header!\r\n");
+                } else {
+                    efi_print_ascii("        BOOTX64.EFI   HD: read failed\r\n");
+                }
+                gBS->FreePages(phys, pages);
+            }
+            next_file_cluster += (uint32_t)((pr_efi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
+        }
+
+        /* --- vocab.btv --- */
+        if (pr_vocab.data && pr_vocab.size > 0) {
+            uint32_t usb_crc = crc32(pr_vocab.data, (int)pr_vocab.size);
+            efi_print_ascii("        vocab.btv    USB: ");
+            print_hex32(usb_crc);
+            efi_print_ascii("\r\n");
+
+            uint32_t n_clusters = (uint32_t)((pr_vocab.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
+            UINTN read_total = (UINTN)n_clusters * vf.cluster_bytes;
+            uint64_t phys = 0;
+            UINTN pages = (read_total + 4095) / 4096;
+            st = gBS->AllocatePages(0, EfiLoaderData, pages, &phys);
+            if (st == EFI_SUCCESS) {
+                uint8_t *rb = (uint8_t *)(UINTN)phys;
+                st = disk->ReadBlocks(disk, mid,
+                                       cluster_lba(&vf, next_file_cluster),
+                                       read_total, rb);
+                if (st == EFI_SUCCESS) {
+                    uint32_t hd_crc = crc32(rb, (int)pr_vocab.size);
+                    efi_print_ascii("        vocab.btv     HD: ");
+                    print_hex32(hd_crc);
+                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
+                } else {
+                    efi_print_ascii("        vocab.btv     HD: read failed\r\n");
+                }
+                gBS->FreePages(phys, pages);
+            }
+            next_file_cluster += n_clusters;
+        }
+
+        /* --- wifi.conf --- */
+        if (pr_wifi.data && pr_wifi.size > 0) {
+            uint32_t usb_crc = crc32(pr_wifi.data, (int)pr_wifi.size);
+            efi_print_ascii("        wifi.conf    USB: ");
+            print_hex32(usb_crc);
+            efi_print_ascii("\r\n");
+
+            uint32_t n_clusters = (uint32_t)((pr_wifi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
+            UINTN read_total = (UINTN)n_clusters * vf.cluster_bytes;
+            uint64_t phys = 0;
+            UINTN pages = (read_total + 4095) / 4096;
+            st = gBS->AllocatePages(0, EfiLoaderData, pages, &phys);
+            if (st == EFI_SUCCESS) {
+                uint8_t *rb = (uint8_t *)(UINTN)phys;
+                st = disk->ReadBlocks(disk, mid,
+                                       cluster_lba(&vf, next_file_cluster),
+                                       read_total, rb);
+                if (st == EFI_SUCCESS) {
+                    uint32_t hd_crc = crc32(rb, (int)pr_wifi.size);
+                    efi_print_ascii("        wifi.conf     HD: ");
+                    print_hex32(hd_crc);
+                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
+                } else {
+                    efi_print_ascii("        wifi.conf     HD: read failed\r\n");
+                }
+                gBS->FreePages(phys, pages);
+            }
+        }
+
+        /* --- model.btw (raw partition, read in 1MB chunks) --- */
+        if (pr_model.data && pr_model.size > 0) {
+            uint32_t usb_crc = crc32(pr_model.data, (int)pr_model.size);
+            efi_print_ascii("        model.btw    USB: ");
+            print_hex32(usb_crc);
+            efi_print_ascii("\r\n");
+
+            /* Read back from raw partition in 1MB chunks, compute CRC incrementally */
+            uint64_t data_lba = RAW_START_LBA + (BTAI_DATA_OFFSET / 512);
+            UINTN chunk = 1024 * 1024;
+            uint8_t *cbuf = 0;
+            gBS->AllocatePool(EfiLoaderData, chunk, (void **)&cbuf);
+            if (cbuf) {
+                uint32_t hd_crc = 0xFFFFFFFF;
+                uint64_t remaining = pr_model.size;
+                uint64_t cur_lba = data_lba;
+                int read_ok = 1;
+                while (remaining > 0) {
+                    UINTN to_read = (remaining < chunk) ? (UINTN)remaining : chunk;
+                    UINTN aligned = (to_read + 511) & ~(UINTN)511;
+                    st = disk->ReadBlocks(disk, mid, cur_lba, aligned, cbuf);
+                    if (st != EFI_SUCCESS) { read_ok = 0; break; }
+                    /* Incremental CRC32 */
+                    const uint8_t *cp = cbuf;
+                    for (UINTN ci = 0; ci < to_read; ci++)
+                        hd_crc = (hd_crc >> 8) ^ crc32_table[(hd_crc ^ cp[ci]) & 0xFF];
+                    cur_lba += aligned / 512;
+                    remaining -= to_read;
+                }
+                hd_crc ^= 0xFFFFFFFF;
+                if (read_ok) {
+                    efi_print_ascii("        model.btw     HD: ");
+                    print_hex32(hd_crc);
+                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
+                } else {
+                    efi_print_ascii("        model.btw     HD: read failed\r\n");
+                }
+                gBS->FreePool(cbuf);
+            }
+        }
+
+        /* Try ConnectController to see if firmware can mount the partition */
+        efi_print_ascii("        Reconnecting disk...\r\n");
+        gBS->DisconnectController(disk_handle, 0, 0);
+        gBS->ConnectController(disk_handle, 0, 0, 1);
+        gBS->Stall(2000000);  /* 2 seconds */
+
+        /* Check if firmware created SimpleFileSystem on the partition */
+        UINTN n_fs2 = 0;
+        EFI_HANDLE *fs2 = 0;
+        gBS->LocateHandleBuffer(2, &gEfiSimpleFileSystemProtocolGuid, 0, &n_fs2, &fs2);
+        efi_print_ascii("        SimpleFileSystem handles after reconnect: ");
+        print_dec64(n_fs2);
+        efi_print_ascii("\r\n");
+        if (fs2) gBS->FreePool(fs2);
     }
-    efi_print_ascii(" OK\r\n");
 
-    /* Step 6a: Create directories */
-    efi_print_ascii("  [5/6] Creating directories...");
-    create_dir(hd_root, "EFI");
-    create_dir(hd_root, "EFI\\BOOT");
-    create_dir(hd_root, "rwkvos");
-    create_dir(hd_root, "workspace");
-    efi_print_ascii(" OK\r\n");
+    /* Step 7: Create UEFI boot entry in NVRAM */
+    efi_print_ascii("  [7/7] Creating boot entry...\r\n");
+    create_boot_entry();
 
-    /* Step 6b: Copy files to ESP */
-    efi_print_ascii("  [6/6] Copying files:\r\n");
-    EFI_FILE_PROTOCOL *usb_root = efi_fs_root();
-
-    copy_file_to_esp(usb_root, "EFI\\BOOT\\BOOTX64.EFI",
-                     hd_root, "EFI\\BOOT\\BOOTX64.EFI", "BOOTX64.EFI");
-    copy_file_to_esp(usb_root, "rwkvos\\vocab.btv",
-                     hd_root, "rwkvos\\vocab.btv", "vocab.btv");
-    copy_file_to_esp(usb_root, "wifi.conf",
-                     hd_root, "wifi.conf", "wifi.conf");
-
-    hd_root->Close(hd_root);
+cleanup:
+    preread_free(&pr_efi);
+    preread_free(&pr_vocab);
+    preread_free(&pr_wifi);
+    preread_free(&pr_model);
+    if (st != EFI_SUCCESS) return;
 
     /* Summary */
     efi_print_ascii("\r\n  Installation complete!\r\n");
     efi_print_ascii("  Remove USB drive and reboot to boot from hard drive.\r\n\r\n");
 
-    /* Offer reboot */
-    efi_print_ascii("  Reboot now? (y/n): ");
-    char yn[8];
-    efi_read_line(yn, sizeof(yn));
-    if (yn[0] == 'y' || yn[0] == 'Y') {
-        efi_reboot();
+}
+
+/* ================================================================== */
+/* HD Inspector — read and dump HD contents via Block IO               */
+/* ================================================================== */
+
+static void print_guid(const EFI_GUID *g) {
+    print_hex32(g->Data1);
+    efi_print_ascii("-");
+    /* Data2, Data3 as 16-bit */
+    print_hex8((uint8_t)(g->Data2 >> 8));
+    print_hex8((uint8_t)(g->Data2));
+    efi_print_ascii("-");
+    print_hex8((uint8_t)(g->Data3 >> 8));
+    print_hex8((uint8_t)(g->Data3));
+    efi_print_ascii("-");
+    print_hex8(g->Data4[0]);
+    print_hex8(g->Data4[1]);
+    efi_print_ascii("-");
+    for (int i = 2; i < 8; i++) print_hex8(g->Data4[i]);
+}
+
+void ba_hdinfo(void) {
+    efi_print_ascii("\r\n  [HD Inspector]\r\n\r\n");
+
+    /* Find internal disk */
+    EFI_BLOCK_IO_PROTOCOL *disk = 0;
+    EFI_HANDLE disk_handle = 0;
+    if (find_internal_disk(&disk, &disk_handle) != EFI_SUCCESS) {
+        efi_print_ascii("  ERROR: No internal drive found\r\n");
+        return;
     }
+
+    uint64_t disk_bytes = (disk->Media->LastBlock + 1) * 512ULL;
+    uint32_t media_id = disk->Media->MediaId;
+    efi_print_ascii("  Disk: ");
+    print_size_human(disk_bytes);
+    efi_print_ascii(" (MediaId ");
+    print_dec64(media_id);
+    efi_print_ascii(", LastBlock ");
+    print_dec64(disk->Media->LastBlock);
+    efi_print_ascii(")\r\n\r\n");
+
+    /* Read LBA 0 (MBR) */
+    uint8_t *sector = 0;
+    EFI_STATUS st = gBS->AllocatePool(EfiLoaderData, 512, (void **)&sector);
+    if (st != EFI_SUCCESS) { efi_print_ascii("  AllocatePool failed\r\n"); return; }
+
+    st = disk->ReadBlocks(disk, media_id, 0, 512, sector);
+    if (st != EFI_SUCCESS) {
+        efi_print_ascii("  Read LBA 0 failed\r\n");
+        gBS->FreePool(sector);
+        return;
+    }
+    efi_print_ascii("  === MBR (LBA 0) ===\r\n");
+    efi_print_ascii("  Boot signature: ");
+    print_hex8(sector[510]); print_hex8(sector[511]);
+    efi_print_ascii(sector[510] == 0x55 && sector[511] == 0xAA ? " (valid)\r\n" : " (INVALID)\r\n");
+    efi_print_ascii("  Disk ID: ");
+    print_hex32(*(uint32_t *)&sector[440]);
+    efi_print_ascii("\r\n");
+
+    /* Show MBR partition entries (4 entries at offsets 446, 462, 478, 494) */
+    efi_print_ascii("\r\n  === MBR Partitions ===\r\n");
+    for (int pi = 0; pi < 4; pi++) {
+        uint8_t *pe = &sector[446 + pi * 16];
+        uint8_t type = pe[4];
+        if (type == 0) continue;  /* empty entry */
+
+        uint32_t lba_start = *(uint32_t *)&pe[8];
+        uint32_t lba_count = *(uint32_t *)&pe[12];
+
+        efi_print_ascii("  [");
+        char pnum[2] = { '1' + pi, 0 };
+        efi_print_ascii(pnum);
+        efi_print_ascii("] Type: ");
+        print_hex8(type);
+        if (type == 0xEF) efi_print_ascii(" (EFI System)");
+        else if (type == 0xDA) efi_print_ascii(" (BootAI Data)");
+        else if (type == 0xEE) efi_print_ascii(" (GPT protective)");
+        efi_print_ascii(pe[0] == 0x80 ? "  *BOOTABLE*" : "");
+        efi_print_ascii("\r\n      LBA ");
+        print_dec64(lba_start);
+        efi_print_ascii(" - ");
+        print_dec64(lba_start + lba_count - 1);
+        efi_print_ascii(" (");
+        print_size_human((uint64_t)lba_count * 512);
+        efi_print_ascii(")\r\n");
+    }
+
+    /* Read FAT32 BPB from ESP (LBA 2048) */
+    efi_print_ascii("\r\n  === FAT32 BPB (ESP at LBA ");
+    print_dec64(ESP_START_LBA);
+    efi_print_ascii(") ===\r\n");
+    st = disk->ReadBlocks(disk, media_id, ESP_START_LBA, 512, sector);
+    if (st == EFI_SUCCESS) {
+        efi_print_ascii("  OEM: ");
+        for (int i = 3; i < 11; i++) {
+            char c[2] = { (char)sector[i], 0 };
+            efi_print_ascii(c);
+        }
+        efi_print_ascii("\r\n  BytsPerSec: ");
+        print_dec64(*(uint16_t *)&sector[11]);
+        efi_print_ascii("\r\n  SecPerClus: ");
+        print_dec64(sector[13]);
+        efi_print_ascii("\r\n  RsvdSecCnt: ");
+        print_dec64(*(uint16_t *)&sector[14]);
+        efi_print_ascii("\r\n  NumFATs:    ");
+        print_dec64(sector[16]);
+        efi_print_ascii("\r\n  TotSec32:   ");
+        print_dec64(*(uint32_t *)&sector[32]);
+        efi_print_ascii("\r\n  FATSz32:    ");
+        print_dec64(*(uint32_t *)&sector[36]);
+        efi_print_ascii("\r\n  RootClus:   ");
+        print_dec64(*(uint32_t *)&sector[44]);
+        efi_print_ascii("\r\n  Signature:  ");
+        print_hex8(sector[510]); print_hex8(sector[511]);
+        efi_print_ascii(sector[510] == 0x55 && sector[511] == 0xAA ? " (valid)" : " (INVALID)");
+        efi_print_ascii("\r\n  VolLabel:   ");
+        for (int i = 71; i < 82; i++) {
+            char c[2] = { (char)sector[i], 0 };
+            efi_print_ascii(c);
+        }
+        efi_print_ascii("\r\n  FSType:     ");
+        for (int i = 82; i < 90; i++) {
+            char c[2] = { (char)sector[i], 0 };
+            efi_print_ascii(c);
+        }
+        efi_print_ascii("\r\n");
+
+        /* Compute data region and read root directory */
+        uint32_t spc = sector[13];
+        uint32_t reserved = *(uint16_t *)&sector[14];
+        uint32_t fat_size = *(uint32_t *)&sector[36];
+        uint32_t num_fats = sector[16];
+        uint64_t data_lba = ESP_START_LBA + reserved + num_fats * fat_size;
+
+        efi_print_ascii("\r\n  === Root Directory (cluster 2 at LBA ");
+        print_dec64(data_lba);
+        efi_print_ascii(") ===\r\n");
+
+        uint32_t cluster_bytes = spc * 512;
+        uint8_t *root = 0;
+        st = gBS->AllocatePool(EfiLoaderData, cluster_bytes, (void **)&root);
+        if (st == EFI_SUCCESS) {
+            st = disk->ReadBlocks(disk, media_id, data_lba, cluster_bytes, root);
+            if (st == EFI_SUCCESS) {
+                for (uint32_t i = 0; i < cluster_bytes / 32; i++) {
+                    uint8_t *e = &root[i * 32];
+                    if (e[0] == 0x00) break;      /* end of dir */
+                    if (e[0] == 0xE5) continue;    /* deleted */
+                    if (e[11] == 0x0F) continue;   /* LFN entry */
+
+                    efi_print_ascii("  ");
+                    /* Print 8.3 name */
+                    for (int j = 0; j < 8; j++) {
+                        char c[2] = { (char)e[j], 0 };
+                        efi_print_ascii(c);
+                    }
+                    efi_print_ascii(".");
+                    for (int j = 8; j < 11; j++) {
+                        char c[2] = { (char)e[j], 0 };
+                        efi_print_ascii(c);
+                    }
+
+                    uint32_t clust = ((uint32_t)e[20] << 16) | ((uint32_t)e[21] << 24) |
+                                      (uint32_t)e[26] | ((uint32_t)e[27] << 8);
+                    uint32_t fsize = *(uint32_t *)&e[28];
+
+                    if (e[11] & 0x10) {
+                        efi_print_ascii("  <DIR>");
+                    } else {
+                        efi_print_ascii("  ");
+                        print_size_human(fsize);
+                    }
+                    efi_print_ascii("  (cluster ");
+                    print_dec64(clust);
+                    efi_print_ascii(")\r\n");
+
+                    /* If it's a directory, list its contents too */
+                    if ((e[11] & 0x10) && clust >= 2 && e[0] != '.') {
+                        uint64_t sub_lba = data_lba + (uint64_t)(clust - 2) * spc;
+                        uint8_t *sub = 0;
+                        gBS->AllocatePool(EfiLoaderData, cluster_bytes, (void **)&sub);
+                        if (sub) {
+                            st = disk->ReadBlocks(disk, media_id, sub_lba, cluster_bytes, sub);
+                            if (st == EFI_SUCCESS) {
+                                for (uint32_t j = 0; j < cluster_bytes / 32; j++) {
+                                    uint8_t *se = &sub[j * 32];
+                                    if (se[0] == 0x00) break;
+                                    if (se[0] == 0xE5) continue;
+                                    if (se[11] == 0x0F) continue;
+
+                                    efi_print_ascii("    ");
+                                    for (int k = 0; k < 8; k++) {
+                                        char c[2] = { (char)se[k], 0 };
+                                        efi_print_ascii(c);
+                                    }
+                                    efi_print_ascii(".");
+                                    for (int k = 8; k < 11; k++) {
+                                        char c[2] = { (char)se[k], 0 };
+                                        efi_print_ascii(c);
+                                    }
+
+                                    uint32_t sc = ((uint32_t)se[20] << 16) | ((uint32_t)se[21] << 24) |
+                                                   (uint32_t)se[26] | ((uint32_t)se[27] << 8);
+                                    uint32_t ss = *(uint32_t *)&se[28];
+                                    if (se[11] & 0x10) {
+                                        efi_print_ascii("  <DIR>");
+                                    } else {
+                                        efi_print_ascii("  ");
+                                        print_size_human(ss);
+                                    }
+                                    efi_print_ascii("  (cluster ");
+                                    print_dec64(sc);
+                                    efi_print_ascii(")\r\n");
+
+                                    /* 3rd level: list sub-subdirectory */
+                                    if ((se[11] & 0x10) && sc >= 2 && se[0] != '.') {
+                                        uint64_t sub2_lba = data_lba + (uint64_t)(sc - 2) * spc;
+                                        uint8_t *sub2 = 0;
+                                        gBS->AllocatePool(EfiLoaderData, cluster_bytes, (void **)&sub2);
+                                        if (sub2) {
+                                            disk->ReadBlocks(disk, media_id, sub2_lba, cluster_bytes, sub2);
+                                            for (uint32_t m = 0; m < cluster_bytes / 32; m++) {
+                                                uint8_t *te = &sub2[m * 32];
+                                                if (te[0] == 0x00) break;
+                                                if (te[0] == 0xE5) continue;
+                                                if (te[11] == 0x0F) continue;
+                                                efi_print_ascii("      ");
+                                                for (int k = 0; k < 8; k++) {
+                                                    char c[2] = { (char)te[k], 0 };
+                                                    efi_print_ascii(c);
+                                                }
+                                                efi_print_ascii(".");
+                                                for (int k = 8; k < 11; k++) {
+                                                    char c[2] = { (char)te[k], 0 };
+                                                    efi_print_ascii(c);
+                                                }
+                                                uint32_t tc = ((uint32_t)te[20] << 16) | ((uint32_t)te[21] << 24) |
+                                                               (uint32_t)te[26] | ((uint32_t)te[27] << 8);
+                                                uint32_t ts = *(uint32_t *)&te[28];
+                                                if (te[11] & 0x10) {
+                                                    efi_print_ascii("  <DIR>");
+                                                } else {
+                                                    efi_print_ascii("  ");
+                                                    print_size_human(ts);
+                                                }
+                                                efi_print_ascii("  (cluster ");
+                                                print_dec64(tc);
+                                                efi_print_ascii(")\r\n");
+                                            }
+                                            gBS->FreePool(sub2);
+                                        }
+                                    }
+                                }
+                            }
+                            gBS->FreePool(sub);
+                        }
+                    }
+                }
+            } else {
+                efi_print_ascii("  Read root dir failed\r\n");
+            }
+            gBS->FreePool(root);
+        }
+    } else {
+        efi_print_ascii("  Read ESP BPB failed\r\n");
+    }
+
+    /* Read BTAI TOC from raw partition */
+    efi_print_ascii("\r\n  === BTAI Raw Partition (LBA ");
+    print_dec64(RAW_START_LBA);
+    efi_print_ascii(") ===\r\n");
+    uint8_t *toc_buf = 0;
+    st = gBS->AllocatePool(EfiLoaderData, 4096, (void **)&toc_buf);
+    if (st == EFI_SUCCESS) {
+        st = disk->ReadBlocks(disk, media_id, RAW_START_LBA, 4096, toc_buf);
+        if (st == EFI_SUCCESS) {
+            btai_header *bh = (btai_header *)toc_buf;
+            efi_print_ascii("  Magic: ");
+            print_hex32(bh->magic);
+            if (bh->magic == BTAI_MAGIC) {
+                efi_print_ascii(" (BTAI valid)\r\n");
+                efi_print_ascii("  Version: ");
+                print_dec64(bh->version);
+                efi_print_ascii("\r\n  Entries: ");
+                print_dec64(bh->entry_count);
+                efi_print_ascii("\r\n  Partition size: ");
+                print_size_human(bh->partition_size);
+                efi_print_ascii("\r\n  Data offset: ");
+                print_dec64(bh->data_offset);
+                efi_print_ascii("\r\n  Next free: ");
+                print_dec64(bh->next_free);
+                efi_print_ascii("\r\n");
+
+                btai_entry *ents = (btai_entry *)(toc_buf + sizeof(btai_header));
+                for (uint32_t i = 0; i < bh->entry_count && i < BTAI_MAX_ENTRIES; i++) {
+                    efi_print_ascii("  [");
+                    print_dec64(i);
+                    efi_print_ascii("] \"");
+                    efi_print_ascii(ents[i].name);
+                    efi_print_ascii("\" offset=");
+                    print_dec64(ents[i].offset);
+                    efi_print_ascii(" size=");
+                    print_size_human(ents[i].size);
+                    efi_print_ascii(" flags=");
+                    print_dec64(ents[i].flags);
+                    efi_print_ascii("\r\n");
+                }
+            } else {
+                efi_print_ascii(" (NOT BTAI)\r\n");
+            }
+        }
+        gBS->FreePool(toc_buf);
+    }
+
+    gBS->FreePool(sector);
+    efi_print_ascii("\r\n");
 }
 
 /* ================================================================== */
@@ -915,7 +1896,6 @@ EFI_STATUS ba_raw_read_entry(const char *name, void **buffer, UINTN *size) {
                                       (void **)&bio);
         if (status != EFI_SUCCESS || !bio) continue;
         if (!bio->Media || !bio->Media->MediaPresent) continue;
-        if (bio->Media->RemovableMedia) continue;
         if (!bio->Media->LogicalPartition) continue;
 
         /* Read first 8 sectors (4KB TOC) */

@@ -110,6 +110,14 @@ void ns_poll(void) {
         ns_arp_handle(frame, frame_len);
         break;
     case 0x0800:  /* IPv4 */
+        /* Learn source MAC→IP from every IPv4 frame (not just ARP).
+         * This keeps the ARP table fresh and prevents eviction of
+         * active TCP peers by other devices' ARP broadcasts. */
+        if (frame_len >= 14 + 20) {
+            const uint8_t *src_mac = frame + 6;        /* Ethernet src MAC */
+            const uint8_t *src_ip  = frame + 14 + 12;  /* IPv4 src IP */
+            ns_arp_learn(src_ip, src_mac);
+        }
         ns_ip_handle(frame, frame_len);
         break;
     default:

@@ -83,6 +83,7 @@ typedef struct {
     float *k_cache;     /* [max_len * n_kv_heads * head_dim] per layer */
     float *v_cache;     /* [max_len * n_kv_heads * head_dim] per layer */
     int cache_len;      /* current number of tokens cached */
+    int cache_start;    /* ring buffer start index */
     int max_len;        /* capacity */
 } ba_kv_layer;
 

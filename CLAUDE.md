@@ -90,6 +90,41 @@ python3 tools/export_weights.py --model Qwen/Qwen2.5-Coder-7B-Instruct --quant q
 |------|------|------|
 | `PROD=1` | Skip boot menu and REPL, boot straight into chat inference | Production/demo builds |
 
+## OTA Firmware Update (Preferred)
+
+When the Dell is running and serving (after `serve 8080`), use OTA instead of USB flashing:
+
+```bash
+# 1. Build
+make clean && make efi
+
+# 2. Push firmware to Dell
+curl -H "Authorization: Bearer bootai" \
+     --data-binary @all_bootai.efi \
+     http://<DELL_IP>:8080/api/update
+
+# 3. Reboot into new firmware
+curl -H "Authorization: Bearer bootai" \
+     -d '{"cmd":"reboot"}' \
+     http://<DELL_IP>:8080/api/cmd
+
+# 4. After reboot, user must run `serve 8080` on Dell keyboard
+
+# 5. Verify
+curl -H "Authorization: Bearer bootai" http://<DELL_IP>:8080/api/health
+```
+
+Other useful API commands:
+```bash
+curl -H "Authorization: Bearer bootai" -d '{"cmd":"meminfo"}' http://<DELL_IP>:8080/api/cmd
+curl -H "Authorization: Bearer bootai" -d '{"cmd":"hdinfo"}'  http://<DELL_IP>:8080/api/cmd
+curl -H "Authorization: Bearer bootai" http://<DELL_IP>:8080/api/log
+```
+
+**Important:** Do NOT run `make run` or any QEMU commands from Claude — they are interactive. Build only, never run.
+
+See `docs/architecture/management-api.md` for full API documentation.
+
 ## Flashing USB
 
 The USB drive is FAT32 with an existing EFI directory structure. To flash the latest build, mount and copy — do NOT use `dd` or `sudo`:

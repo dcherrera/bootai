@@ -55,6 +55,61 @@ static void arp_insert(const uint8_t *ip, const uint8_t *mac) {
     arp_table[0].valid = 1;
 }
 
+/* ---- Public: learn MAC from non-ARP frames ---- */
+
+void ns_arp_learn(const uint8_t *ip, const uint8_t *mac) {
+    /* Don't learn 0.0.0.0 or broadcast */
+    if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) return;
+    if (ip[0] == 255 && ip[1] == 255 && ip[2] == 255 && ip[3] == 255) return;
+    arp_insert(ip, mac);
+}
+
+/* ---- Public: dump ARP table for diagnostics ---- */
+
+void ns_arp_dump(void) {
+    efi_print_ascii("  ARP table (");
+    /* Count valid entries */
+    int count = 0;
+    for (int i = 0; i < NS_ARP_TABLE_SIZE; i++)
+        if (arp_table[i].valid) count++;
+
+    char num[4];
+    int ni = 0;
+    if (count >= 10) num[ni++] = '0' + count / 10;
+    num[ni++] = '0' + count % 10;
+    num[ni] = '\0';
+    efi_print_ascii(num);
+    efi_print_ascii(" entries):\r\n");
+
+    for (int i = 0; i < NS_ARP_TABLE_SIZE; i++) {
+        if (!arp_table[i].valid) continue;
+        efi_print_ascii("    ");
+        /* Print IP */
+        for (int j = 0; j < 4; j++) {
+            int v = arp_table[i].ip[j];
+            char d[4]; int di = 0;
+            if (v >= 100) d[di++] = '0' + v / 100;
+            if (v >= 10) d[di++] = '0' + (v / 10) % 10;
+            d[di++] = '0' + v % 10;
+            d[di] = '\0';
+            efi_print_ascii(d);
+            if (j < 3) efi_print_ascii(".");
+        }
+        efi_print_ascii(" -> ");
+        /* Print MAC */
+        for (int j = 0; j < 6; j++) {
+            uint8_t b = arp_table[i].mac[j];
+            char hex[3];
+            hex[0] = "0123456789ABCDEF"[b >> 4];
+            hex[1] = "0123456789ABCDEF"[b & 0xF];
+            hex[2] = 0;
+            efi_print_ascii(hex);
+            if (j < 5) efi_print_ascii(":");
+        }
+        efi_print_ascii("\r\n");
+    }
+}
+
 /* ---- Build ARP packet (28 bytes) ---- */
 
 static void arp_build(uint8_t *pkt, uint16_t opcode,

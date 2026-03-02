@@ -52,7 +52,40 @@ static inline float sse_hsum(v4sf v) {
     return sums[0];
 }
 
-/* ---- f16 conversion ---- */
+/* ---- Batch f16→f32 SSE conversion (4 values at once) ---- */
+
+/*
+ * Convert 4 packed F16 values to 4 F32 values using SSE2 integer ops.
+ * No F16C or SSE4.1 required — works on Westmere and any SSE2 CPU.
+ * Denormals are flushed to zero (safe for trained model weights).
+ */
+static inline v4sf f16x4_to_f32_sse(const uint16_t *p) {
+    /* Load 4 uint16 into integer registers and unpack manually */
+    uint32_t h0 = p[0], h1 = p[1], h2 = p[2], h3 = p[3];
+
+    /* Unpack each f16 to f32 using integer arithmetic */
+    union { uint32_t i; float f; } u0, u1, u2, u3;
+
+    #define F16_TO_F32_FAST(h, u) do { \
+        uint32_t sign = (h >> 15) << 31; \
+        uint32_t exp  = (h >> 10) & 0x1F; \
+        uint32_t mant = h & 0x3FF; \
+        if (exp == 0) { u.i = sign; } /* flush denormals to zero */ \
+        else if (exp == 31) { u.i = sign | 0x7F800000 | (mant << 13); } \
+        else { u.i = sign | ((exp + 112) << 23) | (mant << 13); } \
+    } while(0)
+
+    F16_TO_F32_FAST(h0, u0);
+    F16_TO_F32_FAST(h1, u1);
+    F16_TO_F32_FAST(h2, u2);
+    F16_TO_F32_FAST(h3, u3);
+
+    #undef F16_TO_F32_FAST
+
+    return (v4sf){u0.f, u1.f, u2.f, u3.f};
+}
+
+/* ---- f16 conversion (scalar) ---- */
 
 #ifdef __F16C__
 /* Use hardware F16C instruction (vcvtph2ps) without immintrin.h
@@ -172,9 +205,7 @@ static void matvec_f16(const float *x, const uint16_t *w_f16, float *out,
         v4sf acc = sse_setzero();
         int j = 0;
         for (; j + 3 < cols; j += 4) {
-            /* Software F16→F32 batch of 4 */
-            v4sf w = {f16_to_f32(row[j]), f16_to_f32(row[j+1]),
-                      f16_to_f32(row[j+2]), f16_to_f32(row[j+3])};
+            v4sf w = f16x4_to_f32_sse(&row[j]);
             v4sf xv = sse_load(&x[j]);
             acc = sse_add(acc, sse_mul(w, xv));
         }
@@ -201,10 +232,15 @@ float* ba_qwen_forward(ba_model *m, int token) {
     int group   = n_q / n_kv;
     int pos     = m->position;
 
-    /* Step 1: Embedding lookup (f16 → f32) */
+    /* Step 1: Embedding lookup (f16 → f32, SSE batch of 4) */
     const uint16_t *emb_row = &m->embed[(size_t)token * c];
-    for (int i = 0; i < c; i++)
-        ws->x[i] = f16_to_f32(emb_row[i]);
+    {
+        int i = 0;
+        for (; i + 3 < c; i += 4)
+            sse_store(&ws->x[i], f16x4_to_f32_sse(&emb_row[i]));
+        for (; i < c; i++)
+            ws->x[i] = f16_to_f32(emb_row[i]);
+    }
 
     /* Step 2: Transformer layers */
     for (int layer = 0; layer < cfg->n_layers; layer++) {
@@ -260,7 +296,8 @@ float* ba_qwen_forward(ba_model *m, int token) {
             /* Compute attention scores (SSE 4-wide dot products) */
             float max_s = -1e30f;
             for (int t = 0; t < total; t++) {
-                float *kt = &kv_l->k_cache[t * kv_dim + kvh * hd];
+                int idx = (kv_l->cache_start + t) % kv_l->max_len;
+                float *kt = &kv_l->k_cache[idx * kv_dim + kvh * hd];
                 v4sf acc = sse_setzero();
                 int j = 0;
                 for (; j + 3 < hd; j += 4)
@@ -286,7 +323,8 @@ float* ba_qwen_forward(ba_model *m, int token) {
             /* Value aggregation (SSE 4-wide) */
             float *y_head = &ws->attn_out[qh * hd];
             for (int t = 0; t < total; t++) {
-                float *vt = &kv_l->v_cache[t * kv_dim + kvh * hd];
+                int vidx = (kv_l->cache_start + t) % kv_l->max_len;
+                float *vt = &kv_l->v_cache[vidx * kv_dim + kvh * hd];
                 v4sf sv = sse_set1(scores[t]);
                 int j = 0;
                 for (; j + 3 < hd; j += 4)

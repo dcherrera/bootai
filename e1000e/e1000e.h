@@ -28,6 +28,8 @@ int  e1000e_transmit(const uint8_t *frame, int len);
 int  e1000e_send(const uint8_t *dst_mac, uint16_t ethertype,
                  const uint8_t *payload, int payload_len);
 void e1000e_arp_cmd(void);
+uint32_t e1000e_tx_ok_count(void);
+uint32_t e1000e_tx_fail_count(void);
 
 /* Phase 4: SNP-compatible wrappers for ns_* network stack */
 int  e1000e_snp_is_installed(void);

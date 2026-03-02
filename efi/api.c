@@ -33,6 +33,16 @@ extern void resp_append(http_response *r, const char *s, int n);
 extern void resp_append_str(http_response *r, const char *s);
 extern void resp_append_int(http_response *r, int val);
 
+/* ---- Timing (rdtsc) ---- */
+
+static inline uint64_t rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+/* Dell E6510 Core i5-560M: ~2.53 GHz */
+#define CYCLES_PER_MS 2530000ULL
+
 /* ---- Freestanding helpers ---- */
 
 static int api_strlen(const char *s) {
@@ -345,6 +355,20 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
 
     /* Build chat template from messages */
     int ci = 0;
+
+    /* Inject default system prompt if none provided (matches chat REPL) */
+    int has_system = 0;
+    for (int m = 0; m < n_msgs; m++) {
+        if (msgs[m].role_len == 6 && api_strncmp(msgs[m].role, "system", 6) == 0) {
+            has_system = 1;
+            break;
+        }
+    }
+    if (!has_system) {
+        ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE,
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n");
+    }
+
     for (int m = 0; m < n_msgs; m++) {
         ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE, "<|im_start|>");
         ci = buf_add_n(chat_buf, ci, CHAT_BUF_SIZE, msgs[m].role, msgs[m].role_len);
@@ -369,9 +393,11 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
 
     /* Prefill */
     float *logits = 0;
+    uint64_t t_prefill_start = rdtsc();
     for (int i = 0; i < n_prompt; i++) {
         logits = ba_model_forward(g_model, &token_buf[i], 1);
     }
+    uint64_t t_prefill_end = rdtsc();
 
     if (!logits) {
         const char *err = "{\"error\":{\"message\":\"forward pass failed\",\"type\":\"server_error\"}}";
@@ -393,6 +419,7 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
     int n_gen = 0;
     char decode_buf[64];
 
+    uint64_t t_decode_start = rdtsc();
     for (int i = 0; i < max_tokens; i++) {
         int next = ba_model_sample(logits, vocab, &cfg);
         if (next == eos_id || next == im_end_id) break;
@@ -406,7 +433,15 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
         n_gen++;
         logits = ba_model_forward(g_model, &next, 1);
     }
+    uint64_t t_decode_end = rdtsc();
     gen_buf[gen_pos] = '\0';
+
+    /* Compute timing metrics */
+    uint64_t prefill_ms = (t_prefill_end - t_prefill_start) / CYCLES_PER_MS;
+    uint64_t decode_ms  = (t_decode_end - t_decode_start) / CYCLES_PER_MS;
+    uint64_t prefill_tps = prefill_ms > 0 ? (uint64_t)n_prompt * 1000 / prefill_ms : 0;
+    uint64_t decode_tps  = decode_ms > 0 ? (uint64_t)n_gen * 1000 / decode_ms : 0;
+    uint64_t total_ms = prefill_ms + decode_ms;
 
     /* Build OpenAI-compatible JSON response */
     static char json_body[GEN_BUF_SIZE + 1024];
@@ -460,6 +495,45 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
         if (v == 0) { num[ni++] = '0'; }
         else { char tmp[12]; int ti = 0;
             while (v > 0) { tmp[ti++] = '0' + v % 10; v /= 10; }
+            while (ti > 0) num[ni++] = tmp[--ti];
+        }
+        for (int k = 0; k < ni; k++) json_body[ji++] = num[k];
+    }
+
+    s = ",\"prefill_tok_s\":";
+    while (*s) json_body[ji++] = *s++;
+
+    {
+        char num[12]; int ni = 0; uint64_t v = prefill_tps;
+        if (v == 0) { num[ni++] = '0'; }
+        else { char tmp[12]; int ti = 0;
+            while (v > 0) { tmp[ti++] = '0' + (char)(v % 10); v /= 10; }
+            while (ti > 0) num[ni++] = tmp[--ti];
+        }
+        for (int k = 0; k < ni; k++) json_body[ji++] = num[k];
+    }
+
+    s = ",\"decode_tok_s\":";
+    while (*s) json_body[ji++] = *s++;
+
+    {
+        char num[12]; int ni = 0; uint64_t v = decode_tps;
+        if (v == 0) { num[ni++] = '0'; }
+        else { char tmp[12]; int ti = 0;
+            while (v > 0) { tmp[ti++] = '0' + (char)(v % 10); v /= 10; }
+            while (ti > 0) num[ni++] = tmp[--ti];
+        }
+        for (int k = 0; k < ni; k++) json_body[ji++] = num[k];
+    }
+
+    s = ",\"inference_ms\":";
+    while (*s) json_body[ji++] = *s++;
+
+    {
+        char num[12]; int ni = 0; uint64_t v = total_ms;
+        if (v == 0) { num[ni++] = '0'; }
+        else { char tmp[12]; int ti = 0;
+            while (v > 0) { tmp[ti++] = '0' + (char)(v % 10); v /= 10; }
             while (ti > 0) num[ni++] = tmp[--ti];
         }
         for (int k = 0; k < ni; k++) json_body[ji++] = num[k];
