@@ -11,6 +11,30 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* ---- f16 → f32 scalar conversion (used by loader.c for bulk conversion) ---- */
+static inline float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            union { uint32_t i; float f; } u = { .i = sign };
+            return u.f;
+        }
+        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+        exp++; mant &= 0x3FF;
+    } else if (exp == 31) {
+        union { uint32_t i; float f; } u = { .i = sign | 0x7F800000 | (mant << 13) };
+        return u.f;
+    }
+
+    union { uint32_t i; float f; } u = {
+        .i = sign | ((exp + 112) << 23) | (mant << 13)
+    };
+    return u.f;
+}
+
 /* Freestanding allocator (provided by efi/uefi_libc.c on bare metal) */
 void* uefi_malloc(size_t n);
 void* uefi_calloc(size_t count, size_t size);
@@ -52,11 +76,11 @@ typedef struct {
 /* ---- Per-layer weights ---- */
 
 typedef struct {
-    /* Attention Q/K/V/O projections (F16) */
-    uint16_t *q_proj;   /* [q_dim * n_embd] */
-    uint16_t *k_proj;   /* [kv_dim * n_embd] */
-    uint16_t *v_proj;   /* [kv_dim * n_embd] */
-    uint16_t *o_proj;   /* [n_embd * q_dim] */
+    /* Attention Q/K/V/O projections (F32, pre-converted from F16 at load) */
+    float *q_proj;      /* [q_dim * n_embd] */
+    float *k_proj;      /* [kv_dim * n_embd] */
+    float *v_proj;      /* [kv_dim * n_embd] */
+    float *o_proj;      /* [n_embd * q_dim] */
 
     /* QK-Norm weights (f32, NULL if not present) */
     float *q_norm;      /* [head_dim] */
@@ -71,10 +95,19 @@ typedef struct {
     float *ln1_w;       /* [n_embd] input layernorm */
     float *ln2_w;       /* [n_embd] post-attention layernorm */
 
-    /* FFN projections (F16) */
-    uint16_t *gate_proj; /* [ffn_dim * n_embd] */
-    uint16_t *up_proj;   /* [ffn_dim * n_embd] */
-    uint16_t *down_proj; /* [n_embd * ffn_dim] */
+    /* FFN projections (F32, pre-converted from F16 at load) */
+    float *gate_proj;    /* [ffn_dim * n_embd] */
+    float *up_proj;      /* [ffn_dim * n_embd] */
+    float *down_proj;    /* [n_embd * ffn_dim] */
+
+    /* Q8 projections (populated when quant==2, zero otherwise) */
+    ba_q8_weight q_proj_q8;
+    ba_q8_weight k_proj_q8;
+    ba_q8_weight v_proj_q8;
+    ba_q8_weight o_proj_q8;
+    ba_q8_weight gate_proj_q8;
+    ba_q8_weight up_proj_q8;
+    ba_q8_weight down_proj_q8;
 } ba_layer_weights;
 
 /* ---- KV cache ---- */
@@ -122,13 +155,16 @@ typedef struct {
 typedef struct ba_model {
     ba_model_config config;
     ba_model_arch arch;
+    int quant;              /* 0=f32, 1=f16, 2=q8 (from .btw header) */
     int position;           /* current sequence position */
 
-    /* Weights */
-    uint16_t *embed;        /* [vocab_size * n_embd] f16 embeddings */
+    /* Weights (F32, pre-converted from F16 at load) */
+    float *embed;           /* [vocab_size * n_embd] embeddings (F32) — NULL if f16 mode */
+    uint16_t *embed_f16;    /* [vocab_size * n_embd] embeddings (F16) — NULL if f32 mode */
     ba_layer_weights *layers;  /* [n_layers] */
     float *ln_out_w;        /* [n_embd] final norm weight */
-    uint16_t *lm_head;      /* [vocab_size * n_embd] f16 lm_head */
+    float *lm_head;         /* [vocab_size * n_embd] lm_head (F32) — NULL if f16 mode */
+    ba_q8_weight lm_head_q8; /* Q8 lm_head (quantized from F16 embed at load) */
     int shared_embed_lmhead; /* 1 if lm_head == embed */
 
     /* State */
@@ -164,8 +200,10 @@ ba_model_arch ba_model_arch_of(const ba_model *m);
 /* Run forward pass — returns logits for next token */
 float* ba_model_forward(ba_model *m, const int *tokens, int n_tokens);
 
-/* Sample next token from logits */
-int ba_model_sample(const float *logits, int vocab_size, ba_sample_config *config);
+/* Sample next token from logits.
+ * recent/n_recent: token history for repeat penalty (NULL/0 to disable). */
+int ba_model_sample(const float *logits, int vocab_size, ba_sample_config *config,
+                    const int *recent, int n_recent);
 
 /* Reset model state (clear KV cache) */
 void ba_model_reset(ba_model *m);

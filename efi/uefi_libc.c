@@ -562,35 +562,55 @@ double tanh(double x) { return (double)tanhf((float)x); }
 /* ================================================================= */
 
 typedef struct {
-    void    *raw;     /* original AllocatePool pointer (for FreePool) */
-    uint64_t size;    /* user-requested size */
-    uint64_t magic;   /* corruption guard */
+    void    *raw;     /* original pointer (for FreePool/FreePages) */
+    uint64_t size;    /* total allocation size (for FreePages page count) */
+    uint64_t magic;   /* corruption guard + allocation method */
 } alloc_header_t;     /* 24 bytes on x86_64 */
 
-#define ALLOC_MAGIC      0xBABECAFE00C0FFEEULL
-#define ALLOC_MAGIC_POOL 0xBABECAFE00DEADULL  /* allocated from reclaimed pool */
+#define ALLOC_MAGIC       0xBABECAFE00C0FFEEULL  /* AllocatePool */
+#define ALLOC_MAGIC_PAGES 0xBABECAFEA110CA6EULL  /* AllocatePages */
+#define ALLOC_MAGIC_POOL  0xBABECAFE00DEADULL    /* reclaimed BS pool */
 
 void* uefi_malloc(size_t n) {
     if (!gBS || n == 0) return (void *)0;
 
     size_t total = n + sizeof(alloc_header_t) + 16;
     void *raw = (void *)0;
-    int from_pool = 0;
+    int method = 0;  /* 0=pool, 1=pages, 2=reclaimed */
 
+    /* Try 1: AllocatePool (fastest, firmware-tracked) */
     EFI_STATUS status = gBS->AllocatePool(EfiLoaderData, total, &raw);
+
     if (status != EFI_SUCCESS || !raw) {
-        /* AllocatePool failed — try reclaimed memory pool */
-        raw = ba_mem_alloc(total);
-        if (!raw) return (void *)0;
-        from_pool = 1;
+        /* Try 2: AllocatePages (gets ConventionalMemory, firmware-safe)
+         * This succeeds where AllocatePool fails because AllocatePool
+         * has an internal pool limit, while AllocatePages can use any
+         * free conventional memory pages. */
+        UINTN pages = (total + 4095) / 4096;
+        uint64_t phys = 0;
+        status = gBS->AllocatePages(0 /* AllocateAnyPages */, EfiLoaderData,
+                                     pages, &phys);
+        if (status == EFI_SUCCESS) {
+            raw = (void *)(UINTN)phys;
+            method = 1;
+        } else {
+            /* Try 3: Reclaimed BS memory pool (last resort).
+             * This memory may conflict with firmware operations —
+             * use bounce buffers for any UEFI I/O into this memory. */
+            raw = ba_mem_alloc(total);
+            if (!raw) return (void *)0;
+            method = 2;
+        }
     }
 
     uintptr_t user = ((uintptr_t)raw + sizeof(alloc_header_t) + 15) & ~(uintptr_t)15;
 
     alloc_header_t *hdr = ((alloc_header_t *)user) - 1;
     hdr->raw = raw;
-    hdr->size = n;
-    hdr->magic = from_pool ? ALLOC_MAGIC_POOL : ALLOC_MAGIC;
+    hdr->size = total;  /* store total for FreePages page count */
+    hdr->magic = method == 2 ? ALLOC_MAGIC_POOL
+               : method == 1 ? ALLOC_MAGIC_PAGES
+               : ALLOC_MAGIC;
 
     return (void *)user;
 }
@@ -612,14 +632,18 @@ void* uefi_realloc(void *ptr, size_t n) {
     if (n == 0) { uefi_free(ptr); return (void *)0; }
 
     alloc_header_t *hdr = ((alloc_header_t *)ptr) - 1;
-    if (hdr->magic != ALLOC_MAGIC && hdr->magic != ALLOC_MAGIC_POOL) return (void *)0;
+    if (hdr->magic != ALLOC_MAGIC && hdr->magic != ALLOC_MAGIC_PAGES
+        && hdr->magic != ALLOC_MAGIC_POOL)
+        return (void *)0;
 
-    size_t old_size = hdr->size;
+    /* Compute usable size from total allocation minus overhead */
+    size_t old_usable = hdr->size > (sizeof(alloc_header_t) + 16)
+                      ? hdr->size - sizeof(alloc_header_t) - 16 : 0;
 
     void *new_ptr = uefi_malloc(n);
     if (!new_ptr) return (void *)0;
 
-    size_t copy_size = old_size < n ? old_size : n;
+    size_t copy_size = old_usable < n ? old_usable : n;
     uint8_t *dst = (uint8_t *)new_ptr;
     uint8_t *src = (uint8_t *)ptr;
     for (size_t i = 0; i < copy_size; i++) dst[i] = src[i];
@@ -635,6 +659,10 @@ void uefi_free(void *ptr) {
     if (hdr->magic == ALLOC_MAGIC) {
         hdr->magic = 0;
         gBS->FreePool(hdr->raw);
+    } else if (hdr->magic == ALLOC_MAGIC_PAGES) {
+        hdr->magic = 0;
+        UINTN pages = (hdr->size + 4095) / 4096;
+        gBS->FreePages((uint64_t)(UINTN)hdr->raw, pages);
     } else if (hdr->magic == ALLOC_MAGIC_POOL) {
         /* Bump allocator — can't free individual allocations.
          * Memory stays allocated until reboot. Fine for model

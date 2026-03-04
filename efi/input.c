@@ -8,6 +8,21 @@
 
 #include "efi.h"
 
+void efi_keyboard_init(void) {
+    if (!gBS) return;
+
+    /* Locate Simple Text Input Ex protocol to control toggle state */
+    EFI_GUID ex_guid = { 0xDD9E7534, 0x7762, 0x4698,
+                         {0x8C, 0x14, 0xF5, 0x85, 0x17, 0xA6, 0x25, 0xAA} };
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = 0;
+    EFI_STATUS status = gBS->LocateProtocol(&ex_guid, 0, (void **)&ex);
+    if (status != EFI_SUCCESS || !ex) return;
+
+    /* Clear all toggle states (CapsLock, NumLock, ScrollLock) */
+    EFI_KEY_TOGGLE_STATE state = EFI_TOGGLE_STATE_VALID; /* no lock bits = all off */
+    ex->SetState(ex, &state);
+}
+
 EFI_STATUS efi_read_key(EFI_INPUT_KEY *key) {
     if (!gST || !gST->ConIn || !key) {
         return EFI_NOT_READY;

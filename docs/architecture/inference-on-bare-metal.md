@@ -125,11 +125,11 @@ Tested hardware: Surface Pro 7 (Intel Ice Lake, 4GB RAM).
 ## Model Architecture (SmolLM2-135M)
 
 ```
-Token → Embedding lookup (F16 → F32)
+Token → Embedding lookup (F32 memcpy)
   ↓
 30x Transformer Block:
   ├─ RMSNorm (pre-attention)
-  ├─ Q/K/V projections (F16 matvec)
+  ├─ Q/K/V projections (F32 SSE matvec)
   ├─ RoPE (halved/rotate_half pairing)
   ├─ GQA attention (9 Q heads, 3 KV heads, head_dim=64)
   ├─ Output projection + residual
@@ -137,11 +137,12 @@ Token → Embedding lookup (F16 → F32)
   ├─ SwiGLU FFN (gate * silu(up), then down projection)
   └─ FFN residual
   ↓
-Final RMSNorm → LM Head (F16 matvec) → Logits
+Final RMSNorm → LM Head (F32 SSE matvec) → Logits
 ```
 
-- **Weights:** F16 (10-bit mantissa, lossless from BF16 source)
-- **Activations:** F32 throughout (W16A32)
+- **Weights on disk:** F16 (10-bit mantissa, lossless from BF16 source)
+- **Weights in memory:** F32 (pre-converted from F16 at load time — see [weight-loading-strategy.md](weight-loading-strategy.md))
+- **Activations:** F32 throughout
 - **KV cache:** F32, pre-allocated per layer
 - **Tied embeddings:** `lm_head` shares weights with `embed_tokens`
 - **RoPE theta:** 100,000 (rope_theta from config.json)
@@ -150,21 +151,26 @@ Final RMSNorm → LM Head (F16 matvec) → Logits
 ## Memory Layout
 
 ```
-SmolLM2-135M F16 weights:   ~257 MB
-KV cache (512 context):       ~7 MB
-Workspace (activations):      ~2 MB
-UEFI + framebuffer:          ~64 MB
+SmolLM2-135M F32 weights:   ~512 MB  (pre-converted from 257 MB F16 on disk)
+F16 raw buffer (norms/bias): ~257 MB  (kept alive for F32 norm weights)
+KV cache (2048 context):      ~28 MB
+Workspace (activations):       ~2 MB
+RoPE sin/cos cache:            ~1 MB
 ─────────────────────────────────────
-Total:                       ~330 MB
+Total:                       ~886 MB  (measured on Dell E6510)
 ```
 
-Easily fits in QEMU's 8GB allocation. On real hardware, any machine with 1GB+ RAM can run this model.
+Fits in the Dell E6510's 8 GB RAM with 7.2 GB still available. On real hardware, any machine with 2 GB+ RAM can run this model.
 
 ## Key Technical Decisions
 
-### F16 weights instead of INT8
+### F32 pre-converted weights (small models)
 
-SmolLM2-135M is small enough (135M params) that F16 weights fit easily in memory. F16 preserves all precision from the original BF16 weights (BF16 has 7 mantissa bits, F16 has 10). INT8 quantization on a model this small causes measurable quality loss.
+Weights are stored on disk as F16 but converted to F32 at model load time. This eliminates F16→F32 conversion from the matvec inner loop, yielding an **8x decode speedup** (1.5 → 12 tok/s on the Dell E6510). The tradeoff is 2x weight memory — acceptable for small models but not viable for 7B+ models. See [weight-loading-strategy.md](weight-loading-strategy.md) for details.
+
+### No INT8 at 135M parameters
+
+SmolLM2-135M is too small for INT8 quantization — measurable quality loss at 135M params. F16 preserves all precision from the original BF16 weights (BF16 has 7 mantissa bits, F16 has 10).
 
 ### RoPE: halved format (rotate_half)
 
@@ -187,4 +193,4 @@ UEFI firmware does not enable AVX (CR4.OSXSAVE is not set, XSAVE state not confi
 
 The F16C instruction `vcvtph2ps` uses VEX encoding, so hardware f16-to-f32 conversion cannot be used. The compiler flag `-mf16c` must NOT be used because it causes GCC to emit VEX-encoded instructions throughout the generated code (not just f16 conversion).
 
-BootAI uses a software f16-to-f32 conversion via bit manipulation instead. SSE (up to SSE4.2) is safe — UEFI guarantees SSE state is configured.
+BootAI uses a software f16-to-f32 conversion via bit manipulation (`f16_to_f32()` in `model.h`). This runs once at model load time to pre-convert all F16 weights to F32. The forward pass operates entirely on F32 data using SSE (up to SSE4.2), which UEFI guarantees is configured.

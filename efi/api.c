@@ -273,6 +273,76 @@ extern void http_format_response(http_response *resp, int status_code,
                                   const char *content_type,
                                   const char *body, int body_len);
 
+/* ---- Streaming: detect "stream":true in JSON body ---- */
+
+int api_has_stream_true(const char *body, int body_len) {
+    /* Scan for "stream" key with value true */
+    const char *key = "\"stream\"";
+    int klen = 8;
+    for (int i = 0; i + klen + 4 < body_len; i++) {
+        if (api_strncmp(body + i, key, klen) == 0) {
+            /* Skip past "stream" : */
+            int j = i + klen;
+            while (j < body_len && (body[j] == ':' || body[j] == ' ')) j++;
+            if (j + 4 <= body_len && api_strncmp(body + j, "true", 4) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---- SSE helpers for streaming responses ---- */
+
+#define SSE_BUF_SIZE 1024
+static char sse_buf[SSE_BUF_SIZE];
+
+/*
+ * Send one SSE chunk with a token. If is_final, sends empty delta + finish_reason:"stop".
+ * Returns 0 on success, -1 on send failure (connection dropped).
+ */
+static int sse_send_chunk(tcp4_conn_t *client, const char *text, int text_len,
+                           int is_final) {
+    int bi = 0;
+    const char *s;
+
+    s = "data: {\"id\":\"chatcmpl-bootai\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{";
+    while (*s && bi < SSE_BUF_SIZE - 128) sse_buf[bi++] = *s++;
+
+    if (!is_final && text && text_len > 0) {
+        s = "\"content\":\"";
+        while (*s) sse_buf[bi++] = *s++;
+        bi += json_escape(sse_buf + bi, SSE_BUF_SIZE - bi - 64, text, text_len);
+        sse_buf[bi++] = '"';
+    }
+
+    s = "},\"finish_reason\":";
+    while (*s && bi < SSE_BUF_SIZE - 32) sse_buf[bi++] = *s++;
+
+    if (is_final) {
+        s = "\"stop\"";
+    } else {
+        s = "null";
+    }
+    while (*s) sse_buf[bi++] = *s++;
+
+    s = "}]}\n\n";
+    while (*s) sse_buf[bi++] = *s++;
+
+    EFI_STATUS status = tcp4_send(client, sse_buf, (UINTN)bi);
+    return (status == EFI_SUCCESS) ? 0 : -1;
+}
+
+/*
+ * Send the final SSE terminator: data: [DONE]
+ * Returns 0 on success, -1 on send failure.
+ */
+static int sse_send_done(tcp4_conn_t *client) {
+    const char *msg = "data: [DONE]\n\n";
+    EFI_STATUS status = tcp4_send(client, msg, 14);
+    return (status == EFI_SUCCESS) ? 0 : -1;
+}
+
 /* ---- API: GET /health ---- */
 
 void api_health(http_response *resp) {
@@ -419,10 +489,21 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
     int n_gen = 0;
     char decode_buf[64];
 
+    /* Token history for repeat penalty (ring buffer, last 64 tokens) */
+    #define REP_HISTORY 64
+    int recent_tokens[REP_HISTORY];
+    int n_recent = 0;
+
     uint64_t t_decode_start = rdtsc();
     for (int i = 0; i < max_tokens; i++) {
-        int next = ba_model_sample(logits, vocab, &cfg);
+        int next = ba_model_sample(logits, vocab, &cfg, recent_tokens, n_recent);
         if (next == eos_id || next == im_end_id) break;
+
+        /* Track token for repeat penalty */
+        if (n_recent < REP_HISTORY)
+            recent_tokens[n_recent++] = next;
+        else
+            recent_tokens[i % REP_HISTORY] = next;
 
         int dec_len = ba_tokenizer_decode(g_tok, &next, 1, decode_buf, sizeof(decode_buf));
         if (dec_len > 0) {
@@ -544,4 +625,162 @@ void api_chat_completions(const char *body, int body_len, http_response *resp) {
     json_body[ji] = '\0';
 
     http_format_response(resp, 200, "OK", "application/json", json_body, ji);
+}
+
+/* ---- API: POST /v1/chat/completions (streaming SSE) ---- */
+
+/*
+ * SSE HTTP headers — sent once before streaming begins.
+ * No Content-Length (chunked/streaming).
+ */
+static const char SSE_HEADERS[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "\r\n";
+
+static void sse_send_error(tcp4_conn_t *client, int status_code,
+                            const char *status_text, const char *msg) {
+    static char err_buf[512];
+    int bi = 0;
+    const char *s;
+
+    s = "HTTP/1.1 ";
+    while (*s) err_buf[bi++] = *s++;
+    /* Write status code (3 digits) */
+    err_buf[bi++] = '0' + (status_code / 100);
+    err_buf[bi++] = '0' + (status_code / 10) % 10;
+    err_buf[bi++] = '0' + status_code % 10;
+    err_buf[bi++] = ' ';
+    while (*status_text) err_buf[bi++] = *status_text++;
+    s = "\r\nContent-Type: application/json\r\nConnection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n\r\n{\"error\":{\"message\":\"";
+    while (*s) err_buf[bi++] = *s++;
+    while (*msg && bi < 480) err_buf[bi++] = *msg++;
+    s = "\",\"type\":\"server_error\"}}";
+    while (*s) err_buf[bi++] = *s++;
+
+    tcp4_send(client, err_buf, (UINTN)bi);
+}
+
+void api_chat_completions_stream(const char *body, int body_len,
+                                  tcp4_conn_t *client) {
+    /* Check model is loaded */
+    if (!g_model || !g_tok) {
+        sse_send_error(client, 503, "Service Unavailable", "model not loaded");
+        return;
+    }
+
+    /* Parse request */
+    chat_message msgs[MAX_MESSAGES];
+    int n_msgs = json_parse_messages(body, body_len, msgs, MAX_MESSAGES);
+
+    if (n_msgs == 0) {
+        sse_send_error(client, 400, "Bad Request", "no messages provided");
+        return;
+    }
+
+    float temperature = json_get_float(body, body_len, "temperature", 0.7f);
+    int max_tokens = json_get_int(body, body_len, "max_tokens", 256);
+    if (max_tokens > 2048) max_tokens = 2048;
+    if (max_tokens < 1) max_tokens = 256;
+
+    /* Build chat template from messages */
+    int ci = 0;
+
+    /* Inject default system prompt if none provided */
+    int has_system = 0;
+    for (int m = 0; m < n_msgs; m++) {
+        if (msgs[m].role_len == 6 && api_strncmp(msgs[m].role, "system", 6) == 0) {
+            has_system = 1;
+            break;
+        }
+    }
+    if (!has_system) {
+        ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE,
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n");
+    }
+
+    for (int m = 0; m < n_msgs; m++) {
+        ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE, "<|im_start|>");
+        ci = buf_add_n(chat_buf, ci, CHAT_BUF_SIZE, msgs[m].role, msgs[m].role_len);
+        ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE, "\n");
+        ci = buf_add_n(chat_buf, ci, CHAT_BUF_SIZE, msgs[m].content, msgs[m].content_len);
+        ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE, "<|im_end|>\n");
+    }
+    ci = buf_add(chat_buf, ci, CHAT_BUF_SIZE, "<|im_start|>assistant\n");
+    chat_buf[ci] = '\0';
+
+    /* Reset model state for fresh inference */
+    ba_model_reset(g_model);
+
+    /* Tokenize */
+    int n_prompt = ba_tokenizer_encode(g_tok, chat_buf, token_buf, MAX_TOKENS_BUF);
+    if (n_prompt <= 0) {
+        sse_send_error(client, 500, "Internal Server Error", "tokenization failed");
+        return;
+    }
+
+    /* Prefill (blocking — no SSE events) */
+    float *logits = 0;
+    for (int i = 0; i < n_prompt; i++) {
+        logits = ba_model_forward(g_model, &token_buf[i], 1);
+    }
+
+    if (!logits) {
+        sse_send_error(client, 500, "Internal Server Error", "forward pass failed");
+        return;
+    }
+
+    /* Send SSE headers — now we're committed to streaming */
+    if (tcp4_send(client, SSE_HEADERS, sizeof(SSE_HEADERS) - 1) != EFI_SUCCESS) {
+        return;
+    }
+
+    /* Decode loop — send each token as an SSE event */
+    ba_sample_config cfg = ba_default_config();
+    cfg.temperature = temperature;
+    cfg.max_tokens = max_tokens;
+
+    int eos_id = ba_tokenizer_eos(g_tok);
+    int im_end_id = ba_tokenizer_im_end(g_tok);
+    int vocab = ba_model_vocab_size(g_model);
+    char decode_buf[64];
+
+    /* Token history for repeat penalty */
+    int recent_tokens[REP_HISTORY];
+    int n_recent = 0;
+
+    for (int i = 0; i < max_tokens; i++) {
+        int next = ba_model_sample(logits, vocab, &cfg, recent_tokens, n_recent);
+
+        /* EOS or im_end — send final chunk and stop */
+        if (next == eos_id || next == im_end_id) {
+            sse_send_chunk(client, 0, 0, 1);
+            break;
+        }
+
+        /* Track token for repeat penalty */
+        if (n_recent < REP_HISTORY)
+            recent_tokens[n_recent++] = next;
+        else
+            recent_tokens[i % REP_HISTORY] = next;
+
+        /* Decode token to text and stream it */
+        int dec_len = ba_tokenizer_decode(g_tok, &next, 1, decode_buf,
+                                           sizeof(decode_buf));
+        if (dec_len > 0) {
+            if (sse_send_chunk(client, decode_buf, dec_len, 0) < 0) {
+                break; /* Connection dropped */
+            }
+        }
+
+        /* Forward pass for next token */
+        logits = ba_model_forward(g_model, &next, 1);
+        if (!logits) break;
+    }
+
+    sse_send_done(client);
 }

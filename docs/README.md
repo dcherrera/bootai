@@ -13,7 +13,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [UEFI Boot Architecture](architecture/uefi-boot-architecture.md) — Boot flow, memory model, build pipeline, driver binding
 - [Networking](architecture/networking.md) — DHCP, TCP4, UDP4 DNS, HTTP/1.0, mDNS/Bonjour, custom network stack (ARP/DHCP/IP/UDP/TCP on raw SNP)
 - [Inference on Bare Metal](architecture/inference-on-bare-metal.md) — Model conversion, disk image creation, running SmolLM2-135M
-- [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions
+- [HTTP Server](architecture/http-server.md) — OpenAI-compatible API, TCP4 listen/accept, JSON parsing, chat completions (non-streaming and SSE streaming)
 - [WiFi & Driver Loader](architecture/wifi-and-drivers.md) — UEFI driver loading from disk, WiFi scan/connect via WiFi2 protocol, wifi.conf auto-connect
 - [e1000e Ethernet Driver](architecture/e1000e-ethernet-driver.md) — Native Intel 82577LM wired Ethernet driver: PCI probe, DMA descriptor rings, raw TX/RX, ns_* stack integration
 - [IWN WiFi Driver](architecture/iwn-wifi-driver.md) — Native Intel 6200 WiFi driver ported from OpenBSD: PCI probe, MMIO/EEPROM, DMA/firmware, scanning, auth/assoc, WPA2 EAPOL, data TX/RX, SNP integration
@@ -22,6 +22,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [Management API](architecture/management-api.md) — Remote debugging over Ethernet: execute commands, stream logs, health check (`/api/cmd`, `/api/log`, `/api/health`)
 - [Memory Diagnostics](architecture/memory-diagnostics.md) — `meminfo` REPL command: UEFI memory map breakdown by type (loader, firmware, free)
 - [HD Install](architecture/hd-install.md) — Install to hard drive: GPT partitioning, FAT32 ESP, raw data partition with BTAI TOC for unlimited model sizes, boot path model loading via Block IO
+- [Weight Loading Strategy](architecture/weight-loading-strategy.md) — F32 pre-conversion for small models, F16/INT8 strategies for larger models, memory ownership and loader architecture
 
 ## Guides
 

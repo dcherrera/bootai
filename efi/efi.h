@@ -58,17 +58,24 @@ typedef struct {
 #define EFI_CONNECTION_RESET     EFI_ERROR(105)
 #define EFI_CONNECTION_REFUSED   EFI_ERROR(106)
 
-/* Memory types */
+/* Memory types (UEFI spec Table 7-5) */
 typedef enum {
-    EfiReservedMemoryType,
-    EfiLoaderCode,
-    EfiLoaderData,
-    EfiBootServicesCode,
-    EfiBootServicesData,
-    EfiRuntimeServicesCode,
-    EfiRuntimeServicesData,
-    EfiConventionalMemory,
-    EfiMaxMemoryType
+    EfiReservedMemoryType,       /* 0 */
+    EfiLoaderCode,               /* 1 */
+    EfiLoaderData,               /* 2 */
+    EfiBootServicesCode,         /* 3 */
+    EfiBootServicesData,         /* 4 */
+    EfiRuntimeServicesCode,      /* 5 */
+    EfiRuntimeServicesData,      /* 6 */
+    EfiConventionalMemory,       /* 7 */
+    EfiUnusableMemory,           /* 8 */
+    EfiACPIReclaimMemory,        /* 9 */
+    EfiACPIMemoryNVS,            /* 10 */
+    EfiMemoryMappedIO,           /* 11 */
+    EfiMemoryMappedIOPortSpace,  /* 12 */
+    EfiPalCode,                  /* 13 */
+    EfiPersistentMemory,         /* 14 */
+    EfiMaxMemoryType             /* 15 */
 } EFI_MEMORY_TYPE;
 
 /* Memory descriptor (returned by GetMemoryMap) */
@@ -389,7 +396,7 @@ struct EFI_FILE_PROTOCOL {
     EFI_STATUS (EFIAPI *Delete)(EFI_FILE_PROTOCOL *This);
     EFI_STATUS (EFIAPI *Read)(EFI_FILE_PROTOCOL *This, UINTN *BufferSize, void *Buffer);
     EFI_STATUS (EFIAPI *Write)(EFI_FILE_PROTOCOL *This, UINTN *BufferSize, void *Buffer);
-    void *GetPosition;
+    EFI_STATUS (EFIAPI *GetPosition)(EFI_FILE_PROTOCOL *This, uint64_t *Position);
     EFI_STATUS (EFIAPI *SetPosition)(EFI_FILE_PROTOCOL *This, uint64_t Position);
     EFI_STATUS (EFIAPI *GetInfo)(EFI_FILE_PROTOCOL *This, EFI_GUID *InformationType,
                                  UINTN *BufferSize, void *Buffer);
@@ -461,6 +468,34 @@ struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
     EFI_STATUS (EFIAPI *Reset)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
     EFI_STATUS (EFIAPI *ReadKeyStroke)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
     EFI_EVENT WaitForKey;
+};
+
+/* Simple Text Input Ex Protocol — keyboard toggle state control */
+typedef uint8_t EFI_KEY_TOGGLE_STATE;
+#define EFI_TOGGLE_STATE_VALID 0x80
+#define EFI_KEY_STATE_EXPOSED  0x40
+#define EFI_SCROLL_LOCK_ACTIVE 0x01
+#define EFI_NUM_LOCK_ACTIVE    0x02
+#define EFI_CAPS_LOCK_ACTIVE   0x04
+
+typedef struct {
+    uint32_t KeyShiftState;
+    EFI_KEY_TOGGLE_STATE KeyToggleState;
+} EFI_KEY_STATE;
+
+typedef struct {
+    EFI_INPUT_KEY Key;
+    EFI_KEY_STATE KeyState;
+} EFI_KEY_DATA;
+
+typedef struct EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL;
+struct EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL {
+    EFI_STATUS (EFIAPI *Reset)(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, BOOLEAN ExtendedVerification);
+    EFI_STATUS (EFIAPI *ReadKeyStrokeEx)(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData);
+    EFI_EVENT WaitForKeyEx;
+    EFI_STATUS (EFIAPI *SetState)(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_TOGGLE_STATE *KeyToggleState);
+    void *RegisterKeyNotify;
+    void *UnregisterKeyNotify;
 };
 
 /* Boot Services (partial — expand as needed) */
@@ -779,6 +814,7 @@ void efi_clear_screen(void);
 EFI_STATUS efi_read_key(EFI_INPUT_KEY *key);
 void efi_wait_key(void);
 int efi_read_line(char *buf, int max_len);
+void efi_keyboard_init(void); /* Clear CapsLock/NumLock toggle state */
 
 /* Filesystem */
 EFI_STATUS efi_fs_init(void);

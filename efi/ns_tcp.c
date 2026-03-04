@@ -356,22 +356,27 @@ void ns_tcp_handle(const uint8_t *ip_payload, int len,
         case NS_TCP_ESTABLISHED:
             /* Data or FIN */
             if (data_len > 0) {
-                /* Append to rx_buf if space */
-                int space = NS_TCP_RX_BUF_SIZE - c->rx_len;
-                int copy = data_len;
-                if (copy > space) copy = space;
-                if (copy > 0) {
-                    tcp_memcpy(c->rx_buf + c->rx_len, data, copy);
-                    c->rx_len += copy;
+                if (seq == c->ack) {
+                    /* In-order segment: append to rx_buf */
+                    int space = NS_TCP_RX_BUF_SIZE - c->rx_len;
+                    int copy = data_len;
+                    if (copy > space) copy = space;
+                    if (copy > 0) {
+                        tcp_memcpy(c->rx_buf + c->rx_len, data, copy);
+                        c->rx_len += copy;
+                    }
+                    c->ack = seq + (uint32_t)copy;
+                } else {
+                    /* Out-of-order or duplicate: drop, re-ACK expected seq */
                 }
-                /* Only ACK bytes actually stored — sender retransmits the rest */
-                c->ack = seq + (uint32_t)copy;
-                /* Send ACK (window field signals free space for flow control) */
                 tcp_send_segment(c, TCP_ACK, (void *)0, 0);
             }
             if (flags & TCP_FIN) {
                 c->rx_fin = 1;
-                c->ack = seq + (uint32_t)data_len + 1;
+                if (seq == c->ack)
+                    c->ack = seq + (uint32_t)data_len + 1;
+                else
+                    c->ack = c->ack; /* keep expected seq, re-ACK */
                 tcp_send_segment(c, TCP_ACK, (void *)0, 0);
                 c->state = NS_TCP_CLOSING;
             }

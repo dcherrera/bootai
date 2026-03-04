@@ -98,20 +98,23 @@ When the Dell is running and serving (after `serve 8080`), use OTA instead of US
 # 1. Build
 make clean && make efi
 
-# 2. Push firmware to Dell
+# 2. Compute local CRC32 BEFORE pushing
+python3 -c "import binascii; print(format(binascii.crc32(open('all_bootai.efi','rb').read()) & 0xFFFFFFFF, '08x'))"
+
+# 3. Push firmware to Dell
 curl -H "Authorization: Bearer bootai" \
      --data-binary @all_bootai.efi \
      http://<DELL_IP>:8080/api/update
+# Response includes "crc32":"XXXXXXXX" — VERIFY it matches step 2 before proceeding!
 
-# 3. Reboot into new firmware
+# 4. Only after CRC32 match confirmed, reboot Dell
 curl -H "Authorization: Bearer bootai" \
      -d '{"cmd":"reboot"}' \
      http://<DELL_IP>:8080/api/cmd
 
-# 4. After reboot, user must run `serve 8080` on Dell keyboard
-
-# 5. Verify
-curl -H "Authorization: Bearer bootai" http://<DELL_IP>:8080/api/health
+# 5. STOP. Wait for user to confirm they ran `serve 8080` on Dell keyboard.
+#    Do NOT attempt to reconnect, poll health, or send any requests until
+#    the user explicitly says the Dell is serving again.
 ```
 
 Other useful API commands:
@@ -287,3 +290,7 @@ For real hardware: write USB with `make usb`, boot from USB.
 - `qemu-system-x86_64` — Emulator
 - OVMF firmware — UEFI for QEMU
 - Python 3 + safetensors — Weight export script only
+
+### Client Configs
+- **OpenCode:** `~/.config/opencode/config.json` — BootAI endpoint config for the OpenCode AI coding tool
+- **TeamIDE Plugin:** `../BootAI-TeamIDE-Pluggin/` — Chat UI plugin (Vue/Quasar, built with `npm run build`)

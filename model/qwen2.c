@@ -3,7 +3,7 @@
  *
  * Standard transformer: RMSNorm + GQA + SwiGLU + RoPE.
  * All operations on raw float* arrays — no tm_tensor in hot path.
- * INT8 quantized matmul for weight projections.
+ * Weights pre-converted from F16 to F32 at load time for fast SSE matvec.
  *
  * Ported from foundry/rwkvx/rfa.c with modifications for bare-metal.
  */
@@ -52,99 +52,31 @@ static inline float sse_hsum(v4sf v) {
     return sums[0];
 }
 
-/* ---- Batch f16→f32 SSE conversion (4 values at once) ---- */
-
-/*
- * Convert 4 packed F16 values to 4 F32 values using SSE2 integer ops.
- * No F16C or SSE4.1 required — works on Westmere and any SSE2 CPU.
- * Denormals are flushed to zero (safe for trained model weights).
- */
-static inline v4sf f16x4_to_f32_sse(const uint16_t *p) {
-    /* Load 4 uint16 into integer registers and unpack manually */
-    uint32_t h0 = p[0], h1 = p[1], h2 = p[2], h3 = p[3];
-
-    /* Unpack each f16 to f32 using integer arithmetic */
-    union { uint32_t i; float f; } u0, u1, u2, u3;
-
-    #define F16_TO_F32_FAST(h, u) do { \
-        uint32_t sign = (h >> 15) << 31; \
-        uint32_t exp  = (h >> 10) & 0x1F; \
-        uint32_t mant = h & 0x3FF; \
-        if (exp == 0) { u.i = sign; } /* flush denormals to zero */ \
-        else if (exp == 31) { u.i = sign | 0x7F800000 | (mant << 13); } \
-        else { u.i = sign | ((exp + 112) << 23) | (mant << 13); } \
-    } while(0)
-
-    F16_TO_F32_FAST(h0, u0);
-    F16_TO_F32_FAST(h1, u1);
-    F16_TO_F32_FAST(h2, u2);
-    F16_TO_F32_FAST(h3, u3);
-
-    #undef F16_TO_F32_FAST
-
-    return (v4sf){u0.f, u1.f, u2.f, u3.f};
-}
-
-/* ---- f16 conversion (scalar) ---- */
-
-#ifdef __F16C__
-/* Use hardware F16C instruction (vcvtph2ps) without immintrin.h
- * which requires stdlib.h unavailable in freestanding mode */
-static inline float f16_to_f32(uint16_t h) {
-    typedef float __v4sf __attribute__((__vector_size__(16)));
-    typedef short __v8hi __attribute__((__vector_size__(16)));
-    __v8hi v = {(short)h, 0, 0, 0, 0, 0, 0, 0};
-    __v4sf r = __builtin_ia32_vcvtph2ps(v);
-    return r[0];
-}
-#else
-static inline float f16_to_f32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-
-    if (exp == 0) {
-        if (mant == 0) {
-            union { uint32_t i; float f; } u = { .i = sign };
-            return u.f;
-        }
-        /* Denormalized: convert to normalized */
-        while (!(mant & 0x400)) { mant <<= 1; exp--; }
-        exp++; mant &= 0x3FF;
-    } else if (exp == 31) {
-        /* Inf/NaN */
-        union { uint32_t i; float f; } u = { .i = sign | 0x7F800000 | (mant << 13) };
-        return u.f;
-    }
-
-    union { uint32_t i; float f; } u = {
-        .i = sign | ((exp + 112) << 23) | (mant << 13)
-    };
-    return u.f;
-}
-#endif
+/* f16_to_f32 is now in model.h (shared with loader.c) */
 
 /* ---- Core math ops (ported from rfa.c) ---- */
 
-/* Padé approximant for SiLU: x * sigma(x).
- * Accurate to ~0.15% for |x| < 8, exact at x=0.
- * ~3 FLOPs vs ~20 for the expf-based version. */
+/* SiLU: x * sigmoid(x) = x / (1 + exp(-x)).
+ * Uses the Cody-Waite expf from uefi_libc — accurate to float precision.
+ * Cost is ~20 FLOPs vs ~3 for the old Padé, but negligible next to matvecs. */
 static inline float fast_silu(float x) {
-    float ax = fabsf(x);
-    if (ax > 10.0f) return x > 0.0f ? x : 0.0f;  /* saturate */
-    float x2 = x * x;
-    return x * (0.5f + x / (4.0f + x2 * 0.16f));
+    if (x > 10.0f) return x;      /* sigmoid ≈ 1 */
+    if (x < -10.0f) return 0.0f;  /* sigmoid ≈ 0 */
+    return x / (1.0f + expf(-x));
 }
 
 static void fast_rms_norm(const float *x, const float *w, float *out,
                           int n, float eps) {
-    /* SSE 4-wide sum of squares */
-    v4sf acc = sse_setzero();
+    /* SSE 4-wide sum of squares — dual accumulator to hide FP add latency */
+    v4sf acc0 = sse_setzero(), acc1 = sse_setzero();
     int i = 0;
-    for (; i + 3 < n; i += 4) {
-        v4sf xv = sse_load(&x[i]);
-        acc = sse_add(acc, sse_mul(xv, xv));
+    for (; i + 7 < n; i += 8) {
+        v4sf x0 = sse_load(&x[i]);
+        v4sf x1 = sse_load(&x[i + 4]);
+        acc0 = sse_add(acc0, sse_mul(x0, x0));
+        acc1 = sse_add(acc1, sse_mul(x1, x1));
     }
+    v4sf acc = sse_add(acc0, acc1);
     float sum_sq = sse_hsum(acc);
     for (; i < n; i++)
         sum_sq += x[i] * x[i];
@@ -181,40 +113,105 @@ static void rms_norm_per_head(float *vec, const float *w, int n_heads,
 
 /* Q8 weight × F32 activation matvec: out[rows] = W_q8[rows,cols] @ x_f32[cols]
  * W8A32: only weights are quantized, activations stay float32.
- * W8A8 (both quantized) is too lossy for small models (135M). */
+ * SSE vectorized: int8→int32 sign extension + cvtdq2ps, 8-wide unroll.
+ * GCC compiles v4si = {row[j]..row[j+3]} into pmovsxbd at -O2+. */
 static void matvec_q8(const float *x, const ba_q8_weight *q, float *out,
                        int rows, int cols, int8_t *q8_buf) {
     (void)q8_buf;  /* not needed for W8A32 */
 
     for (int i = 0; i < rows; i++) {
-        const int8_t *row = &q->data[i * cols];
-        float w_scale = q->scales[i];
-        float dot = 0.0f;
-        for (int j = 0; j < cols; j++)
-            dot += x[j] * (float)row[j];
-        out[i] = dot * w_scale;
+        const int8_t *row = &q->data[(size_t)i * cols];
+        v4sf acc0 = sse_setzero(), acc1 = sse_setzero();
+        v4sf acc2 = sse_setzero(), acc3 = sse_setzero();
+        int j = 0;
+        /* 16-wide unroll (4 accumulators) + prefetch next cache line */
+        for (; j + 15 < cols; j += 16) {
+            __builtin_prefetch(&row[j + 64], 0, 0);
+            __builtin_prefetch(&x[j + 64], 0, 0);
+            v4si w0_i = {row[j],    row[j+1],  row[j+2],  row[j+3]};
+            acc0 = sse_add(acc0, sse_mul(__builtin_ia32_cvtdq2ps(w0_i),
+                                          sse_load(&x[j])));
+            v4si w1_i = {row[j+4],  row[j+5],  row[j+6],  row[j+7]};
+            acc1 = sse_add(acc1, sse_mul(__builtin_ia32_cvtdq2ps(w1_i),
+                                          sse_load(&x[j+4])));
+            v4si w2_i = {row[j+8],  row[j+9],  row[j+10], row[j+11]};
+            acc2 = sse_add(acc2, sse_mul(__builtin_ia32_cvtdq2ps(w2_i),
+                                          sse_load(&x[j+8])));
+            v4si w3_i = {row[j+12], row[j+13], row[j+14], row[j+15]};
+            acc3 = sse_add(acc3, sse_mul(__builtin_ia32_cvtdq2ps(w3_i),
+                                          sse_load(&x[j+12])));
+        }
+        /* 8-wide cleanup */
+        for (; j + 7 < cols; j += 8) {
+            v4si w0_i = {row[j], row[j+1], row[j+2], row[j+3]};
+            acc0 = sse_add(acc0, sse_mul(__builtin_ia32_cvtdq2ps(w0_i),
+                                          sse_load(&x[j])));
+            v4si w1_i = {row[j+4], row[j+5], row[j+6], row[j+7]};
+            acc1 = sse_add(acc1, sse_mul(__builtin_ia32_cvtdq2ps(w1_i),
+                                          sse_load(&x[j+4])));
+        }
+        float sum = sse_hsum(sse_add(sse_add(acc0, acc1), sse_add(acc2, acc3)));
+        for (; j < cols; j++)
+            sum += (float)row[j] * x[j];
+        out[i] = sum * q->scales[i];
     }
 }
 
-/* f16 matvec for embedding/lm_head: out[rows] = W_f16[rows,cols] @ x[cols]
- * SSE 4-wide: convert 4 F16 values at a time, multiply-accumulate with x */
-static void matvec_f16(const float *x, const uint16_t *w_f16, float *out,
+/* F32 matvec: out[rows] = W[rows,cols] @ x[cols]
+ * Weights pre-converted to F32 at load — pure SSE, no F16 conversion.
+ * Dual accumulators (8-wide unroll) to hide FP add latency. */
+static void matvec_f32(const float *x, const float *w, float *out,
                         int rows, int cols) {
     for (int i = 0; i < rows; i++) {
-        const uint16_t *row = &w_f16[(size_t)i * cols];
-        v4sf acc = sse_setzero();
+        const float *row = &w[(size_t)i * cols];
+        v4sf acc0 = sse_setzero(), acc1 = sse_setzero();
         int j = 0;
-        for (; j + 3 < cols; j += 4) {
-            v4sf w = f16x4_to_f32_sse(&row[j]);
-            v4sf xv = sse_load(&x[j]);
-            acc = sse_add(acc, sse_mul(w, xv));
+        for (; j + 7 < cols; j += 8) {
+            acc0 = sse_add(acc0, sse_mul(sse_load(&row[j]),     sse_load(&x[j])));
+            acc1 = sse_add(acc1, sse_mul(sse_load(&row[j + 4]), sse_load(&x[j + 4])));
         }
-        float sum = sse_hsum(acc);
-        /* Scalar tail */
+        float sum = sse_hsum(sse_add(acc0, acc1));
+        for (; j < cols; j++)
+            sum += row[j] * x[j];
+        out[i] = sum;
+    }
+}
+
+/* F16 matvec: out[rows] = W_f16[rows,cols] @ x[cols]
+ * Converts F16→F32 per element on-the-fly. Used for lm_head when embed
+ * is kept as F16 (streamed Q8 loader saves ~600 MB).
+ * SSE dual-accumulator with 8-wide unroll — same structure as matvec_f32
+ * but with f16_to_f32 conversion per weight element. */
+static void matvec_f16(const float *x, const uint16_t *w, float *out,
+                        int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        const uint16_t *row = &w[(size_t)i * cols];
+        v4sf acc0 = sse_setzero(), acc1 = sse_setzero();
+        int j = 0;
+        for (; j + 7 < cols; j += 8) {
+            v4sf w0 = {f16_to_f32(row[j]),   f16_to_f32(row[j+1]),
+                       f16_to_f32(row[j+2]), f16_to_f32(row[j+3])};
+            acc0 = sse_add(acc0, sse_mul(w0, sse_load(&x[j])));
+            v4sf w1 = {f16_to_f32(row[j+4]), f16_to_f32(row[j+5]),
+                       f16_to_f32(row[j+6]), f16_to_f32(row[j+7])};
+            acc1 = sse_add(acc1, sse_mul(w1, sse_load(&x[j+4])));
+        }
+        float sum = sse_hsum(sse_add(acc0, acc1));
         for (; j < cols; j++)
             sum += f16_to_f32(row[j]) * x[j];
         out[i] = sum;
     }
+}
+
+/* Dispatch to Q8 or F32 matvec based on model quantization */
+static inline void matvec_dispatch(const float *x, const float *w_f32,
+                                    const ba_q8_weight *w_q8, float *out,
+                                    int rows, int cols, int quant,
+                                    int8_t *q8_buf) {
+    if (quant == 2)
+        matvec_q8(x, w_q8, out, rows, cols, q8_buf);
+    else
+        matvec_f32(x, w_f32, out, rows, cols);
 }
 
 /* ---- Qwen forward pass ---- */
@@ -230,17 +227,23 @@ float* ba_qwen_forward(ba_model *m, int token) {
     int q_dim   = n_q * hd;
     int ffn     = cfg->ffn_dim;
     int group   = n_q / n_kv;
+    int quant   = m->quant;
     int pos     = m->position;
 
-    /* Step 1: Embedding lookup (f16 → f32, SSE batch of 4) */
-    const uint16_t *emb_row = &m->embed[(size_t)token * c];
-    {
-        int i = 0;
-        for (; i + 3 < c; i += 4)
-            sse_store(&ws->x[i], f16x4_to_f32_sse(&emb_row[i]));
-        for (; i < c; i++)
+    /* Step 1: Embedding lookup */
+    if (m->embed) {
+        /* F32 path (monolithic load) */
+        const float *emb_row = &m->embed[(size_t)token * c];
+        memcpy(ws->x, emb_row, c * sizeof(float));
+    } else {
+        /* F16 path (streamed load) — convert one row on-the-fly */
+        const uint16_t *emb_row = &m->embed_f16[(size_t)token * c];
+        for (int i = 0; i < c; i++)
             ws->x[i] = f16_to_f32(emb_row[i]);
     }
+
+    /* Precompute attention scale — hd is constant across all layers */
+    float attn_scale = 1.0f / sqrtf((float)hd);
 
     /* Step 2: Transformer layers */
     for (int layer = 0; layer < cfg->n_layers; layer++) {
@@ -249,10 +252,13 @@ float* ba_qwen_forward(ba_model *m, int token) {
         /* 2a: RMSNorm (pre-attention) */
         fast_rms_norm(ws->x, lw->ln1_w, ws->ln_buf, c, cfg->rms_eps);
 
-        /* 2b: Q/K/V projections (F16 matvec) */
-        matvec_f16(ws->ln_buf, lw->q_proj, ws->q, q_dim, c);
-        matvec_f16(ws->ln_buf, lw->k_proj, ws->k, kv_dim, c);
-        matvec_f16(ws->ln_buf, lw->v_proj, ws->v, kv_dim, c);
+        /* 2b: Q/K/V projections */
+        matvec_dispatch(ws->ln_buf, lw->q_proj, &lw->q_proj_q8, ws->q,
+                        q_dim, c, quant, ws->q8_buf);
+        matvec_dispatch(ws->ln_buf, lw->k_proj, &lw->k_proj_q8, ws->k,
+                        kv_dim, c, quant, ws->q8_buf);
+        matvec_dispatch(ws->ln_buf, lw->v_proj, &lw->v_proj_q8, ws->v,
+                        kv_dim, c, quant, ws->q8_buf);
 
         /* 2b': Add bias if present (Qwen2.5) */
         if (lw->q_bias) {
@@ -284,7 +290,6 @@ float* ba_qwen_forward(ba_model *m, int token) {
         /* 2f: GQA attention */
         ba_kv_layer *kv_l = &m->kv.layers[layer];
         int total = kv_l->cache_len;
-        float scale = 1.0f / sqrtf((float)hd);
 
         memset(ws->attn_out, 0, q_dim * sizeof(float));
 
@@ -306,11 +311,13 @@ float* ba_qwen_forward(ba_model *m, int token) {
                 float dot = sse_hsum(acc);
                 for (; j < hd; j++)
                     dot += q_head[j] * kt[j];
-                scores[t] = dot * scale;
+                scores[t] = dot * attn_scale;
                 if (scores[t] > max_s) max_s = scores[t];
             }
 
-            /* Softmax */
+            /* Softmax (accurate expf — fast_expf's ~12-bit errors compound
+             * across 24 layers and 100+ autoregressive steps, causing
+             * degenerate repetition with stochastic sampling) */
             float sum_e = 0.0f;
             for (int t = 0; t < total; t++) {
                 scores[t] = expf(scores[t] - max_s);
@@ -338,7 +345,8 @@ float* ba_qwen_forward(ba_model *m, int token) {
         }
 
         /* 2g: Output projection + residual */
-        matvec_f16(ws->attn_out, lw->o_proj, ws->x_out, c, q_dim);
+        matvec_dispatch(ws->attn_out, lw->o_proj, &lw->o_proj_q8, ws->x_out,
+                        c, q_dim, quant, ws->q8_buf);
         for (int i = 0; i < c; i++)
             ws->x[i] += ws->x_out[i];
 
@@ -346,13 +354,16 @@ float* ba_qwen_forward(ba_model *m, int token) {
         fast_rms_norm(ws->x, lw->ln2_w, ws->ln_buf, c, cfg->rms_eps);
 
         /* 2i: SwiGLU FFN */
-        matvec_f16(ws->ln_buf, lw->gate_proj, ws->ffn_gate, ffn, c);
-        matvec_f16(ws->ln_buf, lw->up_proj, ws->ffn_up, ffn, c);
+        matvec_dispatch(ws->ln_buf, lw->gate_proj, &lw->gate_proj_q8,
+                        ws->ffn_gate, ffn, c, quant, ws->q8_buf);
+        matvec_dispatch(ws->ln_buf, lw->up_proj, &lw->up_proj_q8,
+                        ws->ffn_up, ffn, c, quant, ws->q8_buf);
 
         for (int i = 0; i < ffn; i++)
             ws->ffn_gate[i] = fast_silu(ws->ffn_gate[i]) * ws->ffn_up[i];
 
-        matvec_f16(ws->ffn_gate, lw->down_proj, ws->ffn_out, c, ffn);
+        matvec_dispatch(ws->ffn_gate, lw->down_proj, &lw->down_proj_q8,
+                        ws->ffn_out, c, ffn, quant, ws->q8_buf);
 
         /* FFN residual */
         for (int i = 0; i < c; i++)
@@ -362,8 +373,53 @@ float* ba_qwen_forward(ba_model *m, int token) {
     /* Step 3: Final RMSNorm */
     fast_rms_norm(ws->x, m->ln_out_w, ws->ln_buf, c, cfg->rms_eps);
 
-    /* Step 4: LM head (f16 matvec → logits) */
-    matvec_f16(ws->ln_buf, m->lm_head, ws->logits, cfg->vocab_size, c);
+    /* Step 4: LM head → logits */
+    if (m->lm_head) {
+        /* F32 path (monolithic loader — SmolLM etc.) */
+        matvec_f32(ws->ln_buf, m->lm_head, ws->logits, cfg->vocab_size, c);
+    } else if (m->lm_head_q8.data) {
+        /* Q8 path (streamed loader — quantized from F16 embed at load) */
+        matvec_q8(ws->ln_buf, &m->lm_head_q8, ws->logits, cfg->vocab_size, c, ws->q8_buf);
+    } else {
+        /* F16 fallback */
+        matvec_f16(ws->ln_buf, m->embed_f16, ws->logits, cfg->vocab_size, c);
+    }
+
+    /* Debug: print logit stats on first 2 tokens to verify forward pass */
+    if (pos < 2) {
+        float lmin = ws->logits[0], lmax = ws->logits[0];
+        int argmax = 0;
+        for (int i = 1; i < cfg->vocab_size; i++) {
+            if (ws->logits[i] > lmax) { lmax = ws->logits[i]; argmax = i; }
+            if (ws->logits[i] < lmin) lmin = ws->logits[i];
+        }
+        /* Also print first few hidden state values after all layers */
+        efi_print_ascii("  [dbg] pos=");
+        /* simple int print */
+        char dbg[32];
+        int dp = 0;
+        int pv = pos;
+        if (pv == 0) dbg[dp++] = '0';
+        else { char tmp[12]; int ti = 0; while (pv > 0) { tmp[ti++] = '0' + pv % 10; pv /= 10; } while (ti > 0) dbg[dp++] = tmp[--ti]; }
+        dbg[dp] = 0;
+        efi_print_ascii(dbg);
+        efi_print_ascii(" argmax=");
+        pv = argmax; dp = 0;
+        if (pv == 0) dbg[dp++] = '0';
+        else { char tmp[12]; int ti = 0; while (pv > 0) { tmp[ti++] = '0' + pv % 10; pv /= 10; } while (ti > 0) dbg[dp++] = tmp[--ti]; }
+        dbg[dp] = 0;
+        efi_print_ascii(dbg);
+        /* Print x[0..3] to check hidden state sanity */
+        efi_print_ascii(" x0=");
+        int xi = (int)(ws->x[0] * 100.0f);
+        if (xi < 0) { efi_print_ascii("-"); xi = -xi; }
+        pv = xi; dp = 0;
+        if (pv == 0) dbg[dp++] = '0';
+        else { char tmp[12]; int ti = 0; while (pv > 0) { tmp[ti++] = '0' + pv % 10; pv /= 10; } while (ti > 0) dbg[dp++] = tmp[--ti]; }
+        dbg[dp] = 0;
+        efi_print_ascii(dbg);
+        efi_print_ascii("\r\n");
+    }
 
     m->position++;
     return ws->logits;

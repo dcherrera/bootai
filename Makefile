@@ -58,7 +58,7 @@ OVMF_CODE ?= ovmf-code.fd
 OVMF_VARS ?= ovmf-vars.fd
 
 # Targets
-.PHONY: phase1 phase3 phase4 efi run run-prod clean usb img release test-iwn-crypto
+.PHONY: phase1 phase3 phase4 efi run run-prod clean usb img img-multi release test-iwn-crypto
 
 # Model files (source paths)
 MODEL_BTW ?= ../models/base/SmolLM2-135M-Instruct/model.btw
@@ -127,6 +127,40 @@ img: bootai-p4.efi
 	mcopy -i bootai.img wifi.conf.template ::wifi.conf
 	mcopy -i bootai.img $(MODEL_BTW) ::rwkvos/model.btw
 	mcopy -i bootai.img $(MODEL_BTV) ::rwkvos/vocab.btv
+	@echo "bootai.img ready ($$(ls -lh bootai.img | awk '{print $$5}'))"
+
+# Multi-model disk image — multiple models in rwkvos/models/<name>/
+# Usage: make img-multi
+# Models are auto-discovered from MODELS variable or use defaults
+MODELS_SMOL_BTW ?= ../models/base/SmolLM2-135M-Instruct/model.btw
+MODELS_SMOL_BTV ?= ../models/base/SmolLM2-135M-Instruct/model.btv
+MODELS_QWEN_BTW ?= DownloadedModels/Qwen2.5-Coder-3B-Instruct/model.btw
+MODELS_QWEN_BTV ?= DownloadedModels/Qwen2.5-Coder-3B-Instruct/model.btv
+
+img-multi: all_bootai.efi
+	@echo "Creating multi-model bootai.img..."
+	@size=0; \
+	for f in $(MODELS_SMOL_BTW) $(MODELS_SMOL_BTV) $(MODELS_QWEN_BTW) $(MODELS_QWEN_BTV); do \
+		if [ -f "$$f" ]; then size=$$(( $$size + $$(stat -f%z "$$f") )); fi; \
+	done; \
+	size=$$(( ($$size + 52428800) / 1048576 )); \
+	dd if=/dev/zero of=bootai.img bs=1m count=$$size 2>/dev/null
+	mformat -i bootai.img -F ::
+	mmd -i bootai.img ::EFI ::EFI/BOOT ::rwkvos ::rwkvos/models ::workspace ::drivers
+	mcopy -i bootai.img all_bootai.efi ::EFI/BOOT/BOOTX64.EFI
+	mcopy -i bootai.img wifi.conf.template ::wifi.conf
+	@if [ -f "$(MODELS_SMOL_BTW)" ]; then \
+		echo "  Adding smollm-135m..."; \
+		mmd -i bootai.img ::rwkvos/models/smollm-135m; \
+		mcopy -i bootai.img $(MODELS_SMOL_BTW) ::rwkvos/models/smollm-135m/model.btw; \
+		mcopy -i bootai.img $(MODELS_SMOL_BTV) ::rwkvos/models/smollm-135m/vocab.btv; \
+	fi
+	@if [ -f "$(MODELS_QWEN_BTW)" ]; then \
+		echo "  Adding qwen25-coder-3b..."; \
+		mmd -i bootai.img ::rwkvos/models/qwen25-coder-3b; \
+		mcopy -i bootai.img $(MODELS_QWEN_BTW) ::rwkvos/models/qwen25-coder-3b/model.btw; \
+		mcopy -i bootai.img $(MODELS_QWEN_BTV) ::rwkvos/models/qwen25-coder-3b/vocab.btv; \
+	fi
 	@echo "bootai.img ready ($$(ls -lh bootai.img | awk '{print $$5}'))"
 
 # GPT release image — flashable with balenaEtcher or dd

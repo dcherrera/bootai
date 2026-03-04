@@ -237,6 +237,8 @@ void http_format_response(http_response *resp, int status_code,
 void api_health(http_response *resp);
 void api_models(http_response *resp);
 void api_chat_completions(const char *body, int body_len, http_response *resp);
+void api_chat_completions_stream(const char *body, int body_len, tcp4_conn_t *client);
+int  api_has_stream_true(const char *body, int body_len);
 
 /* Management API (implemented in mgmt_api.c) */
 void mgmt_route(http_request *req, http_response *resp);
@@ -385,6 +387,26 @@ void ba_http_serve(uint16_t port) {
                                        body_bytes, content_length);
                     streaming_handled = 1;
                     break;
+                }
+
+                /* Streaming chat completions — detect before waiting for full body */
+                if (hdr_req.method_len == 4 &&
+                    http_strncmp(hdr_req.method, "POST", 4) == 0 &&
+                    hdr_req.path_len == 20 &&
+                    http_strncmp(hdr_req.path, "/v1/chat/completions", 20) == 0 &&
+                    hdr_req.body_len > 0 &&
+                    api_has_stream_true(hdr_req.body, hdr_req.body_len)) {
+                    /* Wait for full body before streaming */
+                    int body_received = total_read - body_start;
+                    if (content_length > 0 && body_received < content_length) {
+                        /* Not enough body yet — keep reading */
+                    } else {
+                        efi_print_ascii("  POST /v1/chat/completions (stream)\r\n");
+                        api_chat_completions_stream(hdr_req.body, hdr_req.body_len,
+                                                     &client);
+                        streaming_handled = 1;
+                        break;
+                    }
                 }
 
                 /* Normal request: wait for full body */

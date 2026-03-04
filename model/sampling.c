@@ -12,6 +12,10 @@
 /* Math declarations */
 float expf(float x);
 
+/* Use accurate expf for sampling softmax — Schraudolph's fast_expf has
+ * ~12-bit errors that skew probability distributions, causing wrong tokens
+ * to be sampled. Only runs on top-k candidates (40), not full vocab. */
+
 /* Freestanding memcpy */
 void *memcpy(void *dest, const void *src, size_t n);
 
@@ -51,7 +55,8 @@ static void sort_desc(indexed_logit *arr, int n) {
     }
 }
 
-int ba_model_sample(const float *logits, int vocab_size, ba_sample_config *config) {
+int ba_model_sample(const float *logits, int vocab_size, ba_sample_config *config,
+                    const int *recent, int n_recent) {
     /* Greedy: argmax when temperature <= 0 */
     if (config->temperature <= 0.0f) {
         int max_i = 0;
@@ -63,6 +68,7 @@ int ba_model_sample(const float *logits, int vocab_size, ba_sample_config *confi
 
     /* Work on a copy with temperature scaling */
     float inv_t = 1.0f / config->temperature;
+    float rep_pen = config->repeat_penalty;
 
     /* Find top-k candidates first to avoid sorting entire vocab */
     int k = config->top_k > 0 && config->top_k < vocab_size ? config->top_k : vocab_size;
@@ -91,6 +97,25 @@ int ba_model_sample(const float *logits, int vocab_size, ba_sample_config *confi
                 candidates[j - 1] = tmp;
             }
         }
+    }
+
+    /* Apply repeat penalty: penalize tokens that appear in recent history.
+     * Positive logits are divided by penalty, negative logits are multiplied. */
+    if (recent && n_recent > 0 && rep_pen > 1.0f) {
+        for (int i = 0; i < k; i++) {
+            int tid = candidates[i].idx;
+            for (int j = 0; j < n_recent; j++) {
+                if (recent[j] == tid) {
+                    if (candidates[i].val > 0.0f)
+                        candidates[i].val /= rep_pen;
+                    else
+                        candidates[i].val *= rep_pen;
+                    break;
+                }
+            }
+        }
+        /* Re-sort after penalty adjustment */
+        sort_desc(candidates, k);
     }
 
     int n_cand = k;

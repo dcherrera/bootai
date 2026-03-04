@@ -46,7 +46,7 @@ print(r.choices[0].message.content)
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status":"ok"}` |
 | `GET` | `/v1/models` | Returns model list (OpenAI format) |
-| `POST` | `/v1/chat/completions` | Run inference (non-streaming) |
+| `POST` | `/v1/chat/completions` | Run inference (non-streaming or SSE streaming) |
 | `OPTIONS` | `*` | CORS preflight (returns 204) |
 
 ### POST /v1/chat/completions
@@ -93,6 +93,77 @@ print(r.choices[0].message.content)
 | `messages` | array | required | Chat messages (role + content) |
 | `temperature` | float | 0.7 | Sampling temperature |
 | `max_tokens` | int | 256 | Maximum tokens to generate (capped at 2048) |
+| `stream` | bool | false | Enable SSE streaming (tokens sent as they're generated) |
+
+### Streaming (SSE)
+
+When `"stream": true` is set, the response is sent as Server-Sent Events (SSE) — one event per generated token. This makes the first token visible immediately after prefill instead of waiting for the entire response to complete.
+
+**Request:**
+
+```bash
+curl -N -H "Authorization: Bearer bootai" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":32,"stream":true}' \
+  http://<ip>:8080/v1/chat/completions
+```
+
+**Response headers:**
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: close
+Access-Control-Allow-Origin: *
+```
+
+**SSE events (one per token):**
+
+```
+data: {"id":"chatcmpl-bootai","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bootai","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bootai","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+Each SSE event is a `data:` line followed by two newlines. The format is OpenAI-compatible — clients that work with `openai.ChatCompletion.create(stream=True)` work with BootAI streaming.
+
+**Python example:**
+
+```python
+import openai
+client = openai.OpenAI(base_url="http://<ip>:8080/v1", api_key="bootai")
+stream = client.chat.completions.create(
+    model="bootai",
+    messages=[{"role": "user", "content": "Hello"}],
+    max_tokens=32,
+    stream=True
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()
+```
+
+**Streaming flow:**
+
+1. Request body is fully received before inference begins
+2. Messages, temperature, max_tokens are parsed (same as non-streaming)
+3. Chat template is built and tokenized
+4. Prefill runs (blocking — no events sent during prefill)
+5. SSE headers are sent immediately after prefill
+6. Each decoded token is sent as an SSE event via `tcp4_send()`
+7. On EOS or `<|im_end|>`: final chunk with `"finish_reason":"stop"`, then `data: [DONE]`
+
+**Error handling:**
+
+- If the model/tokenizer isn't loaded or tokenization fails, a standard HTTP error response (JSON) is returned instead of SSE headers
+- If the TCP connection drops mid-stream (client disconnects), the decode loop breaks and the server cleans up normally
+- Non-streaming requests (`"stream":false` or omitted) are unaffected — they use the original buffered response path
 
 ## Architecture
 
@@ -117,24 +188,23 @@ Client (curl/openai) ──TCP──► QEMU port forward ──► UEFI TCP4 st
                                                          │
                                                     http_parse_request()
                                                          │
-                                                    http_route()
-                                                         │
-                                            ┌────────────┼────────────┐
-                                            │            │            │
-                                       /health    /v1/models   /v1/chat/completions
-                                            │            │            │
-                                            │            │      Parse messages
-                                            │            │      Build chat template
-                                            │            │      Reset model
-                                            │            │      Tokenize + prefill
-                                            │            │      Generate tokens
-                                            │            │      Format JSON response
-                                            │            │            │
-                                            └────────────┴────────────┘
-                                                         │
-                                                    tcp4_send() ── HTTP/1.0 response
-                                                         │
-                                                    tcp4_close()
+                                          ┌── stream:true detected? ──┐
+                                          │ YES                       │ NO
+                                          │                           │
+                                   api_chat_completions_stream()  http_route()
+                                          │                           │
+                                   Parse + prefill          ┌────────┼────────┐
+                                          │                 │        │        │
+                                   Send SSE headers    /health /v1/models /v1/chat/...
+                                          │                 │        │        │
+                                   Token-by-token SSE       └────────┴────────┘
+                                   via tcp4_send()                   │
+                                          │                   tcp4_send() ── buffered
+                                   data: [DONE]                      │
+                                          │                          │
+                                          └──────────┬───────────────┘
+                                                     │
+                                                tcp4_close()
 ```
 
 ### Design Decisions
@@ -143,9 +213,9 @@ Client (curl/openai) ──TCP──► QEMU port forward ──► UEFI TCP4 st
 
 **Single-threaded** — UEFI has no threading primitives. The server handles one request at a time. During inference, no other requests are accepted.
 
-**Non-streaming** — Full response is accumulated and sent at once. Streaming SSE would require a different TCP management approach (future work).
+**Dual response modes** — Non-streaming requests accumulate the full response in a 64KB buffer and send at once. Streaming requests (`"stream":true`) bypass the response buffer entirely — SSE events are sent directly via `tcp4_send()` from a 1KB static buffer as each token is decoded. The streaming path is detected early in the request-reading loop (alongside `/api/update`), before the normal parse/route path runs.
 
-**Pre-allocated buffers** — 8KB request buffer, 64KB response buffer. No per-request memory allocation. Safe for bare-metal where heap is limited.
+**Pre-allocated buffers** — 8KB request buffer, 64KB response buffer (non-streaming), 1KB SSE event buffer (streaming). No per-request memory allocation. Safe for bare-metal where heap is limited.
 
 **500ms accept timeout** — `tcp4_accept()` polls for 500ms then returns `EFI_TIMEOUT`. The server loop checks for a keypress between accept cycles, allowing the user to stop the server by pressing any key.
 
@@ -199,8 +269,7 @@ This maps host port 8080 to guest port 8080, so `curl http://localhost:8080/...`
 
 ## Limitations
 
-- **No streaming** — responses are sent all at once after generation completes
-- **No authentication** — `api_key` parameter is ignored
+- **No authentication** — `api_key` parameter is ignored (use management API auth with Bearer token instead)
 - **Single model** — always uses the loaded model (SmolLM2-135M)
 - **No conversation persistence** — model state resets per request
 - **32 messages max** — `messages` array is limited to 32 entries
