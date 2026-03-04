@@ -7,7 +7,6 @@
 
 #include "efi.h"
 #include "ns_net.h"
-#include "foundry/tensor/tensor.h"
 #include "model/model.h"
 #include "iwn/iwn.h"
 #include "e1000e/e1000e.h"
@@ -117,94 +116,6 @@ static void show_boot_menu(void) {
     efi_print_ascii("  [2] Settings\r\n");
     efi_print_ascii("\r\n");
     efi_print_ascii("  Select: ");
-}
-
-/* ----------------------------------------------------------------- */
-/* Tensor self-test — verifies foundry tensor ops on bare metal      */
-/* ----------------------------------------------------------------- */
-static void tensor_self_test(void) {
-    efi_print_ascii("  Running tensor self-test...\r\n");
-    int pass;
-
-    /* Disable autograd — we're doing inference, not training */
-    bool prev_grad = tm_no_grad_begin();
-
-    /* Test 1: matmul — [2,3] @ [3,2] = [2,2] with all 3.0 */
-    {
-        int64_t shape_a[] = {2, 3};
-        int64_t shape_b[] = {3, 2};
-        tm_tensor *a = tm_ones(shape_a, 2, TM_F32);
-        tm_tensor *b = tm_ones(shape_b, 2, TM_F32);
-        tm_tensor *c = tm_matmul(a, b);
-
-        float *data = tm_data_f32(c);
-        pass = (c && c->shape[0] == 2 && c->shape[1] == 2 &&
-                data[0] == 3.0f && data[1] == 3.0f &&
-                data[2] == 3.0f && data[3] == 3.0f);
-        efi_print_ascii(pass ? "  PASS: matmul\r\n" : "  FAIL: matmul\r\n");
-
-        tm_free(a);
-        tm_free(b);
-        tm_free(c);
-    }
-
-    /* Test 2: softmax — use tm_softmax now */
-    {
-        int64_t shape[] = {1, 4};
-        tm_tensor *t = tm_ones(shape, 2, TM_F32);
-        tm_tensor *s = tm_softmax(t, -1);
-
-        float *data = tm_data_f32(s);
-        /* softmax of [1,1,1,1] = [0.25, 0.25, 0.25, 0.25] */
-        float total = data[0] + data[1] + data[2] + data[3];
-        pass = (total > 0.999f && total < 1.001f &&
-                data[0] > 0.24f && data[0] < 0.26f);
-        efi_print_ascii(pass ? "  PASS: softmax\r\n" : "  FAIL: softmax\r\n");
-
-        tm_free(t);
-        tm_free(s);
-    }
-
-    /* Test 3: rms_norm — normalized output */
-    {
-        int64_t shape[] = {1, 4};
-        tm_tensor *t = tm_full(shape, 2, TM_F32, 2.0);
-        tm_tensor *w = tm_ones(shape, 2, TM_F32);
-        tm_tensor *n = tm_rms_norm(t, w, 1e-6f);
-
-        if (!n) { efi_print_ascii("  FAIL: rms_norm returned NULL\r\n"); tm_free(t); tm_free(w); goto done; }
-
-        float *data = tm_data_f32(n);
-        /* RMS of [2,2,2,2] = 2.0, so normalized = 2/2 * 1 = 1.0 */
-        pass = (data[0] > 0.99f && data[0] < 1.01f);
-        efi_print_ascii(pass ? "  PASS: rms_norm\r\n" : "  FAIL: rms_norm\r\n");
-
-        tm_free(t);
-        tm_free(w);
-        tm_free(n);
-    }
-
-    /* Test 4: silu — silu(x) = x * sigmoid(x) */
-    {
-        int64_t shape[] = {4};
-        tm_tensor *t = tm_ones(shape, 1, TM_F32);
-        if (!t) { efi_print_ascii("  FAIL: silu: tm_ones NULL\r\n"); goto done; }
-
-        tm_tensor *s = tm_silu(t);
-        if (!s) { efi_print_ascii("  FAIL: silu: tm_silu NULL\r\n"); tm_free(t); goto done; }
-
-        float *data = tm_data_f32(s);
-        /* silu(1.0) = 1.0 * sigmoid(1.0) = 1.0 * 0.7311 ≈ 0.7311 */
-        pass = (data[0] > 0.73f && data[0] < 0.74f);
-        efi_print_ascii(pass ? "  PASS: silu\r\n" : "  FAIL: silu\r\n");
-
-        tm_free(t);
-        tm_free(s);
-    }
-
-done:
-    tm_no_grad_end(prev_grad);
-    efi_print_ascii("  Tensor self-test complete.\r\n");
 }
 
 /* ---- Integer-to-ASCII helper (freestanding) ---- */
@@ -1347,12 +1258,6 @@ int ba_exec_cmd(const char *line) {
         return 0;
     }
 
-    /* tensor — run tensor self-test */
-    if (str_eq(line, "tensor")) {
-        tensor_self_test();
-        return 0;
-    }
-
     /* install — install to hard drive */
     if (str_eq(line, "install")) {
         ba_install_to_hd();
@@ -1504,9 +1409,6 @@ static void __attribute__((used)) app_main(void) {
 
     /* Auto-connect WiFi if adapter present and wifi.conf exists */
     efi_wifi_auto_connect();
-
-    /* Run tensor self-test at boot */
-    tensor_self_test();
 
 #ifdef PROD
     /* PROD mode: skip menu, boot straight into chat */

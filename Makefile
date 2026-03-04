@@ -19,17 +19,11 @@ ifdef DEBUG_REMOTE
 CFLAGS += -DDEBUG_REMOTE
 endif
 
-# Shim headers: declaration-only libc for bare-metal foundry (no __builtin_* wrappers)
-SHIM_CFLAGS = -I shim
-
 # Phase 1: EFI layer only (console + input + memory)
 EFI_SRC   = efi/main.c efi/console.c efi/input.c efi/efi_memory.c efi/reloc.c efi/install.c efi/net.c efi/net_diag.c efi/http_server.c efi/api.c efi/mgmt_api.c efi/drivers.c efi/wifi.c efi/mdns.c efi/ns_net.c efi/ns_arp.c efi/ns_ip.c efi/ns_udp.c efi/ns_dhcp.c efi/ns_tcp.c iwn/iwn_pci.c iwn/iwn_hw.c iwn/iwn_dma.c iwn/iwn_fw.c iwn/iwn_scan.c iwn/iwn_crypto.c iwn/iwn_assoc.c iwn/iwn_eapol.c iwn/iwn_data.c iwn/iwn_ccmp.c iwn/iwn_snp.c e1000e/e1000e_hw.c
 
 # Phase 3: UEFI libc shim (malloc/printf via UEFI Boot Services)
 LIBC_SRC  = efi/uefi_libc.c
-
-# Foundry tensor library sources
-FOUNDRY_SRC = foundry/tensor/tensor.c foundry/quantization/quantization.c
 
 # Phase 4: Filesystem + Model + Tokenizer
 FS_SRC    = efi/fs.c
@@ -45,13 +39,13 @@ RWKVX_SRC  = model/rwkvx.c model/wkv7.c
 TOOLS_SRC  = tools/tool_use.c tools/tools_fs.c tools/tools_net.c tools/tools_system.c
 RWKV_TOK   = tokenizer/rwkv_tokenizer.c
 
-ALL_SRC = $(EFI_SRC) $(LIBC_SRC) $(FOUNDRY_SRC) $(PHASE4_SRC) \
+ALL_SRC = $(EFI_SRC) $(LIBC_SRC) $(PHASE4_SRC) \
           $(RWKVX_SRC) $(TOOLS_SRC) $(RWKV_TOK)
 ALL_OBJ = $(ALL_SRC:.c=.o)
 
 PHASE1_OBJ = $(EFI_SRC:.c=.o)
-PHASE3_OBJ = $(EFI_SRC:.c=.o) $(LIBC_SRC:.c=.o) $(FOUNDRY_SRC:.c=.o)
-PHASE4_OBJ = $(EFI_SRC:.c=.o) $(LIBC_SRC:.c=.o) $(FOUNDRY_SRC:.c=.o) $(PHASE4_SRC:.c=.o)
+PHASE3_OBJ = $(EFI_SRC:.c=.o) $(LIBC_SRC:.c=.o)
+PHASE4_OBJ = $(EFI_SRC:.c=.o) $(LIBC_SRC:.c=.o) $(PHASE4_SRC:.c=.o)
 
 # UEFI firmware for QEMU (built from EDK2 with NETWORK_IP4_ENABLE)
 OVMF_CODE ?= ovmf-code.fd
@@ -71,7 +65,7 @@ phase3: bootai.efi
 
 phase4: bootai-p4.efi
 
-# Phase 3 build (EFI + libc + foundry tensor)
+# Phase 3 build (EFI + libc)
 bootai.efi: $(PHASE3_OBJ)
 	$(LD) -T efi/uefi.lds -nostdlib -shared -Bsymbolic -o bootai.so $^
 	$(OBJCOPY) -j .text -j .data -j .bss -j .dynamic -j .dynsym -j .rel \
@@ -103,17 +97,6 @@ all_bootai.efi: $(ALL_OBJ)
 # uefi_libc.c uses only compiler-provided headers + efi.h — no JACLibc
 efi/uefi_libc.o: efi/uefi_libc.c
 	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Foundry sources: force-include the shim to redirect malloc/printf, plus JACLibc
-foundry/tensor/tensor.o: foundry/tensor/tensor.c
-	$(CC) $(CFLAGS) $(SHIM_CFLAGS) -include efi/uefi_libc.h \
-	    -I foundry/tensor -Wno-unused-parameter -Wno-sign-compare \
-	    -c -o $@ $<
-
-foundry/quantization/quantization.o: foundry/quantization/quantization.c
-	$(CC) $(CFLAGS) $(SHIM_CFLAGS) -include efi/uefi_libc.h \
-	    -I foundry/tensor -I foundry/quantization -Wno-unused-parameter -Wno-sign-compare \
-	    -c -o $@ $<
 
 # Create FAT32 disk image with EFI binary + model + vocab
 # Size: model + vocab + 50MB headroom, rounded up to nearest MB
@@ -230,7 +213,7 @@ run-prod:
 		-device virtio-net-pci,netdev=net0 \
 		-device virtio-rng-pci
 
-# Run phase 3 (no model, networking + tensor only)
+# Run phase 3 (no model, networking only)
 run3: bootai.efi
 	mkdir -p esp/EFI/BOOT esp/rwkvos esp/workspace
 	cp bootai.efi esp/EFI/BOOT/BOOTX64.EFI
