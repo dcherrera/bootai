@@ -1062,7 +1062,9 @@ static EFI_STATUS create_boot_entry(void) {
     memcpy(p, desc, desc_bytes);
     p += desc_bytes;
 
-    /* HD device path node */
+    /* HD device path node — MBR signature matching.
+     * Dell E6510 uses MBR (not GPT), so match via the 4-byte disk
+     * signature at MBR offset 440 (0xB007A1DA). */
     HD_DEVICE_PATH *hd = (HD_DEVICE_PATH *)p;
     hd->Header.Type = 0x04;      /* Media */
     hd->Header.SubType = 0x01;   /* Hard Drive */
@@ -1070,10 +1072,11 @@ static EFI_STATUS create_boot_entry(void) {
     hd->PartitionNumber = 1;
     hd->PartitionStart = ESP_START_LBA;
     hd->PartitionSize = ESP_SECTORS;
-    /* GPT partition GUID (mixed-endian as per UEFI spec) */
-    memcpy(hd->Signature, &esp_unique_guid, 16);
-    hd->MBRType = 0x02;          /* GPT */
-    hd->SignatureType = 0x02;    /* GUID signature */
+    /* MBR disk signature (4 bytes at offset 0, rest zeroed) */
+    memset(hd->Signature, 0, 16);
+    *(uint32_t *)hd->Signature = 0xB007A1DA;
+    hd->MBRType = 0x01;          /* MBR */
+    hd->SignatureType = 0x01;    /* 32-bit MBR disk signature */
     p += 42;
 
     /* File path device path node */
@@ -1188,7 +1191,7 @@ void ba_install_to_hd(void) {
      * Don't rely on efi_fs_root() — Dell has multiple SimpleFileSystem
      * volumes (HP Port Rep, BOOTAI USB) and LocateProtocol may find
      * the wrong one. Enumerate all volumes and find ours. */
-    efi_print_ascii("  [1/6] Reading files from USB...\r\n");
+    efi_print_ascii("  [1/7] Reading files from USB...\r\n");
 
     EFI_STATUS st;
     EFI_FILE_PROTOCOL *usb_root = 0;
@@ -1266,12 +1269,25 @@ void ba_install_to_hd(void) {
         efi_print_ascii("\r\n");
     }
 
-    /* Step 2: Write GPT partition table + protective MBR.
-     * UEFI firmware on fixed/internal drives requires GPT — the removable
-     * media fallback path (\EFI\BOOT\BOOTX64.EFI) only auto-discovers on
-     * USB. Internal drives need GPT + NVRAM boot entries. */
-    efi_print_ascii("  [2/6] Writing GPT partition table...");
-    st = write_gpt(disk);
+    /* Confirmation prompt — this wipes the entire disk */
+    efi_print_ascii("  WARNING: This will ERASE ALL DATA on the disk.\r\n");
+    efi_print_ascii("  Type 'yes' to continue: ");
+    {
+        char confirm[16] = {0};
+        efi_read_line(confirm, sizeof(confirm));
+        efi_print_ascii("\r\n");
+        if (!(confirm[0] == 'y' && confirm[1] == 'e' && confirm[2] == 's' &&
+              (confirm[3] == '\0' || confirm[3] == '\r' || confirm[3] == '\n'))) {
+            efi_print_ascii("  Aborted.\r\n");
+            goto cleanup;
+        }
+    }
+
+    /* Step 2: Write MBR partition table.
+     * Dell E6510 UEFI firmware doesn't boot from GPT on internal disks.
+     * MBR with type 0xEF (EFI System) works — same format as the USB. */
+    efi_print_ascii("  [2/7] Writing MBR partition table...");
+    st = write_mbr(disk);
     if (st != EFI_SUCCESS) {
         efi_print_ascii(" FAILED\r\n");
         goto cleanup;
@@ -1279,7 +1295,7 @@ void ba_install_to_hd(void) {
     efi_print_ascii(" OK\r\n");
 
     /* Step 3: Format ESP */
-    efi_print_ascii("  [3/6] Formatting FAT32 (100 MB ESP)...");
+    efi_print_ascii("  [3/7] Formatting FAT32 (100 MB ESP)...");
     st = format_fat32(disk);
     if (st != EFI_SUCCESS) {
         efi_print_ascii(" FAILED\r\n");
@@ -1292,7 +1308,7 @@ void ba_install_to_hd(void) {
         uint64_t raw_end = disk->Media->LastBlock - 33; /* backup GPT entries */
         uint64_t raw_size = (raw_end - RAW_START_LBA + 1) * 512ULL;
 
-        efi_print_ascii("  [4/6] Copying model to data partition (");
+        efi_print_ascii("  [4/7] Copying model to data partition (");
         print_size_human(raw_size);
         efi_print_ascii(")...\r\n");
 
@@ -1362,7 +1378,7 @@ void ba_install_to_hd(void) {
     }
 
     /* Step 5: Write files directly to FAT32 via Block IO */
-    efi_print_ascii("  [5/6] Writing files to ESP:\r\n");
+    efi_print_ascii("  [5/7] Writing files to ESP:\r\n");
 
     st = fat32_write_esp_files(disk, &pr_efi, &pr_vocab, &pr_wifi);
     if (st != EFI_SUCCESS) {

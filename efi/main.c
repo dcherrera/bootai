@@ -150,6 +150,33 @@ ba_tokenizer *g_tok   = 0;
 #define VOCAB_PATH "\\rwkvos\\vocab.btv"
 #define MODELS_DIR "\\rwkvos\\models"
 
+static int load_model(const char *name);  /* forward decl */
+
+/* Try to load a single vocab file. Returns 1 if it matches g_model. */
+static int try_one_vocab(const char *path) {
+    int model_vocab = g_model->config.vocab_size;
+    ba_tokenizer *try_tok = ba_tokenizer_load(path);
+    if (!try_tok) return 0;
+    int tok_vocab = ba_tokenizer_vocab_size(try_tok);
+    if (tok_vocab == model_vocab) {
+        g_tok = try_tok;
+        return 1;
+    }
+    ba_tokenizer_free(try_tok);
+    return 0;
+}
+
+/* Try to load a vocab that matches the current g_model's vocab_size.
+ * Returns 1 on success, 0 if no matching vocab found.
+ * Uses direct string literals — no static pointer arrays (PIC relocation issue). */
+static int try_load_matching_vocab(void) {
+    if (try_one_vocab(VOCAB_PATH)) return 1;
+    if (try_one_vocab(MODELS_DIR "\\qwen25-coder-05b\\vocab.btv")) return 1;
+    if (try_one_vocab(MODELS_DIR "\\qwen25-coder-3b\\vocab.btv")) return 1;
+    if (try_one_vocab(MODELS_DIR "\\smollm-135m\\vocab.btv")) return 1;
+    return 0;
+}
+
 static int ensure_model_loaded(void) {
     if (g_model && g_tok) return 1;
 
@@ -160,27 +187,30 @@ static int ensure_model_loaded(void) {
     }
 
     if (!g_model) {
-        /* Try raw data partition first (HD install stores model there) */
-        void *raw_data = 0;
-        UINTN raw_size = 0;
-        if (ba_raw_read_entry("model.btw", &raw_data, &raw_size) == EFI_SUCCESS) {
-            g_model = ba_model_load_buffer(raw_data, raw_size);
+        /* Try filesystem model+vocab pairs.
+         * Uses load_model() which builds paths on the stack and loads
+         * model+vocab from the same directory — guaranteed to match. */
+
+        /* Try flat paths first */
+        if (!g_model) {
+            ba_model *m = ba_model_load(MODEL_PATH);
+            if (m) {
+                ba_tokenizer *t = ba_tokenizer_load(VOCAB_PATH);
+                if (t) {
+                    g_model = m; g_tok = t;
+                } else {
+                    ba_model_free(m);
+                }
+            }
         }
 
-        /* Fall back to filesystem (USB boot has model as file) */
-        if (!g_model) {
-            efi_print_ascii("  Loading model from " MODEL_PATH "...\r\n");
-            g_model = ba_model_load(MODEL_PATH);
-        }
-
-        /* Try first multi-model dir if flat path also failed */
-        if (!g_model) {
-            efi_print_ascii("  Trying " MODELS_DIR "\\smollm-135m\\model.btw...\r\n");
-            g_model = ba_model_load(MODELS_DIR "\\smollm-135m\\model.btw");
-        }
+        /* Try named model directories in priority order */
+        if (!g_model) load_model("qwen25-coder-05b");
+        if (!g_model) load_model("qwen25-coder-3b");
+        if (!g_model) load_model("smollm-135m");
 
         if (!g_model) {
-            efi_print_ascii("  ERROR: failed to load model\r\n");
+            efi_print_ascii("  ERROR: no model+vocab pair found\r\n");
             return 0;
         }
 
@@ -191,36 +221,9 @@ static int ensure_model_loaded(void) {
         int_to_str(num, cfg->n_embd); efi_print_ascii(num); efi_print_ascii(" hidden, ");
         int_to_str(num, cfg->vocab_size); efi_print_ascii(num); efi_print_ascii(" vocab\r\n");
 
-        /* Print size */
         uint64_t mb = g_model->raw_size / (1024 * 1024);
         int_to_str(num, (int)mb);
         efi_print_ascii("  Weights: "); efi_print_ascii(num); efi_print_ascii(" MB\r\n");
-    }
-
-    if (!g_tok) {
-        /* Try legacy flat path first, then scan multi-model dirs for vocab */
-        efi_print_ascii("  Loading vocab from " VOCAB_PATH "...\r\n");
-        g_tok = ba_tokenizer_load(VOCAB_PATH);
-        if (!g_tok) {
-            /* Try each model directory for a matching vocab */
-            static const char *vocab_paths[] = {
-                MODELS_DIR "\\smollm-135m\\vocab.btv",
-                MODELS_DIR "\\qwen25-coder-3b\\vocab.btv",
-                0
-            };
-            for (int i = 0; vocab_paths[i]; i++) {
-                efi_print_ascii("  Trying ");
-                efi_print_ascii(vocab_paths[i]);
-                efi_print_ascii("...\r\n");
-                g_tok = ba_tokenizer_load(vocab_paths[i]);
-                if (g_tok) break;
-            }
-        }
-        if (!g_tok) {
-            efi_print_ascii("  ERROR: failed to load vocab\r\n");
-            return 0;
-        }
-        efi_print_ascii("  Vocab loaded.\r\n");
     }
 
     return 1;
@@ -449,6 +452,7 @@ static int buf_append_n(char *buf, int pos, int max, const char *s, int n) {
 static void command_chat(void) {
     if (!ensure_model_loaded()) {
         efi_print_ascii("  No model loaded. Use /models and /load <name>\r\n");
+        return;
     }
 
     ba_sample_config cfg = ba_default_config();
@@ -532,11 +536,21 @@ static void command_chat(void) {
         }
         efi_print_ascii("\r\n\r\n");
 
-        /* Generate response */
+        /* Generate response (ESC to stop) */
         int n_gen = 0;
         int recent_tokens[64];
         int n_recent = 0;
+        int stopped = 0;
         for (int i = 0; i < cfg.max_tokens; i++) {
+            /* Check for ESC key (non-blocking) */
+            EFI_INPUT_KEY stop_key;
+            if (efi_read_key(&stop_key) == EFI_SUCCESS) {
+                if (stop_key.ScanCode == 0x17 || stop_key.UnicodeChar == 0x1B) {
+                    stopped = 1;
+                    break;
+                }
+            }
+
             int next = ba_model_sample(logits, vocab, &cfg, recent_tokens, n_recent);
             if (next == eos_id || next == im_end_id) break;
 
@@ -559,7 +573,8 @@ static void command_chat(void) {
             logits = ba_model_forward(g_model, &next, 1);
         }
 
-        efi_print_ascii("\r\n\r\n");
+        if (stopped) efi_print_ascii("\r\n  [stopped]\r\n");
+        efi_print_ascii("\r\n");
         first_turn = 0;
     }
 }

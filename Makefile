@@ -55,8 +55,8 @@ OVMF_VARS ?= ovmf-vars.fd
 .PHONY: phase1 phase3 phase4 efi run run-prod clean usb img img-multi release test-iwn-crypto
 
 # Model files (source paths)
-MODEL_BTW ?= ../models/base/SmolLM2-135M-Instruct/model.btw
-MODEL_BTV ?= ../models/base/SmolLM2-135M-Instruct/model.btv
+MODEL_BTW ?= DownloadedModels/Qwen2.5-Coder-0.5B-Instruct/model.btw
+MODEL_BTV ?= DownloadedModels/Qwen2.5-Coder-0.5B-Instruct/model.btv
 
 phase1: PHASE3_OBJ = $(PHASE1_OBJ)
 phase1: bootai.efi

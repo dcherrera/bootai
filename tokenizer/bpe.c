@@ -284,6 +284,7 @@ int ba_tokenizer_decode(ba_tokenizer *tok, const int *tokens, int n_tokens,
 int ba_tokenizer_im_start(ba_tokenizer *tok) { return tok->im_start_id; }
 int ba_tokenizer_im_end(ba_tokenizer *tok) { return tok->im_end_id; }
 int ba_tokenizer_eos(ba_tokenizer *tok) { return tok->eos_id; }
+int ba_tokenizer_vocab_size(ba_tokenizer *tok) { return tok->n_tokens; }
 
 void ba_tokenizer_free(ba_tokenizer *tok) {
     if (!tok) return;

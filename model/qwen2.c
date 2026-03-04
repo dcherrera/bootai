@@ -385,42 +385,6 @@ float* ba_qwen_forward(ba_model *m, int token) {
         matvec_f16(ws->ln_buf, m->embed_f16, ws->logits, cfg->vocab_size, c);
     }
 
-    /* Debug: print logit stats on first 2 tokens to verify forward pass */
-    if (pos < 2) {
-        float lmin = ws->logits[0], lmax = ws->logits[0];
-        int argmax = 0;
-        for (int i = 1; i < cfg->vocab_size; i++) {
-            if (ws->logits[i] > lmax) { lmax = ws->logits[i]; argmax = i; }
-            if (ws->logits[i] < lmin) lmin = ws->logits[i];
-        }
-        /* Also print first few hidden state values after all layers */
-        efi_print_ascii("  [dbg] pos=");
-        /* simple int print */
-        char dbg[32];
-        int dp = 0;
-        int pv = pos;
-        if (pv == 0) dbg[dp++] = '0';
-        else { char tmp[12]; int ti = 0; while (pv > 0) { tmp[ti++] = '0' + pv % 10; pv /= 10; } while (ti > 0) dbg[dp++] = tmp[--ti]; }
-        dbg[dp] = 0;
-        efi_print_ascii(dbg);
-        efi_print_ascii(" argmax=");
-        pv = argmax; dp = 0;
-        if (pv == 0) dbg[dp++] = '0';
-        else { char tmp[12]; int ti = 0; while (pv > 0) { tmp[ti++] = '0' + pv % 10; pv /= 10; } while (ti > 0) dbg[dp++] = tmp[--ti]; }
-        dbg[dp] = 0;
-        efi_print_ascii(dbg);
-        /* Print x[0..3] to check hidden state sanity */
-        efi_print_ascii(" x0=");
-        int xi = (int)(ws->x[0] * 100.0f);
-        if (xi < 0) { efi_print_ascii("-"); xi = -xi; }
-        pv = xi; dp = 0;
-        if (pv == 0) dbg[dp++] = '0';
-        else { char tmp[12]; int ti = 0; while (pv > 0) { tmp[ti++] = '0' + pv % 10; pv /= 10; } while (ti > 0) dbg[dp++] = tmp[--ti]; }
-        dbg[dp] = 0;
-        efi_print_ascii(dbg);
-        efi_print_ascii("\r\n");
-    }
-
     m->position++;
     return ws->logits;
 }
