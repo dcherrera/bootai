@@ -798,6 +798,16 @@ extern EFI_GUID gEfiPciIoProtocolGuid;
 extern EFI_GUID gEfiSimpleNetworkProtocolGuid;
 extern EFI_GUID gEfiBlockIoProtocolGuid;
 extern EFI_GUID gEfiDevicePathProtocolGuid;
+extern EFI_GUID gEfiLoadedImageProtocolGuid;
+
+/* Minimal EFI_LOADED_IMAGE_PROTOCOL — only fields up to DeviceHandle */
+typedef struct {
+    uint32_t   Revision;
+    EFI_HANDLE ParentHandle;
+    void      *SystemTable;
+    EFI_HANDLE DeviceHandle;
+    /* remaining fields omitted — not needed */
+} EFI_LOADED_IMAGE_PROTOCOL;
 
 /* Global system table + image handle — set in efi_main */
 extern EFI_SYSTEM_TABLE *gST;
@@ -940,6 +950,9 @@ extern EFI_GUID gEfiDhcp4ServiceBindingGuid;
 /* Install to hard drive */
 void ba_install_to_hd(void);
 void ba_hdinfo(void);
+
+/* NVRAM boot entry — write Boot0001 pointing to current boot device */
+void ba_bootfix(void);
 
 /* Read entry from raw data partition (for HD boot model loading) */
 EFI_STATUS ba_raw_read_entry(const char *name, void **buffer, UINTN *size);

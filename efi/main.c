@@ -40,6 +40,11 @@ EFI_GUID gEfiMpServicesProtocolGuid = {
     {0xad, 0x29, 0x12, 0xf4, 0x53, 0x1b, 0x3d, 0x08}
 };
 
+EFI_GUID gEfiLoadedImageProtocolGuid = {
+    0x5B1B31A1, 0x9562, 0x11d2,
+    {0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
+};
+
 /* EFI_MP_SERVICES_PROTOCOL — lightweight typedef for probing */
 typedef void (EFIAPI *EFI_AP_PROCEDURE)(void *Buffer);
 
@@ -581,6 +586,174 @@ static void command_chat(void) {
 
 #define HTTP_RESPONSE_MAX 8192
 #define DISPLAY_MAX       2048
+
+/* ---- bootfix: promote existing USB UEFI boot entry in BootOrder ---- */
+
+/* Check if UCS-2 description contains an ASCII substring (case-insensitive) */
+static int ucs2_contains(const uint16_t *ucs2, const char *needle) {
+    int nlen = 0;
+    while (needle[nlen]) nlen++;
+
+    for (int i = 0; ucs2[i]; i++) {
+        int match = 1;
+        for (int j = 0; j < nlen; j++) {
+            uint16_t c = ucs2[i + j];
+            char nc = needle[j];
+            /* Lowercase both */
+            if (c >= 'A' && c <= 'Z') c += 32;
+            if (nc >= 'A' && nc <= 'Z') nc += 32;
+            if (c != (uint16_t)(unsigned char)nc) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+void ba_bootfix(void) {
+    EFI_RUNTIME_SERVICES *gRT = gST->RuntimeServices;
+    EFI_STATUS st;
+    char num[12];
+
+    EFI_GUID global_var_guid = {
+        0x8BE4DF61, 0x93CA, 0x11d2,
+        {0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C}
+    };
+
+    uint32_t nv_attrs = EFI_VARIABLE_NON_VOLATILE |
+                        EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                        EFI_VARIABLE_RUNTIME_ACCESS;
+
+    /* Step 1: Read BootOrder */
+    uint16_t boot_order_name[] = { 'B','o','o','t','O','r','d','e','r', 0 };
+    uint8_t order_buf[256];
+    UINTN order_size = sizeof(order_buf);
+    uint32_t order_attrs = 0;
+
+    st = gRT->GetVariable(boot_order_name, &global_var_guid,
+                           &order_attrs, &order_size, order_buf);
+    if (st != EFI_SUCCESS || order_size < 2) {
+        efi_print_ascii("  ERROR: cannot read BootOrder\r\n");
+        return;
+    }
+
+    uint16_t *entries = (uint16_t *)order_buf;
+    int n_entries = (int)(order_size / 2);
+
+    efi_print_ascii("  Scanning ");
+    int_to_str(num, n_entries); efi_print_ascii(num);
+    efi_print_ascii(" boot entries...\r\n");
+
+    /* Step 2: For each Boot#### entry, read and check description */
+    int found_idx = -1;
+    uint16_t found_num = 0;
+
+    for (int i = 0; i < n_entries; i++) {
+        uint16_t entry_num = entries[i];
+
+        /* Build "Boot####" variable name */
+        uint16_t var_name[9];
+        var_name[0] = 'B';
+        var_name[1] = 'o';
+        var_name[2] = 'o';
+        var_name[3] = 't';
+        var_name[4] = "0123456789ABCDEF"[(entry_num >> 12) & 0xF];
+        var_name[5] = "0123456789ABCDEF"[(entry_num >> 8) & 0xF];
+        var_name[6] = "0123456789ABCDEF"[(entry_num >> 4) & 0xF];
+        var_name[7] = "0123456789ABCDEF"[entry_num & 0xF];
+        var_name[8] = 0;
+
+        /* Read the Boot#### variable */
+        uint8_t opt_buf[512];
+        UINTN opt_size = sizeof(opt_buf);
+        uint32_t opt_attrs = 0;
+
+        st = gRT->GetVariable(var_name, &global_var_guid,
+                               &opt_attrs, &opt_size, opt_buf);
+        if (st != EFI_SUCCESS || opt_size < 8) continue;
+
+        /* EFI_LOAD_OPTION layout: Attributes(4) + FilePathListLength(2) + Description(UCS-2 NUL-terminated) + ... */
+        uint16_t *desc = (uint16_t *)(opt_buf + 6);
+
+        /* Print entry for debug */
+        efi_print_ascii("    Boot");
+        {
+            char hx[5];
+            hx[0] = "0123456789ABCDEF"[(entry_num >> 12) & 0xF];
+            hx[1] = "0123456789ABCDEF"[(entry_num >> 8) & 0xF];
+            hx[2] = "0123456789ABCDEF"[(entry_num >> 4) & 0xF];
+            hx[3] = "0123456789ABCDEF"[entry_num & 0xF];
+            hx[4] = 0;
+            efi_print_ascii(hx);
+        }
+        efi_print_ascii(": ");
+        /* Print UCS-2 description as ASCII */
+        for (int j = 0; desc[j] && j < 60; j++) {
+            char ch = (desc[j] < 128) ? (char)desc[j] : '?';
+            CHAR16 wc[2] = { (CHAR16)ch, 0 };
+            efi_print(wc);
+        }
+        efi_print_ascii("\r\n");
+
+        /* Check if description contains "USB" */
+        if (ucs2_contains(desc, "USB")) {
+            found_idx = i;
+            found_num = entry_num;
+        }
+    }
+
+    if (found_idx < 0) {
+        efi_print_ascii("  ERROR: no USB boot entry found in BootOrder\r\n");
+        return;
+    }
+
+    if (found_idx == 0) {
+        efi_print_ascii("  USB entry (Boot");
+        {
+            char hx[5];
+            hx[0] = "0123456789ABCDEF"[(found_num >> 12) & 0xF];
+            hx[1] = "0123456789ABCDEF"[(found_num >> 8) & 0xF];
+            hx[2] = "0123456789ABCDEF"[(found_num >> 4) & 0xF];
+            hx[3] = "0123456789ABCDEF"[found_num & 0xF];
+            hx[4] = 0;
+            efi_print_ascii(hx);
+        }
+        efi_print_ascii(") is already first in BootOrder\r\n");
+        return;
+    }
+
+    /* Step 3: Rewrite BootOrder with USB entry first */
+    efi_print_ascii("  Promoting Boot");
+    {
+        char hx[5];
+        hx[0] = "0123456789ABCDEF"[(found_num >> 12) & 0xF];
+        hx[1] = "0123456789ABCDEF"[(found_num >> 8) & 0xF];
+        hx[2] = "0123456789ABCDEF"[(found_num >> 4) & 0xF];
+        hx[3] = "0123456789ABCDEF"[found_num & 0xF];
+        hx[4] = 0;
+        efi_print_ascii(hx);
+    }
+    efi_print_ascii(" to front of BootOrder\r\n");
+
+    uint8_t new_order[256];
+    *(uint16_t *)new_order = found_num;
+    UINTN new_size = 2;
+
+    for (int i = 0; i < n_entries && new_size < 254; i++) {
+        if (entries[i] != found_num) {
+            *(uint16_t *)(new_order + new_size) = entries[i];
+            new_size += 2;
+        }
+    }
+
+    st = gRT->SetVariable(boot_order_name, &global_var_guid, nv_attrs,
+                           new_size, new_order);
+    if (st != EFI_SUCCESS) {
+        efi_print_ascii("  ERROR: SetVariable BootOrder failed\r\n");
+        return;
+    }
+
+    efi_print_ascii("  BootOrder updated. BootAI will auto-boot on next reboot.\r\n");
+}
 
 /* Flag: set to 1 when executing a command from the management API.
  * Interactive/blocking commands check this and refuse to run. */
@@ -1285,6 +1458,12 @@ int ba_exec_cmd(const char *line) {
         return 0;
     }
 
+    /* bootfix — create NVRAM boot entry for current device */
+    if (str_eq(line, "bootfix")) {
+        ba_bootfix();
+        return 0;
+    }
+
     /* reboot — reset system */
     if (str_eq(line, "reboot")) {
         if (g_api_context) {
@@ -1310,7 +1489,7 @@ static void command_repl(void) {
     efi_print_ascii("            ls [path], cat <file>, fetch <url>,\r\n");
     efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
     efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, memmap, mpinfo, tensor, install,\r\n");
-    efi_print_ascii("            hdinfo, reboot, exit\r\n");
+    efi_print_ascii("            hdinfo, bootfix, reboot, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {

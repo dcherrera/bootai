@@ -23,6 +23,7 @@ UEFI application that boots directly into AI inference — no kernel, no OS.
 - [Memory Diagnostics](architecture/memory-diagnostics.md) — `meminfo` REPL command: UEFI memory map breakdown by type (loader, firmware, free)
 - [HD Install](architecture/hd-install.md) — Install to hard drive: GPT partitioning, FAT32 ESP, raw data partition with BTAI TOC for unlimited model sizes, boot path model loading via Block IO
 - [Weight Loading Strategy](architecture/weight-loading-strategy.md) — F32 pre-conversion for small models, F16/INT8 strategies for larger models, memory ownership and loader architecture
+- [DUET Legacy Boot](architecture/duet-legacy-boot.md) — Legacy BIOS boot via DUET: MBR boot chain, image building, PS/2 keyboard fallback, plug-and-play on any x86-64 machine
 
 ## Guides
 
