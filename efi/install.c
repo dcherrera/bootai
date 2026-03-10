@@ -233,6 +233,10 @@ static EFI_GUID gEfiFileInfoGuid_install = EFI_FILE_INFO_GUID;
 
 /* ================================================================== */
 /* Find internal (non-removable) disk                                 */
+/*                                                                     */
+/* SAFETY: Never returns the boot device. Uses LoadedImage protocol    */
+/* to find which disk we booted from and excludes it. If only the      */
+/* boot device exists (no internal HDD), returns EFI_NOT_FOUND.        */
 /* ================================================================== */
 
 static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
@@ -245,7 +249,43 @@ static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
     if (status != EFI_SUCCESS || n_handles == 0)
         return EFI_NOT_FOUND;
 
-    /* Find the largest whole-disk device.
+    /* --- Identify boot device so we can exclude it --- */
+    EFI_HANDLE boot_disk_handle = 0;
+    {
+        EFI_LOADED_IMAGE_PROTOCOL *li = 0;
+        status = gBS->HandleProtocol(gImageHandle,
+                     &gEfiLoadedImageProtocolGuid, (void **)&li);
+        if (status == EFI_SUCCESS && li && li->DeviceHandle) {
+            /* DeviceHandle is the partition we booted from.
+             * Find its parent whole-disk: the whole-disk Block IO handle
+             * whose MediaId matches and is NOT a LogicalPartition. */
+            EFI_BLOCK_IO_PROTOCOL *boot_part_bio = 0;
+            gBS->HandleProtocol(li->DeviceHandle,
+                                &gEfiBlockIoProtocolGuid, (void **)&boot_part_bio);
+
+            if (boot_part_bio && boot_part_bio->Media) {
+                uint32_t boot_media_id = boot_part_bio->Media->MediaId;
+                for (UINTN i = 0; i < n_handles; i++) {
+                    EFI_BLOCK_IO_PROTOCOL *bio = 0;
+                    gBS->HandleProtocol(handles[i],
+                                        &gEfiBlockIoProtocolGuid, (void **)&bio);
+                    if (!bio || !bio->Media) continue;
+                    if (bio->Media->LogicalPartition) continue;
+                    if (bio->Media->MediaId == boot_media_id) {
+                        boot_disk_handle = handles[i];
+                        break;
+                    }
+                }
+            }
+
+            /* Fallback: if we couldn't find a whole-disk parent,
+             * at least exclude the partition handle itself */
+            if (!boot_disk_handle)
+                boot_disk_handle = li->DeviceHandle;
+        }
+    }
+
+    /* Find the largest whole-disk device, excluding the boot device.
      * Some firmware (Dell E6510) marks internal SATA as removable,
      * so we skip the RemovableMedia check and pick by size instead. */
     EFI_BLOCK_IO_PROTOCOL *best_bio = 0;
@@ -253,6 +293,8 @@ static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
     uint64_t best_size = 0;
 
     for (UINTN i = 0; i < n_handles; i++) {
+        if (handles[i] == boot_disk_handle) continue;  /* skip boot device */
+
         EFI_BLOCK_IO_PROTOCOL *bio = 0;
         status = gBS->HandleProtocol(handles[i], &gEfiBlockIoProtocolGuid, (void **)&bio);
         if (status != EFI_SUCCESS || !bio) continue;
@@ -285,6 +327,7 @@ static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
         return EFI_SUCCESS;
     }
 
+    efi_print_ascii("    No internal disk found (boot device excluded)\r\n");
     gBS->FreePool(handles);
     return EFI_NOT_FOUND;
 }
@@ -297,27 +340,24 @@ static EFI_STATUS find_internal_disk(EFI_BLOCK_IO_PROTOCOL **disk_out,
 /* it's the same format as the USB drive (which boots fine).            */
 /* ================================================================== */
 
-/* CHS encoding for MBR partition entries */
+/* CHS encoding for MBR partition entries.
+ * Always use FE FF FF (LBA-only marker) — matches how the DUET USB
+ * image is built and avoids CHS translation issues with boot0. */
 static void lba_to_chs(uint32_t lba, uint8_t *chs) {
-    /* Use dummy geometry 255 heads, 63 sectors/track */
-    if (lba >= 255 * 63 * 1024) {
-        chs[0] = 0xFF; chs[1] = 0xFF; chs[2] = 0xFF;
-        return;
-    }
-    uint32_t s = (lba % 63) + 1;
-    uint32_t tmp = lba / 63;
-    uint32_t h = tmp % 255;
-    uint32_t c = tmp / 255;
-    chs[0] = (uint8_t)h;
-    chs[1] = (uint8_t)(s | ((c >> 2) & 0xC0));
-    chs[2] = (uint8_t)c;
+    (void)lba;
+    chs[0] = 0xFE; chs[1] = 0xFF; chs[2] = 0xFF;
 }
 
-static EFI_STATUS write_mbr(EFI_BLOCK_IO_PROTOCOL *disk) {
+static EFI_STATUS write_mbr(EFI_BLOCK_IO_PROTOCOL *disk,
+                            const uint8_t *boot0_code) {
     uint8_t *mbr = 0;
     EFI_STATUS status = gBS->AllocatePool(EfiLoaderData, 512, (void **)&mbr);
     if (status != EFI_SUCCESS) return status;
     memset(mbr, 0, 512);
+
+    /* If DUET boot0 code provided, inject into MBR (first 446 bytes) */
+    if (boot0_code)
+        memcpy(mbr, boot0_code, 446);
 
     uint64_t last = disk->Media->LastBlock;
     uint32_t mid = disk->Media->MediaId;
@@ -339,14 +379,14 @@ static EFI_STATUS write_mbr(EFI_BLOCK_IO_PROTOCOL *disk) {
         }
     }
 
-    /* Disk signature (unique 32-bit ID at offset 440) */
-    *(uint32_t *)&mbr[440] = 0xB007A1DA;
+    /* Disk signature at offset 440 — must be zero to match working USB image.
+     * DUET boot entry also uses zero signature. */
 
     /* Partition 1: FAT32 LBA, bootable, 100MB at LBA 2048 */
     uint8_t *pe1 = &mbr[446];
     pe1[0] = 0x80;                                      /* Bootable / active */
     lba_to_chs(ESP_START_LBA, &pe1[1]);                 /* CHS start */
-    pe1[4] = 0xEF;                                      /* EFI System Partition */
+    pe1[4] = boot0_code ? 0x0C : 0xEF;                   /* FAT32 LBA for DUET, EFI System otherwise */
     uint32_t esp_end_lba = ESP_START_LBA + (uint32_t)ESP_SECTORS - 1;
     lba_to_chs(esp_end_lba, &pe1[5]);                   /* CHS end */
     *(uint32_t *)&pe1[8] = ESP_START_LBA;               /* LBA start */
@@ -506,7 +546,7 @@ cleanup:
 static EFI_STATUS format_fat32(EFI_BLOCK_IO_PROTOCOL *disk) {
     uint32_t media_id = disk->Media->MediaId;
     uint32_t total_sectors = (uint32_t)ESP_SECTORS;
-    uint32_t spc = 8;          /* 4KB clusters */
+    uint32_t spc = 1;          /* 512B clusters — must keep cluster count ≥65525 for FAT32 */
     uint32_t reserved = 32;
     uint32_t num_fats = 2;
     EFI_STATUS status;
@@ -532,7 +572,7 @@ static EFI_STATUS format_fat32(EFI_BLOCK_IO_PROTOCOL *disk) {
     bpb[21] = 0xF8;                                        /* Media (fixed) */
     *(uint16_t *)&bpb[24] = 63;                            /* SecPerTrk */
     *(uint16_t *)&bpb[26] = 255;                           /* NumHeads */
-    *(uint32_t *)&bpb[28] = (uint32_t)ESP_START_LBA;       /* HiddSec */
+    *(uint32_t *)&bpb[28] = 0;                              /* HiddSec: 0 to match DUET boot1f32 expectations */
     *(uint32_t *)&bpb[32] = total_sectors;                 /* TotSec32 */
     *(uint32_t *)&bpb[36] = fat_size;                      /* FATSz32 */
     *(uint32_t *)&bpb[44] = 2;                             /* RootClus */
@@ -596,6 +636,63 @@ static EFI_STATUS format_fat32(EFI_BLOCK_IO_PROTOCOL *disk) {
 
     disk->FlushBlocks(disk);
     return EFI_SUCCESS;
+}
+
+/* ================================================================== */
+/* Merge boot1f32 PBR code with FAT32 BPB for DUET Legacy Boot        */
+/*                                                                     */
+/* boot1f32 provides the boot code, format_fat32() provides the BPB.  */
+/* The 14 pseudo-random bytes at offset 496 are critical — DUET's BDS */
+/* uses them as a partition signature and rejects all-zeros.           */
+/* ================================================================== */
+
+static EFI_STATUS merge_pbr_boot1f32(EFI_BLOCK_IO_PROTOCOL *disk,
+                                      const uint8_t *boot1f32) {
+    uint32_t mid = disk->Media->MediaId;
+    uint8_t *pbr = 0;
+    EFI_STATUS st = gBS->AllocatePool(EfiLoaderData, 512, (void **)&pbr);
+    if (st != EFI_SUCCESS) return st;
+
+    /* Read the PBR that format_fat32() wrote (has correct BPB) */
+    st = disk->ReadBlocks(disk, mid, ESP_START_LBA, 512, pbr);
+    if (st != EFI_SUCCESS) { gBS->FreePool(pbr); return st; }
+
+    /* Save the BPB (bytes 3-89, 87 bytes) */
+    uint8_t bpb_save[87];
+    memcpy(bpb_save, &pbr[3], 87);
+
+    /* Copy boot1f32 as template (has jump instruction + boot code) */
+    memcpy(pbr, boot1f32, 512);
+
+    /* Restore BPB from format_fat32 */
+    memcpy(&pbr[3], bpb_save, 87);
+
+    /* Write 14 pseudo-random bytes at offset 496-509.
+     * DUET BDS uses these as a partition signature.
+     * Use BPB VolID + disk geometry as entropy seed (no urandom available). */
+    {
+        uint32_t seed = *(uint32_t *)&bpb_save[64];  /* BS_VolID */
+        seed ^= *(uint32_t *)&bpb_save[25];          /* HiddSec */
+        seed ^= (uint32_t)disk->Media->LastBlock;
+        for (int i = 0; i < 14; i++) {
+            seed = seed * 1664525 + 1013904223;
+            pbr[496 + i] = (uint8_t)(seed >> 16);
+        }
+    }
+
+    /* Ensure boot signature */
+    pbr[510] = 0x55;
+    pbr[511] = 0xAA;
+
+    /* Write PBR to partition start */
+    st = disk->WriteBlocks(disk, mid, ESP_START_LBA, 512, pbr);
+    if (st != EFI_SUCCESS) { gBS->FreePool(pbr); return st; }
+
+    /* Also update backup boot sector at partition sector 6 */
+    st = disk->WriteBlocks(disk, mid, ESP_START_LBA + 6, 512, pbr);
+
+    gBS->FreePool(pbr);
+    return st;
 }
 
 /* (Model copy is now done inline from pre-read buffer in ba_install_to_hd) */
@@ -671,7 +768,7 @@ static void preread_free(preread_file *f) {
 typedef struct {
     EFI_BLOCK_IO_PROTOCOL *disk;
     uint32_t media_id;
-    uint32_t spc;            /* sectors per cluster (8) */
+    uint32_t spc;            /* sectors per cluster */
     uint32_t reserved;       /* reserved sectors (32) */
     uint32_t fat_size;       /* FAT size in sectors */
     uint64_t fat1_lba;       /* LBA of first FAT */
@@ -688,7 +785,7 @@ typedef struct {
 static void fat32_init(fat32_state *f, EFI_BLOCK_IO_PROTOCOL *disk) {
     f->disk = disk;
     f->media_id = disk->Media->MediaId;
-    f->spc = 8;
+    f->spc = 1;  /* must match format_fat32() — keeps cluster count ≥65525 for FAT32 */
     f->reserved = 32;
     uint32_t total = (uint32_t)ESP_SECTORS;
     f->fat_size = (total - f->reserved + 128 * f->spc + 1) / (128 * f->spc + 2);
@@ -825,7 +922,8 @@ static uint32_t fat32_mkdir(fat32_state *f, uint32_t parent_cluster,
 static EFI_STATUS fat32_write_esp_files(EFI_BLOCK_IO_PROTOCOL *disk,
                                          preread_file *efi_bin,
                                          preread_file *vocab,
-                                         preread_file *wifi) {
+                                         preread_file *wifi,
+                                         preread_file *duet_fw) {
     fat32_state f;
     fat32_init(&f, disk);
 
@@ -865,6 +963,19 @@ static EFI_STATUS fat32_write_esp_files(EFI_BLOCK_IO_PROTOCOL *disk,
 
     /* Create workspace/ directory */
     fat32_mkdir(&f, 2, root_dir, &root_idx, "WORK       ");
+
+    /* DUET: Create EFI/OC/ directory for OpenCore BDS path */
+    uint8_t *oc_dir = 0;
+    int oc_idx = 0;
+    uint32_t oc_cluster = 0;
+    if (duet_fw && duet_fw->data) {
+        gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&oc_dir);
+        if (oc_dir) {
+            memset(oc_dir, 0, f.cluster_bytes);
+            oc_idx = 2;  /* skip . and .. */
+            oc_cluster = fat32_mkdir(&f, efi_cluster, efi_dir, &efi_idx, "OC         ");
+        }
+    }
 
     /* Write BOOTX64.EFI */
     if (efi_bin->data && efi_bin->size > 0) {
@@ -927,6 +1038,44 @@ static EFI_STATUS fat32_write_esp_files(EFI_BLOCK_IO_PROTOCOL *disk,
         }
     }
 
+    /* DUET: Write /boot (DUET firmware) */
+    if (duet_fw && duet_fw->data && duet_fw->size > 0) {
+        uint32_t n = (uint32_t)((duet_fw->size + f.cluster_bytes - 1) / f.cluster_bytes);
+        uint32_t fc = fat32_alloc(&f, n);
+        if (fc) {
+            fat32_dir_entry(&root_dir[root_idx * 32],
+                            "BOOT       ", 0x20, fc, (uint32_t)duet_fw->size);
+            root_idx++;
+            st = fat32_write_data(&f, fc, duet_fw->data, duet_fw->size);
+            if (st == EFI_SUCCESS) {
+                efi_print_ascii("        boot (");
+                print_size_human(duet_fw->size);
+                efi_print_ascii(") OK\r\n");
+            } else {
+                efi_print_ascii("        boot WRITE FAILED\r\n");
+            }
+        }
+    }
+
+    /* DUET: Write /EFI/OC/OpenCore.efi (copy of BootAI EFI binary) */
+    if (oc_dir && efi_bin->data && efi_bin->size > 0) {
+        uint32_t n = (uint32_t)((efi_bin->size + f.cluster_bytes - 1) / f.cluster_bytes);
+        uint32_t fc = fat32_alloc(&f, n);
+        if (fc) {
+            fat32_dir_entry(&oc_dir[oc_idx * 32],
+                            "OPENCOREEFI", 0x20, fc, (uint32_t)efi_bin->size);
+            oc_idx++;
+            st = fat32_write_data(&f, fc, efi_bin->data, efi_bin->size);
+            if (st == EFI_SUCCESS) {
+                efi_print_ascii("        EFI/OC/OpenCore.efi (");
+                print_size_human(efi_bin->size);
+                efi_print_ascii(") OK\r\n");
+            } else {
+                efi_print_ascii("        EFI/OC/OpenCore.efi WRITE FAILED\r\n");
+            }
+        }
+    }
+
     /* Write directory clusters to disk */
     f.disk->WriteBlocks(f.disk, f.media_id,
                          cluster_lba(&f, 2), f.cluster_bytes, root_dir);
@@ -975,6 +1124,22 @@ static EFI_STATUS fat32_write_esp_files(EFI_BLOCK_IO_PROTOCOL *disk,
         gBS->FreePool(buf);
     }
 
+    /* Re-write OC/ dir with OpenCore.efi entry (if DUET) */
+    if (oc_dir && oc_cluster) {
+        uint8_t *buf = 0;
+        gBS->AllocatePool(EfiLoaderData, f.cluster_bytes, (void **)&buf);
+        if (buf) {
+            memset(buf, 0, f.cluster_bytes);
+            fat32_dir_entry(&buf[0],  ".          ", 0x10, oc_cluster, 0);
+            fat32_dir_entry(&buf[32], "..         ", 0x10, efi_cluster, 0);
+            for (int i = 2; i < oc_idx; i++)
+                memcpy(&buf[i * 32], &oc_dir[i * 32], 32);
+            f.disk->WriteBlocks(f.disk, f.media_id,
+                                 cluster_lba(&f, oc_cluster), f.cluster_bytes, buf);
+            gBS->FreePool(buf);
+        }
+    }
+
     /* Flush FAT (both copies) */
     fat32_flush_fat(&f);
 
@@ -985,6 +1150,7 @@ static EFI_STATUS fat32_write_esp_files(EFI_BLOCK_IO_PROTOCOL *disk,
     gBS->FreePool(efi_dir);
     gBS->FreePool(boot_dir);
     gBS->FreePool(rwkvos_dir);
+    if (oc_dir) gBS->FreePool(oc_dir);
     fat32_free(&f);
     return EFI_SUCCESS;
 }
@@ -1063,8 +1229,7 @@ static EFI_STATUS create_boot_entry(void) {
     p += desc_bytes;
 
     /* HD device path node — MBR signature matching.
-     * Dell E6510 uses MBR (not GPT), so match via the 4-byte disk
-     * signature at MBR offset 440 (0xB007A1DA). */
+     * Disk signature is zero (matching MBR offset 440). */
     HD_DEVICE_PATH *hd = (HD_DEVICE_PATH *)p;
     hd->Header.Type = 0x04;      /* Media */
     hd->Header.SubType = 0x01;   /* Hard Drive */
@@ -1072,9 +1237,7 @@ static EFI_STATUS create_boot_entry(void) {
     hd->PartitionNumber = 1;
     hd->PartitionStart = ESP_START_LBA;
     hd->PartitionSize = ESP_SECTORS;
-    /* MBR disk signature (4 bytes at offset 0, rest zeroed) */
     memset(hd->Signature, 0, 16);
-    *(uint32_t *)hd->Signature = 0xB007A1DA;
     hd->MBRType = 0x01;          /* MBR */
     hd->SignatureType = 0x01;    /* 32-bit MBR disk signature */
     p += 42;
@@ -1191,10 +1354,11 @@ void ba_install_to_hd(void) {
      * Don't rely on efi_fs_root() — Dell has multiple SimpleFileSystem
      * volumes (HP Port Rep, BOOTAI USB) and LocateProtocol may find
      * the wrong one. Enumerate all volumes and find ours. */
-    efi_print_ascii("  [1/7] Reading files from USB...\r\n");
+    efi_print_ascii("  [1/8] Reading files from USB...\r\n");
 
     EFI_STATUS st;
     EFI_FILE_PROTOCOL *usb_root = 0;
+    EFI_HANDLE usb_fs_handle = 0;
     {
         UINTN n_fs = 0;
         EFI_HANDLE *fs_handles = 0;
@@ -1224,6 +1388,7 @@ void ba_install_to_hd(void) {
                 if (st == EFI_SUCCESS && probe) {
                     probe->Close(probe);
                     usb_root = vol;
+                    usb_fs_handle = fs_handles[fi];
                     efi_print_ascii("        Found BOOTAI volume (fs ");
                     print_dec64(fi);
                     efi_print_ascii(")\r\n");
@@ -1269,6 +1434,89 @@ void ba_install_to_hd(void) {
         efi_print_ascii("\r\n");
     }
 
+    /* DUET detection: read USB boot sectors to check for DUET boot chain.
+     * Find the USB whole-disk Block IO (any whole disk that isn't our HD target)
+     * and read sector 0 (MBR). If first byte is 0xFA (CLI instruction), it's
+     * a DUET USB with boot0 code in the MBR. */
+    int is_duet = 0;
+    uint8_t boot0_buf[446];
+    uint8_t boot1f32_buf[512];
+    memset(boot0_buf, 0, 446);
+    memset(boot1f32_buf, 0, 512);
+    preread_file pr_duet_fw = {0};
+
+    {
+        /* Find USB whole-disk Block IO */
+        EFI_BLOCK_IO_PROTOCOL *usb_disk_bio = 0;
+        EFI_BLOCK_IO_PROTOCOL *usb_part_bio = 0;
+        UINTN n_bio = 0;
+        EFI_HANDLE *bio_handles = 0;
+        st = gBS->LocateHandleBuffer(
+            2 /* ByProtocol */, &gEfiBlockIoProtocolGuid, 0, &n_bio, &bio_handles);
+        if (st == EFI_SUCCESS) {
+            for (UINTN i = 0; i < n_bio; i++) {
+                if (bio_handles[i] == disk_handle) continue;
+                EFI_BLOCK_IO_PROTOCOL *bio = 0;
+                gBS->HandleProtocol(bio_handles[i], &gEfiBlockIoProtocolGuid, (void **)&bio);
+                if (!bio || !bio->Media || !bio->Media->MediaPresent) continue;
+                if (bio->Media->BlockSize != 512) continue;
+                if (!bio->Media->LogicalPartition) {
+                    if (!usb_disk_bio) usb_disk_bio = bio;
+                }
+            }
+            gBS->FreePool(bio_handles);
+        }
+
+        /* Also get USB partition Block IO from the filesystem handle */
+        if (usb_fs_handle) {
+            gBS->HandleProtocol(usb_fs_handle, &gEfiBlockIoProtocolGuid,
+                                 (void **)&usb_part_bio);
+        }
+
+        /* Read USB MBR (sector 0) for boot0 code */
+        if (usb_disk_bio) {
+            uint8_t *usb_mbr = 0;
+            st = gBS->AllocatePool(EfiLoaderData, 512, (void **)&usb_mbr);
+            if (st == EFI_SUCCESS) {
+                st = usb_disk_bio->ReadBlocks(usb_disk_bio,
+                    usb_disk_bio->Media->MediaId, 0, 512, usb_mbr);
+                if (st == EFI_SUCCESS && usb_mbr[0] == 0xFA) {
+                    is_duet = 1;
+                    memcpy(boot0_buf, usb_mbr, 446);
+                    efi_print_ascii("        DUET USB detected (boot0 at MBR)\r\n");
+                }
+                gBS->FreePool(usb_mbr);
+            }
+        }
+
+        /* Read USB PBR (partition sector 0) for boot1f32 code */
+        if (is_duet && usb_part_bio) {
+            uint8_t *usb_pbr = 0;
+            st = gBS->AllocatePool(EfiLoaderData, 512, (void **)&usb_pbr);
+            if (st == EFI_SUCCESS) {
+                st = usb_part_bio->ReadBlocks(usb_part_bio,
+                    usb_part_bio->Media->MediaId, 0, 512, usb_pbr);
+                if (st == EFI_SUCCESS) {
+                    memcpy(boot1f32_buf, usb_pbr, 512);
+                    efi_print_ascii("        boot1f32 PBR read OK\r\n");
+                }
+                gBS->FreePool(usb_pbr);
+            }
+        }
+
+        /* Pre-read /boot (DUET firmware) from USB */
+        if (is_duet && usb_root) {
+            preread_usb_file(usb_root, "\\boot", &pr_duet_fw);
+            efi_print_ascii("        boot (DUET): ");
+            if (pr_duet_fw.data) { print_size_human(pr_duet_fw.size); }
+            else { efi_print_ascii("not found"); is_duet = 0; }
+            efi_print_ascii("\r\n");
+        }
+    }
+
+    if (is_duet)
+        efi_print_ascii("        DUET Legacy Boot will be installed\r\n");
+
     /* Confirmation prompt — this wipes the entire disk */
     efi_print_ascii("  WARNING: This will ERASE ALL DATA on the disk.\r\n");
     efi_print_ascii("  Type 'yes' to continue: ");
@@ -1285,9 +1533,12 @@ void ba_install_to_hd(void) {
 
     /* Step 2: Write MBR partition table.
      * Dell E6510 UEFI firmware doesn't boot from GPT on internal disks.
-     * MBR with type 0xEF (EFI System) works — same format as the USB. */
-    efi_print_ascii("  [2/7] Writing MBR partition table...");
-    st = write_mbr(disk);
+     * MBR with type 0xEF (EFI System) works — same format as the USB.
+     * If DUET: boot0 code injected into MBR, partition type = 0x0C (FAT32 LBA). */
+    efi_print_ascii("  [2/8] Writing MBR partition table");
+    if (is_duet) efi_print_ascii(" (with boot0)");
+    efi_print_ascii("...");
+    st = write_mbr(disk, is_duet ? boot0_buf : 0);
     if (st != EFI_SUCCESS) {
         efi_print_ascii(" FAILED\r\n");
         goto cleanup;
@@ -1295,7 +1546,7 @@ void ba_install_to_hd(void) {
     efi_print_ascii(" OK\r\n");
 
     /* Step 3: Format ESP */
-    efi_print_ascii("  [3/7] Formatting FAT32 (100 MB ESP)...");
+    efi_print_ascii("  [3/8] Formatting FAT32 (100 MB ESP)...");
     st = format_fat32(disk);
     if (st != EFI_SUCCESS) {
         efi_print_ascii(" FAILED\r\n");
@@ -1303,12 +1554,25 @@ void ba_install_to_hd(void) {
     }
     efi_print_ascii(" OK\r\n");
 
-    /* Step 4: Copy model to raw partition */
+    /* Step 4: Merge boot1f32 into PBR (DUET only) */
+    if (is_duet) {
+        efi_print_ascii("  [4/8] Merging boot1f32 into PBR...");
+        st = merge_pbr_boot1f32(disk, boot1f32_buf);
+        if (st != EFI_SUCCESS) {
+            efi_print_ascii(" FAILED\r\n");
+            goto cleanup;
+        }
+        efi_print_ascii(" OK\r\n");
+    } else {
+        efi_print_ascii("  [4/8] PBR merge skipped (non-DUET USB)\r\n");
+    }
+
+    /* Step 5: Copy model to raw partition */
     {
         uint64_t raw_end = disk->Media->LastBlock - 33; /* backup GPT entries */
         uint64_t raw_size = (raw_end - RAW_START_LBA + 1) * 512ULL;
 
-        efi_print_ascii("  [4/7] Copying model to data partition (");
+        efi_print_ascii("  [5/8] Copying model to data partition (");
         print_size_human(raw_size);
         efi_print_ascii(")...\r\n");
 
@@ -1377,116 +1641,118 @@ void ba_install_to_hd(void) {
         }
     }
 
-    /* Step 5: Write files directly to FAT32 via Block IO */
-    efi_print_ascii("  [5/7] Writing files to ESP:\r\n");
+    /* Step 6: Write files directly to FAT32 via Block IO */
+    efi_print_ascii("  [6/8] Writing files to ESP:\r\n");
 
-    st = fat32_write_esp_files(disk, &pr_efi, &pr_vocab, &pr_wifi);
+    st = fat32_write_esp_files(disk, &pr_efi, &pr_vocab, &pr_wifi,
+                                is_duet ? &pr_duet_fw : 0);
     if (st != EFI_SUCCESS) {
         efi_print_ascii("        FAT32 write FAILED\r\n");
         goto cleanup;
     }
-    /* Step 6: Verify data integrity (CRC32 hash comparison USB vs HD) */
-    efi_print_ascii("  [6/7] Verifying data integrity (CRC32)...\r\n");
+    /* Step 7: Verify data integrity (CRC32 hash comparison USB vs HD) */
+    efi_print_ascii("  [7/8] Verifying data integrity (CRC32)...\r\n");
     {
         fat32_state vf;
         fat32_init(&vf, disk);
         uint32_t mid = disk->Media->MediaId;
 
-        /* Track cluster offsets: dirs use 3,4,5,6; files start at 7 */
-        uint32_t next_file_cluster = 7;
+        /* Track cluster offsets: dirs use 3,4,5,6 (+ 7 for OC/ if DUET) */
+        uint32_t next_file_cluster = is_duet ? 8 : 7;
+
+        /* Helper: verify a FAT32 file, re-write via raw Block IO + re-verify on mismatch */
+        #define VERIFY_FAT32_FILE(label, src_data, src_size, file_cluster)       \
+        do {                                                                     \
+            uint32_t _usb_crc = crc32(src_data, (int)(src_size));                \
+            uint32_t _n_cl = (uint32_t)(((src_size) + vf.cluster_bytes - 1) / vf.cluster_bytes); \
+            UINTN _rd_total = (UINTN)_n_cl * vf.cluster_bytes;                  \
+            uint64_t _phys = 0;                                                  \
+            UINTN _pages = (_rd_total + 4095) / 4096;                            \
+            efi_print_ascii("        " label "  USB: ");                         \
+            print_hex32(_usb_crc);                                               \
+            efi_print_ascii("\r\n");                                             \
+            st = gBS->AllocatePages(0, EfiLoaderData, _pages, &_phys);           \
+            if (st == EFI_SUCCESS) {                                             \
+                uint8_t *_rb = (uint8_t *)(UINTN)_phys;                          \
+                for (int _attempt = 0; _attempt < 2; _attempt++) {               \
+                    disk->FlushBlocks(disk);                                      \
+                    st = disk->ReadBlocks(disk, mid,                              \
+                                           cluster_lba(&vf, file_cluster),       \
+                                           _rd_total, _rb);                      \
+                    uint32_t _hd_crc = (st == EFI_SUCCESS) ?                     \
+                        crc32(_rb, (int)(src_size)) : 0;                         \
+                    if (st == EFI_SUCCESS && _usb_crc == _hd_crc) {              \
+                        efi_print_ascii("        " label "   HD: ");             \
+                        print_hex32(_hd_crc);                                    \
+                        efi_print_ascii(" MATCH\r\n");                           \
+                        break;                                                   \
+                    }                                                            \
+                    if (_attempt == 0) {                                          \
+                        if (st == EFI_SUCCESS) {                                  \
+                            efi_print_ascii("        " label "   HD: ");         \
+                            print_hex32(_hd_crc);                                \
+                            efi_print_ascii(" MISMATCH -> rewriting...");        \
+                        } else {                                                 \
+                            efi_print_ascii("        " label "   HD: read fail -> rewriting..."); \
+                        }                                                        \
+                        /* Re-write via raw Block IO (contiguous clusters) */    \
+                        uint64_t _wr_lba = cluster_lba(&vf, file_cluster);       \
+                        const uint8_t *_src = (const uint8_t *)(src_data);       \
+                        UINTN _rem = (src_size);                                 \
+                        while (_rem > 0) {                                       \
+                            UINTN _chunk = _rem < vf.cluster_bytes ? _rem : vf.cluster_bytes; \
+                            memset(_rb, 0, vf.cluster_bytes);                    \
+                            memcpy(_rb, _src, _chunk);                           \
+                            disk->WriteBlocks(disk, mid, _wr_lba,                \
+                                               vf.cluster_bytes, _rb);           \
+                            _wr_lba += vf.cluster_bytes / 512;                   \
+                            _src += _chunk;                                      \
+                            _rem -= _chunk;                                      \
+                        }                                                        \
+                        disk->FlushBlocks(disk);                                 \
+                    } else {                                                     \
+                        efi_print_ascii("        " label "   HD: STILL MISMATCHED!\r\n"); \
+                    }                                                            \
+                }                                                                \
+                gBS->FreePages(_phys, _pages);                                   \
+            }                                                                    \
+        } while (0)
 
         /* --- BOOTX64.EFI --- */
         if (pr_efi.data && pr_efi.size > 0) {
-            uint32_t usb_crc = crc32(pr_efi.data, (int)pr_efi.size);
-            efi_print_ascii("        BOOTX64.EFI  USB: ");
-            print_hex32(usb_crc);
-            efi_print_ascii("\r\n");
-
-            /* Read back from HD clusters (contiguous starting at cluster 7) */
-            uint32_t n_clusters = (uint32_t)((pr_efi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
-            UINTN read_total = (UINTN)n_clusters * vf.cluster_bytes;
-            uint64_t phys = 0;
-            UINTN pages = (read_total + 4095) / 4096;
-            st = gBS->AllocatePages(0, EfiLoaderData, pages, &phys);
-            if (st == EFI_SUCCESS) {
-                uint8_t *rb = (uint8_t *)(UINTN)phys;
-                st = disk->ReadBlocks(disk, mid,
-                                       cluster_lba(&vf, next_file_cluster),
-                                       read_total, rb);
-                if (st == EFI_SUCCESS) {
-                    uint32_t hd_crc = crc32(rb, (int)pr_efi.size);
-                    efi_print_ascii("        BOOTX64.EFI   HD: ");
-                    print_hex32(hd_crc);
-                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
-                    /* Also check MZ header */
-                    if (rb[0] != 'M' || rb[1] != 'Z')
-                        efi_print_ascii("        WARNING: No MZ header!\r\n");
-                } else {
-                    efi_print_ascii("        BOOTX64.EFI   HD: read failed\r\n");
-                }
-                gBS->FreePages(phys, pages);
-            }
+            VERIFY_FAT32_FILE("BOOTX64.EFI", pr_efi.data, pr_efi.size, next_file_cluster);
             next_file_cluster += (uint32_t)((pr_efi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
         }
 
         /* --- vocab.btv --- */
         if (pr_vocab.data && pr_vocab.size > 0) {
-            uint32_t usb_crc = crc32(pr_vocab.data, (int)pr_vocab.size);
-            efi_print_ascii("        vocab.btv    USB: ");
-            print_hex32(usb_crc);
-            efi_print_ascii("\r\n");
-
+            VERIFY_FAT32_FILE("vocab.btv  ", pr_vocab.data, pr_vocab.size, next_file_cluster);
             uint32_t n_clusters = (uint32_t)((pr_vocab.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
-            UINTN read_total = (UINTN)n_clusters * vf.cluster_bytes;
-            uint64_t phys = 0;
-            UINTN pages = (read_total + 4095) / 4096;
-            st = gBS->AllocatePages(0, EfiLoaderData, pages, &phys);
-            if (st == EFI_SUCCESS) {
-                uint8_t *rb = (uint8_t *)(UINTN)phys;
-                st = disk->ReadBlocks(disk, mid,
-                                       cluster_lba(&vf, next_file_cluster),
-                                       read_total, rb);
-                if (st == EFI_SUCCESS) {
-                    uint32_t hd_crc = crc32(rb, (int)pr_vocab.size);
-                    efi_print_ascii("        vocab.btv     HD: ");
-                    print_hex32(hd_crc);
-                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
-                } else {
-                    efi_print_ascii("        vocab.btv     HD: read failed\r\n");
-                }
-                gBS->FreePages(phys, pages);
-            }
             next_file_cluster += n_clusters;
         }
 
         /* --- wifi.conf --- */
         if (pr_wifi.data && pr_wifi.size > 0) {
-            uint32_t usb_crc = crc32(pr_wifi.data, (int)pr_wifi.size);
-            efi_print_ascii("        wifi.conf    USB: ");
-            print_hex32(usb_crc);
-            efi_print_ascii("\r\n");
-
+            VERIFY_FAT32_FILE("wifi.conf  ", pr_wifi.data, pr_wifi.size, next_file_cluster);
             uint32_t n_clusters = (uint32_t)((pr_wifi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
-            UINTN read_total = (UINTN)n_clusters * vf.cluster_bytes;
-            uint64_t phys = 0;
-            UINTN pages = (read_total + 4095) / 4096;
-            st = gBS->AllocatePages(0, EfiLoaderData, pages, &phys);
-            if (st == EFI_SUCCESS) {
-                uint8_t *rb = (uint8_t *)(UINTN)phys;
-                st = disk->ReadBlocks(disk, mid,
-                                       cluster_lba(&vf, next_file_cluster),
-                                       read_total, rb);
-                if (st == EFI_SUCCESS) {
-                    uint32_t hd_crc = crc32(rb, (int)pr_wifi.size);
-                    efi_print_ascii("        wifi.conf     HD: ");
-                    print_hex32(hd_crc);
-                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
-                } else {
-                    efi_print_ascii("        wifi.conf     HD: read failed\r\n");
-                }
-                gBS->FreePages(phys, pages);
-            }
+            next_file_cluster += n_clusters;
         }
+
+        /* --- boot (DUET firmware, FAT32) --- */
+        if (is_duet && pr_duet_fw.data && pr_duet_fw.size > 0) {
+            VERIFY_FAT32_FILE("boot       ", pr_duet_fw.data, pr_duet_fw.size, next_file_cluster);
+            uint32_t n_clusters = (uint32_t)((pr_duet_fw.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
+            next_file_cluster += n_clusters;
+        }
+
+        /* --- OpenCore.efi (copy of EFI binary in EFI/OC/, DUET only) --- */
+        if (is_duet && pr_efi.data && pr_efi.size > 0) {
+            VERIFY_FAT32_FILE("OpenCore.efi", pr_efi.data, pr_efi.size, next_file_cluster);
+            uint32_t n_clusters = (uint32_t)((pr_efi.size + vf.cluster_bytes - 1) / vf.cluster_bytes);
+            next_file_cluster += n_clusters;
+        }
+
+        #undef VERIFY_FAT32_FILE
 
         /* --- model.btw (raw partition, read in 1MB chunks) --- */
         if (pr_model.data && pr_model.size > 0) {
@@ -1495,35 +1761,59 @@ void ba_install_to_hd(void) {
             print_hex32(usb_crc);
             efi_print_ascii("\r\n");
 
-            /* Read back from raw partition in 1MB chunks, compute CRC incrementally */
             uint64_t data_lba = RAW_START_LBA + (BTAI_DATA_OFFSET / 512);
             UINTN chunk = 1024 * 1024;
             uint8_t *cbuf = 0;
             gBS->AllocatePool(EfiLoaderData, chunk, (void **)&cbuf);
             if (cbuf) {
-                uint32_t hd_crc = 0xFFFFFFFF;
-                uint64_t remaining = pr_model.size;
-                uint64_t cur_lba = data_lba;
-                int read_ok = 1;
-                while (remaining > 0) {
-                    UINTN to_read = (remaining < chunk) ? (UINTN)remaining : chunk;
-                    UINTN aligned = (to_read + 511) & ~(UINTN)511;
-                    st = disk->ReadBlocks(disk, mid, cur_lba, aligned, cbuf);
-                    if (st != EFI_SUCCESS) { read_ok = 0; break; }
-                    /* Incremental CRC32 */
-                    const uint8_t *cp = cbuf;
-                    for (UINTN ci = 0; ci < to_read; ci++)
-                        hd_crc = (hd_crc >> 8) ^ crc32_table[(hd_crc ^ cp[ci]) & 0xFF];
-                    cur_lba += aligned / 512;
-                    remaining -= to_read;
-                }
-                hd_crc ^= 0xFFFFFFFF;
-                if (read_ok) {
-                    efi_print_ascii("        model.btw     HD: ");
-                    print_hex32(hd_crc);
-                    efi_print_ascii(usb_crc == hd_crc ? " MATCH\r\n" : " MISMATCH!\r\n");
-                } else {
-                    efi_print_ascii("        model.btw     HD: read failed\r\n");
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    uint32_t hd_crc = 0xFFFFFFFF;
+                    uint64_t remaining = pr_model.size;
+                    uint64_t cur_lba = data_lba;
+                    int read_ok = 1;
+                    while (remaining > 0) {
+                        UINTN to_read = (remaining < chunk) ? (UINTN)remaining : chunk;
+                        UINTN aligned = (to_read + 511) & ~(UINTN)511;
+                        st = disk->ReadBlocks(disk, mid, cur_lba, aligned, cbuf);
+                        if (st != EFI_SUCCESS) { read_ok = 0; break; }
+                        const uint8_t *cp = cbuf;
+                        for (UINTN ci = 0; ci < to_read; ci++)
+                            hd_crc = (hd_crc >> 8) ^ crc32_table[(hd_crc ^ cp[ci]) & 0xFF];
+                        cur_lba += aligned / 512;
+                        remaining -= to_read;
+                    }
+                    hd_crc ^= 0xFFFFFFFF;
+                    if (read_ok && usb_crc == hd_crc) {
+                        efi_print_ascii("        model.btw     HD: ");
+                        print_hex32(hd_crc);
+                        efi_print_ascii(" MATCH\r\n");
+                        break;
+                    }
+                    if (attempt == 0) {
+                        if (read_ok) {
+                            efi_print_ascii("        model.btw     HD: ");
+                            print_hex32(hd_crc);
+                            efi_print_ascii(" MISMATCH -> rewriting...\r\n");
+                        } else {
+                            efi_print_ascii("        model.btw     HD: read failed -> rewriting...\r\n");
+                        }
+                        /* Re-write model in 1MB chunks */
+                        uint64_t wr_remaining = pr_model.size;
+                        uint64_t wr_lba = data_lba;
+                        const uint8_t *src = pr_model.data;
+                        while (wr_remaining > 0) {
+                            UINTN to_write = (wr_remaining < chunk) ? (UINTN)wr_remaining : chunk;
+                            UINTN aligned = (to_write + 511) & ~(UINTN)511;
+                            memcpy(cbuf, src, to_write);
+                            disk->WriteBlocks(disk, mid, wr_lba, aligned, cbuf);
+                            wr_lba += aligned / 512;
+                            src += to_write;
+                            wr_remaining -= to_write;
+                        }
+                        disk->FlushBlocks(disk);
+                    } else {
+                        efi_print_ascii("        model.btw     HD: STILL MISMATCHED!\r\n");
+                    }
                 }
                 gBS->FreePool(cbuf);
             }
@@ -1545,8 +1835,11 @@ void ba_install_to_hd(void) {
         if (fs2) gBS->FreePool(fs2);
     }
 
-    /* Step 7: Create UEFI boot entry in NVRAM */
-    efi_print_ascii("  [7/7] Creating boot entry...\r\n");
+    /* Step 8: Create UEFI boot entry in NVRAM.
+     * DUET's BDS requires a Boot#### NVRAM entry to find the boot partition.
+     * The boot entry uses MBR disk signature 0xB007A1DA (written to MBR offset
+     * 440 in step 2) so it matches only the HD, not the USB (sig 0x00000000). */
+    efi_print_ascii("  [8/8] Creating boot entry...\r\n");
     create_boot_entry();
 
 cleanup:
@@ -1554,6 +1847,7 @@ cleanup:
     preread_free(&pr_vocab);
     preread_free(&pr_wifi);
     preread_free(&pr_model);
+    preread_free(&pr_duet_fw);
     if (st != EFI_SUCCESS) return;
 
     /* Summary */
@@ -1638,6 +1932,7 @@ void ba_hdinfo(void) {
         efi_print_ascii("] Type: ");
         print_hex8(type);
         if (type == 0xEF) efi_print_ascii(" (EFI System)");
+        else if (type == 0x0C) efi_print_ascii(" (FAT32 LBA)");
         else if (type == 0xDA) efi_print_ascii(" (BootAI Data)");
         else if (type == 0xEE) efi_print_ascii(" (GPT protective)");
         efi_print_ascii(pe[0] == 0x80 ? "  *BOOTABLE*" : "");

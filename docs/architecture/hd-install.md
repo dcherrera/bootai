@@ -92,43 +92,45 @@ UEFI firmware creates a Block IO handle for it (partition driver scans all GPT e
 ```
 User selects [2] from boot menu
     │
-    ├─ 1. Find internal disk
-    │     Enumerate EFI_BLOCK_IO_PROTOCOL handles
-    │     Filter: MediaPresent && !RemovableMedia && !LogicalPartition && BlockSize==512
+    ├─ 1. Read files from USB
+    │     Find USB filesystem, pre-read EFI binary, vocab, wifi.conf, model
+    │     Detect DUET: read USB MBR sector 0, check for boot0 (0xFA first byte)
+    │     If DUET: read USB PBR for boot1f32, pre-read /boot (DUET firmware)
     │
-    ├─ 2. User confirmation
-    │     Display disk size, warn about data loss
-    │     Require typing "yes" to proceed
+    ├─ 2. Write MBR
+    │     If DUET: inject boot0 code (446 bytes), partition type 0x0C (FAT32 LBA)
+    │     If non-DUET: empty boot code, partition type 0xEF (EFI System)
+    │     Partition 2: type 0xDA (BootAI Data)
     │
-    ├─ 3. Write GPT
-    │     Protective MBR (LBA 0)
-    │     Primary GPT header + 128 partition entries (LBA 1-33)
-    │     Backup entries + header (last 33 LBAs)
-    │     CRC32 checksums on header and entry array
-    │
-    ├─ 4. Format FAT32
+    ├─ 3. Format FAT32
     │     BPB + FSINFO + backup boot sector (reserved area, 32 sectors)
     │     Two FAT copies (each ~100 KB for 100 MB partition)
     │     Empty root directory cluster
+    │
+    ├─ 4. Merge boot1f32 into PBR (DUET only)
+    │     Read PBR from format_fat32, merge boot1f32 code with BPB
+    │     Write 14 pseudo-random bytes at offset 496-509
+    │     Update backup boot sector at partition sector 6
     │
     ├─ 5. Copy model to raw partition
     │     Read model.btw from USB via filesystem (1 MB chunks)
     │     Write to raw partition via Block IO WriteBlocks
     │     Write TOC header with model entry
-    │     Progress bar displayed during copy
     │
-    ├─ 6. Mount new ESP
-    │     DisconnectController + ConnectController (forces UEFI re-enumeration)
-    │     Find new SimpleFileSystem on non-removable logical partition
-    │     Retry once after 3s if first attempt fails
-    │
-    ├─ 7. Create directories + copy files
-    │     Create: EFI/BOOT/, rwkvos/, workspace/
+    ├─ 6. Write files to ESP
+    │     Create: EFI/BOOT/, EFI/OC/ (DUET), rwkvos/, workspace/
     │     Copy: BOOTX64.EFI, vocab.btv, wifi.conf
-    │     Missing source files are skipped with a warning
+    │     If DUET: /boot (DUET firmware), /EFI/OC/OpenCore.efi
     │
-    └─ 8. Offer reboot
+    ├─ 7. Verify data integrity (CRC32)
+    │     Compare USB vs HD CRC32 for all copied files
+    │     If DUET: also verify boot and OpenCore.efi
+    │
+    └─ 8. Create boot entry
+          Write Boot0001 NVRAM variable, update BootOrder
 ```
+
+If source USB is non-DUET, steps 4 is skipped and steps 2/6 proceed without DUET additions (UEFI-only install).
 
 ## Boot Path — Loading from HD
 

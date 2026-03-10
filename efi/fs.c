@@ -13,6 +13,9 @@ EFI_FILE_PROTOCOL *efi_fs_root(void) { return fs_root; }
 
 static EFI_GUID gEfiFileInfoGuid = EFI_FILE_INFO_GUID;
 
+static void print_dec(uint64_t n);
+static void print_hex_status(EFI_STATUS s);
+
 /* Convert ASCII path to UCS-2, replacing '/' with '\\' for UEFI */
 static void ascii_to_ucs2(const char *src, CHAR16 *dst, int max_chars) {
     int i = 0;
@@ -28,7 +31,14 @@ EFI_STATUS efi_fs_init(void) {
 
     /* Enumerate ALL SimpleFileSystem handles and probe each.
      * Dell E6510 has multiple volumes (HP Port Rep 126MB FAT16 +
-     * BOOTAI USB/HD). LocateProtocol finds the wrong one. */
+     * BOOTAI USB/HD). LocateProtocol finds the wrong one.
+     *
+     * Two-pass probe:
+     *  Pass 1: look for \rwkvos\model.btw — only on USB (HD puts model
+     *          on raw BTAI partition, not the ESP). This ensures we pick
+     *          the USB volume when both USB and HD are present.
+     *  Pass 2: fall back to \EFI\BOOT\BOOTX64.EFI — for HD-only boot
+     *          (model will come from raw partition separately). */
     UINTN n_fs = 0;
     EFI_HANDLE *fs_handles = 0;
     EFI_STATUS status = gBS->LocateHandleBuffer(
@@ -37,28 +47,40 @@ EFI_STATUS efi_fs_init(void) {
     if (status != EFI_SUCCESS || n_fs == 0)
         return EFI_NOT_FOUND;
 
-    for (UINTN i = 0; i < n_fs; i++) {
-        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
-        status = gBS->HandleProtocol(fs_handles[i],
-            &gEfiSimpleFileSystemProtocolGuid, (void **)&fs);
-        if (status != EFI_SUCCESS || !fs) continue;
+    efi_print_ascii("  fs: found "); print_dec(n_fs); efi_print_ascii(" volume(s)\r\n");
 
-        EFI_FILE_PROTOCOL *vol = 0;
-        status = fs->OpenVolume(fs, &vol);
-        if (status != EFI_SUCCESS || !vol) continue;
+    /* Probe paths in priority order */
+    const char *probes[] = {
+        "\\rwkvos\\model.btw",
+        "\\EFI\\BOOT\\BOOTX64.EFI",
+    };
 
-        /* Probe: try opening our EFI binary */
+    for (int pass = 0; pass < 2; pass++) {
         CHAR16 probe_path[32];
-        ascii_to_ucs2("\\EFI\\BOOT\\BOOTX64.EFI", probe_path, 32);
-        EFI_FILE_PROTOCOL *probe = 0;
-        status = vol->Open(vol, &probe, probe_path, EFI_FILE_MODE_READ, 0);
-        if (status == EFI_SUCCESS && probe) {
-            probe->Close(probe);
-            fs_root = vol;
-            gBS->FreePool(fs_handles);
-            return EFI_SUCCESS;
+        ascii_to_ucs2(probes[pass], probe_path, 32);
+
+        for (UINTN i = 0; i < n_fs; i++) {
+            EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
+            status = gBS->HandleProtocol(fs_handles[i],
+                &gEfiSimpleFileSystemProtocolGuid, (void **)&fs);
+            if (status != EFI_SUCCESS || !fs) continue;
+
+            EFI_FILE_PROTOCOL *vol = 0;
+            status = fs->OpenVolume(fs, &vol);
+            if (status != EFI_SUCCESS || !vol) continue;
+
+            EFI_FILE_PROTOCOL *probe = 0;
+            status = vol->Open(vol, &probe, probe_path, EFI_FILE_MODE_READ, 0);
+            if (status == EFI_SUCCESS && probe) {
+                probe->Close(probe);
+                fs_root = vol;
+                efi_print_ascii("  fs: selected volume "); print_dec(i);
+                efi_print_ascii(" (pass "); print_dec(pass); efi_print_ascii(")\r\n");
+                gBS->FreePool(fs_handles);
+                return EFI_SUCCESS;
+            }
+            vol->Close(vol);
         }
-        vol->Close(vol);
     }
 
     gBS->FreePool(fs_handles);

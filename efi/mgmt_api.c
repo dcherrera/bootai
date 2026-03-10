@@ -489,6 +489,51 @@ void mgmt_handle_update(tcp4_conn_t *client, const char *auth_header,
     file->Flush(file);
     file->Close(file);
 
+    /* 9b. Also write to \EFI\OC\OpenCore.efi (DUET boot path).
+     *     Re-read the file we just wrote and copy it. */
+    {
+        /* Re-open the file we just wrote to get the data */
+        EFI_FILE_PROTOCOL *src = 0;
+        st = root->Open(root, &src, wpath, EFI_FILE_MODE_READ, 0);
+        if (st == EFI_SUCCESS) {
+            /* Build OC path */
+            CHAR16 oc_path[32];
+            const char *oca = "\\EFI\\OC\\OpenCore.efi";
+            int oi = 0;
+            while (oca[oi]) { oc_path[oi] = (CHAR16)(unsigned char)oca[oi]; oi++; }
+            oc_path[oi] = 0;
+
+            /* Delete old OpenCore.efi if exists */
+            EFI_FILE_PROTOCOL *old_oc = 0;
+            if (root->Open(root, &old_oc, oc_path,
+                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0) == EFI_SUCCESS) {
+                old_oc->Delete(old_oc);
+            }
+
+            /* Create new OpenCore.efi */
+            EFI_FILE_PROTOCOL *oc_file = 0;
+            st = root->Open(root, &oc_file, oc_path,
+                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+            if (st == EFI_SUCCESS) {
+                /* Copy in chunks */
+                char cpbuf[UPDATE_CHUNK_SIZE];
+                UINTN rd;
+                do {
+                    rd = UPDATE_CHUNK_SIZE;
+                    st = src->Read(src, &rd, cpbuf);
+                    if (st == EFI_SUCCESS && rd > 0) {
+                        UINTN wr = rd;
+                        oc_file->Write(oc_file, &wr, cpbuf);
+                    }
+                } while (st == EFI_SUCCESS && rd > 0);
+                oc_file->Flush(oc_file);
+                oc_file->Close(oc_file);
+                efi_print_ascii("  OpenCore.efi updated\r\n");
+            }
+            src->Close(src);
+        }
+    }
+
     /* 10. Log result */
     efi_print_ascii("  Firmware updated (");
     {

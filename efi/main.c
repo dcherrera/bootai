@@ -214,6 +214,24 @@ static int ensure_model_loaded(void) {
         if (!g_model) load_model("qwen25-coder-3b");
         if (!g_model) load_model("smollm-135m");
 
+        /* HD boot fallback: model on raw BTAI data partition, vocab on ESP */
+        if (!g_model) {
+            efi_print_ascii("  Trying raw BTAI partition...\r\n");
+            void *model_buf = 0;
+            UINTN model_size = 0;
+            if (ba_raw_read_entry("model.btw", &model_buf, &model_size) == EFI_SUCCESS) {
+                ba_model *m = ba_model_load_buffer(model_buf, (uint64_t)model_size);
+                if (m) {
+                    ba_tokenizer *t = ba_tokenizer_load(VOCAB_PATH);
+                    if (t) {
+                        g_model = m; g_tok = t;
+                    } else {
+                        ba_model_free(m);
+                    }
+                }
+            }
+        }
+
         if (!g_model) {
             efi_print_ascii("  ERROR: no model+vocab pair found\r\n");
             return 0;
@@ -871,7 +889,8 @@ int ba_exec_cmd(const char *line) {
             efi_print_ascii("  Network not available\r\n");
             return 0;
         }
-        if (!ensure_model_loaded()) return 0;
+        /* Allow serving without model — management API still works for
+         * debugging (log, meminfo, reboot, etc.) */
 
         uint16_t port = 8080;
         if (line[5] == ' ') {
@@ -1453,6 +1472,58 @@ int ba_exec_cmd(const char *line) {
     }
 
     /* hdinfo — inspect hard drive contents */
+    /* diskscan — re-enumerate block devices (for hot-plugged HD) */
+    if (str_eq(line, "diskscan")) {
+        efi_print_ascii("  Reconnecting all controllers...\r\n");
+
+        /* ConnectController(NULL) with Recursive=TRUE connects all
+         * device handles, forcing the firmware to rescan buses. */
+        UINTN n_handles = 0;
+        EFI_HANDLE *handles = 0;
+        gBS->LocateHandleBuffer(1 /* AllHandles */, 0, 0, &n_handles, &handles);
+        for (UINTN i = 0; i < n_handles; i++)
+            gBS->ConnectController(handles[i], 0, 0, 1 /* TRUE */);
+        if (handles) gBS->FreePool(handles);
+
+        /* Enumerate block devices */
+        UINTN n_bio = 0;
+        EFI_HANDLE *bio_handles = 0;
+        EFI_STATUS st = gBS->LocateHandleBuffer(
+            2 /* ByProtocol */, &gEfiBlockIoProtocolGuid, 0, &n_bio, &bio_handles);
+        if (st == EFI_SUCCESS && n_bio > 0) {
+            char num[16];
+            int_to_str(num, (int)n_bio);
+            efi_print_ascii("  Found "); efi_print_ascii(num);
+            efi_print_ascii(" block device(s):\r\n");
+            for (UINTN i = 0; i < n_bio; i++) {
+                EFI_BLOCK_IO_PROTOCOL *bio = 0;
+                gBS->HandleProtocol(bio_handles[i],
+                    &gEfiBlockIoProtocolGuid, (void **)&bio);
+                if (!bio || !bio->Media) continue;
+                uint64_t size_mb = (bio->Media->LastBlock + 1) *
+                    bio->Media->BlockSize / (1024 * 1024);
+                efi_print_ascii("    ");
+                int_to_str(num, (int)i); efi_print_ascii(num);
+                efi_print_ascii(": ");
+                if (size_mb > 1024) {
+                    int_to_str(num, (int)(size_mb / 1024));
+                    efi_print_ascii(num); efi_print_ascii(" GB");
+                } else {
+                    int_to_str(num, (int)size_mb);
+                    efi_print_ascii(num); efi_print_ascii(" MB");
+                }
+                efi_print_ascii(bio->Media->LogicalPartition ? " (partition)" : " (whole disk)");
+                efi_print_ascii(bio->Media->RemovableMedia ? " removable" : "");
+                efi_print_ascii(bio->Media->MediaPresent ? "" : " [no media]");
+                efi_print_ascii("\r\n");
+            }
+            gBS->FreePool(bio_handles);
+        } else {
+            efi_print_ascii("  No block devices found\r\n");
+        }
+        return 0;
+    }
+
     if (str_eq(line, "hdinfo")) {
         ba_hdinfo();
         return 0;
@@ -1489,7 +1560,7 @@ static void command_repl(void) {
     efi_print_ascii("            ls [path], cat <file>, fetch <url>,\r\n");
     efi_print_ascii("            wifi [scan|connect|disconnect|save], mdns, iwn, netinfo,\r\n");
     efi_print_ascii("            e1000e [poll|arp], netdiag, meminfo, memmap, mpinfo, tensor, install,\r\n");
-    efi_print_ascii("            hdinfo, bootfix, reboot, exit\r\n");
+    efi_print_ascii("            hdinfo, diskscan, bootfix, reboot, exit\r\n");
     efi_print_ascii("\r\n");
 
     for (;;) {

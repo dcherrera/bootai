@@ -182,6 +182,41 @@ BootAI includes a fallback: direct 8042 PS/2 controller access via port I/O (por
 - `python3` — for `build_image.py`
 - OpenCorePkg release binaries (already in `bootai/duet/`)
 
+## HD Install with DUET
+
+When `install` (HD install) runs from a DUET USB, it automatically writes DUET boot sectors to the internal hard drive so it boots via Legacy BIOS without the USB.
+
+### How It Works
+
+The installer reads boot0/boot1f32 from the **source USB's boot sectors** at install time — no hex dumps or embedded arrays:
+
+1. **Detect DUET**: Read USB MBR sector 0. If first byte is `0xFA` (CLI instruction), it's a DUET USB.
+2. **Read boot0**: Extract bytes 0-445 from USB MBR.
+3. **Read boot1f32**: Read USB partition's PBR (sector 0 of the FAT32 partition via Block IO).
+4. **Read `/boot`**: Pre-read DUET firmware file from USB filesystem.
+5. **Write MBR**: Inject boot0 code into HD MBR, set partition type to `0x0C` (FAT32 LBA).
+6. **Merge PBR**: After formatting FAT32, merge boot1f32 code with the new BPB. Write 14 pseudo-random bytes at offset 496-509 (DUET BDS partition signature).
+7. **Write DUET files**: Copy `/boot` and `/EFI/OC/OpenCore.efi` to HD ESP alongside standard files.
+
+If the source USB is non-DUET (no boot0 in MBR), the installer skips all DUET steps and creates a UEFI-only install.
+
+### HD Disk Layout (DUET)
+
+```
+Sector 0 (MBR):
+  Bytes 0-445:   boot0 code (from USB)
+  Bytes 446-461: Partition 1: active, type 0x0C (FAT32 LBA), 100 MB at LBA 2048
+  Bytes 462-477: Partition 2: type 0xDA (BootAI Data), rest of disk
+  Bytes 510-511: 0x55AA
+
+LBA 2048 (Partition 1, FAT32 ESP):
+  PBR: boot1f32 code merged with format_fat32() BPB + 14 random bytes
+  Files: EFI/BOOT/BOOTX64.EFI, EFI/OC/OpenCore.efi, boot, rwkvos/vocab.btv, wifi.conf
+
+LBA 206848 (Partition 2, Raw Data):
+  BTAI TOC + model weights (same as UEFI-only install)
+```
+
 ## Troubleshooting
 
 | Problem | Cause | Fix |

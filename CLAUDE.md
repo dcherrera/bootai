@@ -90,9 +90,15 @@ python3 tools/export_weights.py --model Qwen/Qwen2.5-Coder-7B-Instruct --quant q
 |------|------|------|
 | `PROD=1` | Skip boot menu and REPL, boot straight into chat inference | Production/demo builds |
 
+## Nodes
+
+| Name | Machine | IP | Notes |
+|------|---------|-----|-------|
+| Dell | Dell E6510 | 192.168.1.85 | Primary dev node, Westmere SSE4.2, 8 GB |
+
 ## OTA Firmware Update (Preferred)
 
-When the Dell is running and serving (after `serve 8080`), use OTA instead of USB flashing:
+When a node is running and serving (after `serve 8080`), use OTA instead of USB flashing:
 
 ```bash
 # 1. Build
