@@ -9,3 +9,4 @@ esp/
 .DS_Store
 DownloadedModels/
 OpenCore-*.zip
+.teamide/
