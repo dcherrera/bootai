@@ -100,6 +100,25 @@ bootai/
 [3] Settings                  — model, sampling, network config
 ```
 
+## Community
+
+- **X** — [@TeamIDElab](https://x.com/TeamIDElab)
+- **Discord** — [discord.gg/pRpR52A2tk](https://discord.gg/pRpR52A2tk)
+
 ## License
+
+**AGPL-3.0** — see [`LICENSE`](LICENSE).
+
+A free, automatic exception applies to the people this was written for:
+**individuals, academic and non-commercial research, nonprofits, and organizations under
+100 people / $1M revenue may use BootAI under Apache-2.0 terms instead** — no paperwork,
+nothing to pay, nothing to sign. Organizations above that line — anyone shipping hardware
+that boots BootAI, or serving it as a product — need a commercial license:
+[`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
+
+Contributions come inbound under Apache-2.0 with a DCO sign-off — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md). You keep your copyright.
+
+`JACLibc/` is a third-party submodule under MIT.
 
 MIT-T
